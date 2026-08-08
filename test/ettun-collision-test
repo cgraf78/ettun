@@ -72,7 +72,7 @@ signal_transport_pid_file="$tmp/signal-transport.pid"
 signal_child_pid_file="$tmp/signal-child.pid"
 signal_runtime_root="$tmp/signal-runtime"
 mkdir -p "$signal_runtime_root"
-PATH="$bin:/usr/bin:/bin" \
+PATH="$bin:$test_system_path" \
   TMPDIR="$signal_runtime_root" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
@@ -128,7 +128,7 @@ else
 fi
 
 rm -f "$signal_transport_pid_file" "$signal_child_pid_file"
-PATH="$bin:/usr/bin:/bin" \
+PATH="$bin:$test_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
   ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -167,7 +167,7 @@ fi
 
 delayed_transport_pid_file="$tmp/delayed-transport.pid"
 delayed_control_token_file="$tmp/delayed-control.token"
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
   ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -206,7 +206,7 @@ dropping_control_token_file="$tmp/dropping-control.token"
 dropping_control_ready_file="$tmp/dropping-control.ready"
 dropping_control_gate_file="$tmp/dropping-control.gate"
 dropping_control_dropped_file="$tmp/dropping-control.dropped"
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
   ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -253,7 +253,7 @@ terminal_control_token_file="$tmp/terminal-control.token"
 terminal_control_ready_file="$tmp/terminal-control.ready"
 terminal_control_attached_file="$tmp/terminal-control.attached"
 terminal_control_eof_file="$tmp/terminal-control.eof"
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
   ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -316,7 +316,7 @@ _write_stub "$bin/od" \
 setup_suspend_ready="$tmp/setup-suspend-ready"
 setup_suspend_transport_log="$tmp/setup-suspend-transport.log"
 setup_suspend_exit=0
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
   ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -411,7 +411,7 @@ fi
 
 setup_ready="$tmp/setup-ready"
 setup_transport_log="$tmp/setup-transport.log"
-PATH="$bin:/usr/bin:/bin" \
+PATH="$bin:$test_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
   ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \

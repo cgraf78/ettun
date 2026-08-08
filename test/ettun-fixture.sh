@@ -22,6 +22,21 @@ log="$tmp/commands.log"
 test_python=$(python3 -c 'import sys; print(sys.executable)')
 port_probe_error="$tmp/port-probe.error"
 real_bash=$(command -v bash)
+# Fixture PATHs intentionally exclude user-installed commands so missing-tool
+# cases stay honest. Preserve the historical lookup order on FHS hosts, while
+# adding Bash's actual directory when a platform such as Termux keeps all of
+# its core tools below an app prefix and has no /usr/bin or /bin directory.
+real_bash_dir=${real_bash%/*}
+test_system_path=/usr/bin:/bin
+test_extended_system_path=/usr/local/bin:/usr/bin:/bin
+case ":$test_system_path:" in
+  *":$real_bash_dir:"*) ;;
+  *) test_system_path="$real_bash_dir:$test_system_path" ;;
+esac
+case ":$test_extended_system_path:" in
+  *":$real_bash_dir:"*) ;;
+  *) test_extended_system_path="$real_bash_dir:$test_extended_system_path" ;;
+esac
 real_ps=$(command -v ps)
 printf -v real_ps_q '%q' "$real_ps"
 real_mv=$(command -v mv)
@@ -413,7 +428,7 @@ _run_ettun() {
   : >"$remote_command_file"
   rm -f "$bootstrap_payload_file"
   rm -f "$port_probe_error"
-  PATH="${ETTUN_TEST_PATH:-$bin:/usr/bin:/bin}" \
+  PATH="${ETTUN_TEST_PATH:-$bin:$test_system_path}" \
     HOME="$test_home" \
     XDG_STATE_HOME="$test_home/state" \
     ETTUN_TEST_LOG="$log" \

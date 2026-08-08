@@ -404,7 +404,7 @@ _write_stub "$remote_bin/socat" \
 _start_remote_supervisor() {
   local command="$1" control_port="$2" stop_port="$3"
   mkfifo "$remote_fifos/$control_port" "$remote_fifos/$stop_port"
-  PATH="$remote_bin:/usr/bin:/bin" \
+  PATH="$remote_bin:$test_system_path" \
     XDG_CACHE_HOME="$remote_cache" \
     ETTUN_REMOTE_FIFO_DIR="$remote_fifos" \
     ETTUN_REMOTE_DATA_PID="$tmp/remote-data.pid" \
@@ -645,7 +645,7 @@ else
 fi
 
 setup_exit=0
-setup_output=$(PATH="$remote_bin:/usr/bin:/bin" XDG_CACHE_HOME="$bad_cache" \
+setup_output=$(PATH="$remote_bin:$test_system_path" XDG_CACHE_HOME="$bad_cache" \
   ETTUN_REMOTE_FIFO_DIR="$remote_fifos" \
   ETTUN_REMOTE_REAL_FLOCK="$real_flock" \
   ETTUN_REMOTE_TEST_LOG="$remote_log" \

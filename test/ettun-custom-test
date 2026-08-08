@@ -34,7 +34,7 @@ worker_bash_env="$tmp/worker-bash-env"
 mkdir -p "$worker_runtime"
 printf 'set -m\n' >"$worker_bash_env"
 worker_exit=0
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   BASH_ENV="$worker_bash_env" \
   ETTUN_TEST_WORKER_PGRPS="$worker_pgrps" \
   "$BASH" "$SCRIPT" --ettun-transport-worker \
@@ -53,7 +53,7 @@ _assert_eq "transport worker: keeps the adapter in its process group" \
 tstp_exit_runtime="$tmp/tstp-exit-runtime"
 mkdir -p "$tstp_exit_runtime"
 tstp_exit=0
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   "$test_python" - "$BASH" "$SCRIPT" "$tstp_exit_runtime" \
   "$bin/tstp-exit-transport" <<'PY' || tstp_exit=$?
 import os
@@ -99,7 +99,7 @@ _write_stub "$publication_bin/mv" \
   'printf "%s\n" "$PPID" >"$ETTUN_TEST_PUBLISHER_MARKER"' \
   'while [[ ! -e "$ETTUN_TEST_PUBLISHER_RELEASE" ]]; do sleep 0.01; done'
 publication_exit=0
-PATH="$publication_bin:$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$publication_bin:$bin:$test_extended_system_path" \
   ETTUN_TEST_PUBLISHER_MARKER="$publication_marker" \
   ETTUN_TEST_PUBLISHER_RELEASE="$publication_release" \
   "$test_python" - "$BASH" "$SCRIPT" "$publication_runtime" \
@@ -215,7 +215,7 @@ _write_stub "$gate_bash_env" \
   "  ' DEBUG" \
   'fi'
 gate_exit=0
-PATH="$gate_bin:$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$gate_bin:$bin:$test_extended_system_path" \
   TMPDIR="$gate_runtime_root" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
@@ -476,7 +476,7 @@ interactive_auth_result="$tmp/interactive-auth.result"
 interactive_auth_state="$tmp/interactive-auth.state"
 interactive_resume_marker="$tmp/interactive-resumed"
 interactive_exit=0
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
   ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -736,7 +736,7 @@ interactive_cancel_exit=0
 : >"$interactive_cancel_count"
 mkdir -p "$interactive_cancel_runtime"
 rm -f "$interactive_transport_pid_file"
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   TMPDIR="$interactive_cancel_runtime" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
@@ -935,7 +935,7 @@ interactive_control_resumed="$tmp/interactive-control.resumed"
 interactive_control_ready="$tmp/interactive-control.ready"
 interactive_pre_auth_stopped="$tmp/interactive-pre-auth.stopped"
 interactive_handoff_exit=0
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
   ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
@@ -1247,7 +1247,7 @@ late_interrupt_control_ready="$tmp/late-interrupt-control.ready"
 late_interrupt_runtime_root="$tmp/late-interrupt-runtime"
 mkdir -p "$late_interrupt_runtime_root"
 late_interrupt_exit=0
-PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+PATH="$bin:$test_extended_system_path" \
   TMPDIR="$late_interrupt_runtime_root" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
