@@ -1,0 +1,10 @@
+# type<TAB>repository-relative path
+# `fixture` records are discovered but intentionally excluded from ShellCheck.
+program	bin/ettun
+program	install.sh
+program	test/run
+program	test/lib/test.sh
+program	test/ettun-fixture.sh
+program	test/ettun-collision-test
+program	test/ettun-custom-test
+program	test/ettun-default-test

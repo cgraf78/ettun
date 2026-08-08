@@ -1,0 +1,941 @@
+#!/usr/bin/env bash
+# ettun-default-test - default transport and remote supervisor behavior.
+
+# shellcheck disable=SC2016,SC2154
+# shellcheck source=ettun-fixture.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ettun-fixture.sh"
+
+echo "=== ettun default transport ==="
+
+if [[ ! -x "$SCRIPT" ]]; then
+  _fail "installation: public entry point is executable"
+  _test_summary
+fi
+_pass "installation: public entry point is executable"
+
+ETTUN_TEST_LSOF_ESTABLISHED_PORT=10452 \
+  ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example 10452 service.internal 443
+unset ETTUN_TEST_LSOF_ESTABLISHED_PORT ETTUN_TEST_EXIT
+_assert_exit "occupied established local port: rejected" 1 "$run_exit"
+_assert_contains "occupied established local port: suggests an existing tunnel" \
+  "may already be running" "$(cat "$stderr")"
+_assert_file_content "occupied established local port: rejected before transport" "" "$log"
+
+ETTUN_TEST_LSOF_REMOTE_PORT=10453 \
+  ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example 10453 service.internal 443
+unset ETTUN_TEST_LSOF_REMOTE_PORT ETTUN_TEST_EXIT
+_assert_exit "remote-only TCP port: remains available locally" 23 "$run_exit"
+_assert_contains "remote-only TCP port: reaches the transport" "et" "$(cat "$log")"
+
+ETTUN_TEST_PATH="$ss_bin" \
+  ETTUN_TEST_SS_LISTENER_PORT=10454 \
+  ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example 10454 service.internal 443
+unset ETTUN_TEST_PATH ETTUN_TEST_SS_LISTENER_PORT ETTUN_TEST_EXIT
+_assert_exit "ss fallback listener: rejected" 1 "$run_exit"
+_assert_contains "ss fallback listener: suggests an existing tunnel" \
+  "may already be running" "$(cat "$stderr")"
+_assert_file_content "ss fallback listener: rejected before transport" "" "$log"
+
+_local_port_available() {
+  "$test_python" - "$1" <<'PY'
+import errno
+import socket
+import sys
+
+probe = None
+try:
+    probe = socket.socket()
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    probe.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError as error:
+    if error.errno == errno.EADDRINUSE:
+        sys.exit(1)
+    print(f"port availability probe failed: {error}", file=sys.stderr)
+    sys.exit(2)
+finally:
+    if probe is not None:
+        probe.close()
+PY
+}
+
+_local_port_closed() {
+  local probe_exit _
+
+  # A connection probe can consume the one-shot listener and hide a leak.
+  # Poll for a successful bind instead, matching the fixture's allocation test.
+  for _ in {1..40}; do
+    probe_exit=0
+    _local_port_available "$1" || probe_exit=$?
+    case "$probe_exit" in
+      0) return 0 ;;
+      1) sleep 0.05 ;;
+      *) return "$probe_exit" ;;
+    esac
+  done
+  return 1
+}
+
+_capture_default_launch() {
+  local local_port="${1:-10443}"
+  _run_ettun gateway.example "$local_port" service.internal 443
+  commands=$(cat "$log")
+  transport_remote_command=$(cat "$remote_command_file")
+  transport_remote_payload=$(cat "$bootstrap_payload_file")
+  decoded_remote_command=$(_decode_remote_payload "$transport_remote_payload")
+  commands+=$'\n'"$decoded_remote_command"
+  output=$(cat "$stdout")
+  mapping=$(sed -n '/^<-t>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
+  ports=$(sed -n "s/^$local_port:\([0-9][0-9]*\),\([0-9][0-9]*\):\([0-9][0-9]*\)$/\1 \2 \3/p" <<<"$mapping")
+  read -r relay_port control_local_port control_remote_port <<<"$ports"
+}
+
+_activate_captured_remote_launch() {
+  remote_transport_command="$transport_remote_command"
+  remote_command="$decoded_remote_command"
+  stop_remote_port=$(sed -n 's/^ettun_stop_port=//p' <<<"$remote_command")
+  remote_token=$(sed -n 's/^ettun_token=//p' <<<"$remote_command")
+  if [[ ! "$stop_remote_port" =~ ^[0-9]+$ ||
+    ! "$remote_token" =~ ^[0-9a-f]{32}$ ]]; then
+    _fail "default fixture: decoded launch has malformed identity or ports"
+    exit 1
+  fi
+  bootstrap_dir="${TMPDIR:-/tmp}/ettun-bootstrap.$remote_token"
+  if [[ -e "$bootstrap_dir" || -L "$bootstrap_dir" ]]; then
+    _fail "default fixture: generated bootstrap path already exists"
+    exit 1
+  fi
+  # The fixture pins TMPDIR beneath the guarded suite root.  The harness EXIT
+  # trap therefore removes this path even if a bootstrap assertion exits before
+  # the generated supervisor performs its own normal cleanup.
+}
+
+_local_launch_ports_available() {
+  local port_scope="$1" port probe_exit
+  local -a ports=("$control_remote_port")
+  case "$port_scope" in
+    control) ;;
+    all) ports+=("$relay_port" "$stop_remote_port") ;;
+    *)
+      _fail "default fixture: unknown local port scope: $port_scope"
+      exit 1
+      ;;
+  esac
+  for port in "${ports[@]}"; do
+    probe_exit=0
+    _local_port_available "$port" || probe_exit=$?
+    case "$probe_exit" in
+      0) ;;
+      1) return 1 ;;
+      *)
+        _fail "default fixture: could not probe local port $port"
+        exit 1
+        ;;
+    esac
+  done
+  return 0
+}
+
+# The generated control port is remote in production, but this fixture runs the
+# remote command locally. Select immediately before each real local bind so an
+# unrelated listener cannot turn remote-port selection into a test failure.
+_select_local_remote_launch() {
+  local local_port="${1:-10443}" port_scope="${2:-control}" _
+  for _ in {1..20}; do
+    _capture_default_launch "$local_port"
+    if [[ "$run_exit" -ne 0 || ! "$relay_port" =~ ^[0-9]+$ ||
+      ! "$control_local_port" =~ ^[0-9]+$ ||
+      ! "$control_remote_port" =~ ^[0-9]+$ ]]; then
+      _fail "default fixture: launch failed or produced a malformed port mapping"
+      exit 1
+    fi
+    stop_remote_port=$(sed -n 's/^ettun_stop_port=//p' \
+      <<<"$decoded_remote_command")
+    [[ "$stop_remote_port" =~ ^[0-9]+$ ]] || {
+      _fail "default fixture: launch produced a malformed stop port"
+      exit 1
+    }
+    if _local_launch_ports_available "$port_scope"; then
+      _activate_captured_remote_launch
+      return 0
+    fi
+  done
+  _fail "default fixture: could not select an available local remote-control port"
+  exit 1
+}
+
+_capture_default_launch
+
+_assert_exit "default launch: succeeds" 0 "$run_exit"
+_assert_contains "default launch: runs ET without a terminal" $'et\n<-N>' "$commands"
+_assert_contains "default launch: enables ET keepalives" $'<--keepalive>\n<5>' "$commands"
+expected_mapping=$(printf '<-t>\n<10443:%s,%s:%s>' \
+  "$relay_port" "$control_local_port" "$control_remote_port")
+_assert_contains "default launch: maps the requested local port" \
+  "$expected_mapping" "$commands"
+if [[ "$control_local_port" =~ ^[0-9]+$ ]] &&
+  ((control_local_port >= 49152 && control_local_port <= 65535)); then
+  _pass "default launch: chooses a private local control port"
+else
+  _fail "default launch: chooses a private local control port (got '$control_local_port')"
+fi
+_assert_contains "default launch: sends a remote relay command" "<--command>" "$commands"
+_assert_contains "default launch: enters an explicit POSIX remote shell" \
+  "exec /bin/sh -c '" \
+  "$transport_remote_command"
+_assert_contains "default launch: bootstrap uses a portable decoder" \
+  "base64 -d" "$transport_remote_command"
+_assert_contains "default launch: bootstrap decompresses the remote supervisor" \
+  "gzip -dc" "$transport_remote_command"
+_assert_contains "default launch: authenticates the exact bootstrap payload" \
+  "sha256sum" "$transport_remote_command"
+_assert_contains "default launch: bounds unauthenticated bootstrap input" \
+  "ulimit -f" "$transport_remote_command"
+_assert_contains "default launch: gives an abandoned bootstrap a deadline" \
+  "bootstrap-timeout" "$transport_remote_command"
+_assert_contains "default launch: identifies the bootstrap listener before upload" \
+  "ETTUN_BOOTSTRAP" "$transport_remote_command"
+_assert_contains "default launch: uploads the supervisor over the private forward" \
+  "ETTUN_PAYLOAD:" "$transport_remote_payload"
+if [[ "$transport_remote_command" != *$'\n'* ]]; then
+  _pass "default launch: sends the remote command as one line"
+else
+  _fail "default launch: sends the remote command as one line"
+fi
+if ((${#transport_remote_command} <= 3072)); then
+  _pass "default launch: keeps the bootstrap below the remote TTY input budget"
+else
+  _fail "default launch: keeps the bootstrap below the remote TTY input budget"
+fi
+_assert_contains "default launch: connects through the requested host" \
+  "<gateway.example>" "$commands"
+if [[ "$relay_port" =~ ^[0-9]+$ ]] &&
+  ((relay_port >= 49152 && relay_port <= 65535)); then
+  _pass "default launch: chooses an ephemeral relay port"
+else
+  _fail "default launch: chooses an ephemeral relay port (got '$relay_port')"
+fi
+_assert_contains "default launch: relay binds only remote loopback" \
+  '127.0.0.1 "$ettun_relay_port"' "$commands"
+_assert_contains "default launch: control listener binds only remote loopback" \
+  '127.0.0.1 "$ettun_control_port"' "$commands"
+_assert_contains "default launch: ncat relay reaches the requested target" \
+  "service.internal 443" "$commands"
+_assert_contains "default launch: supports socat when ncat is unavailable" "command -v socat" "$commands"
+case "$commands" in
+  *'if command -v socat'*'elif command -v ncat'*)
+    _pass "default launch: prefers the transparent socat relay"
+    ;;
+  *)
+    _fail "default launch: prefers the transparent socat relay"
+    ;;
+esac
+_assert_contains "default launch: scopes remote state to client and local port" \
+  "ettun_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10443" "$commands"
+_assert_contains "default launch: records a private remote owner" \
+  'ettun_owner=$ettun_state/owner' "$commands"
+_assert_contains "default launch: replaces the prior logical tunnel through its control port" \
+  'old_token' "$commands"
+_assert_contains "default launch: supports authenticated pre-attachment cleanup" \
+  'ETTUN_STOPPED:' "$commands"
+_assert_contains "default launch: serializes same-key remote startup" \
+  'flock -n 7' "$commands"
+_assert_contains "default launch: directly execs the observable control listener" \
+  'exec ncat --listen --recv-only' "$commands"
+_assert_contains "default launch: treats zombie control listeners as stopped" \
+  'case "$process_state" in *Z*) return 1' "$commands"
+_assert_contains "default launch: defers remote signals through child PID publication" \
+  'defer_remote_signals' "$commands"
+_assert_contains "default launch: cleans direct relay children on exit" \
+  'relay_pid' "$commands"
+_assert_contains "default launch: emits a tokenized collision marker" \
+  'ETTUN_COLLISION:' "$commands"
+_assert_contains "default launch: reports the local endpoint" "localhost:10443" "$output"
+_assert_contains "default launch: reports the remote endpoint" "service.internal:443" "$output"
+_assert_contains "default launch: reports foreground stop behavior" "Ctrl-C to stop" "$output"
+_assert_contains "default launch: documents the forced cleanup escape" \
+  "press Ctrl-C again to force" "$(bash "$SCRIPT" --help 2>&1)"
+
+echo ""
+echo "=== ettun remote supervisor ==="
+
+remote_bin="$tmp/remote-bin"
+remote_cache="$tmp/remote-cache"
+remote_fifos="$tmp/remote-fifos"
+remote_log="$tmp/remote.log"
+remote_stop_race_arm="$tmp/remote-stop-race.arm"
+remote_stop_race_used="$tmp/remote-stop-race.used"
+remote_stop_race_ready="$tmp/remote-stop-race.ready"
+mkdir -p "$remote_bin" "$remote_cache" "$remote_fifos"
+real_flock=$(command -v flock 2>/dev/null || true)
+_write_stub "$remote_bin/flock" \
+  'if [[ -n "${ETTUN_REMOTE_REAL_FLOCK:-}" ]]; then' \
+  '  exec "$ETTUN_REMOTE_REAL_FLOCK" "$@"' \
+  'fi' \
+  'exit 0'
+_write_stub "$remote_bin/wc" \
+  'if [[ "${1:-}" == -l && -e "${ETTUN_REMOTE_STOP_RACE_ARM:-}" && ! -e "${ETTUN_REMOTE_STOP_RACE_USED:-}" ]] &&' \
+  '  "$ETTUN_REMOTE_TEST_PYTHON" -c "import os, sys; sys.exit(0 if os.path.samestat(os.fstat(0), os.stat(sys.argv[1])) else 1)" "$ETTUN_REMOTE_STOP_FILE"; then' \
+  '  stale_count=$(/usr/bin/wc "$@")' \
+  '  : >"$ETTUN_REMOTE_STOP_RACE_USED"' \
+  '  stop_pid=' \
+  '  [[ ! -r "${ETTUN_REMOTE_STOP_PID:-}" ]] || read -r stop_pid <"$ETTUN_REMOTE_STOP_PID"' \
+  '  for _ in {1..80}; do' \
+  '    stop_state=$(ps -o stat= -p "$stop_pid" 2>/dev/null || true)' \
+  '    if [[ -z "$stop_state" || "$stop_state" == *Z* ]]; then' \
+  '      : >"$ETTUN_REMOTE_STOP_RACE_READY"' \
+  '      break' \
+  '    fi' \
+  '    sleep 0.1' \
+  '  done' \
+  '  printf "  %s\n" "$stale_count"' \
+  '  exit 0' \
+  'fi' \
+  'count=$(/usr/bin/wc "$@")' \
+  'if [[ "${1:-}" == -l || "${1:-}" == -c ]]; then' \
+  '  printf "  %s\n" "$count"' \
+  'else' \
+  '  printf "%s\n" "$count"' \
+  'fi'
+_write_stub "$remote_bin/fifo-listener" \
+  'exec "$ETTUN_REMOTE_TEST_PYTHON" - "$@" <<PY' \
+  'import os' \
+  'import sys' \
+  'with open(sys.argv[1], "rb", buffering=0) as source:' \
+  '    while True:' \
+  '        chunk = source.read(65536)' \
+  '        if not chunk:' \
+  '            break' \
+  '        offset = 0' \
+  '        while offset < len(chunk):' \
+  '            offset += os.write(1, chunk[offset:])' \
+  'PY'
+_write_stub "$remote_bin/fifo-sender" \
+  'IFS= read -r value || :' \
+  'exec "$ETTUN_REMOTE_TEST_PYTHON" - "$1" "$value" <<PY' \
+  'import errno' \
+  'import os' \
+  'import sys' \
+  'import time' \
+  'deadline = time.monotonic() + 8' \
+  'while True:' \
+  '    try:' \
+  '        descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)' \
+  '        break' \
+  '    except OSError as error:' \
+  '        if error.errno not in (errno.ENOENT, errno.ENXIO) or time.monotonic() >= deadline:' \
+  '            raise' \
+  '        time.sleep(0.05)' \
+  'with os.fdopen(descriptor, "wb", buffering=0) as output:' \
+  '    output.write((sys.argv[2] + "\\n").encode())' \
+  'PY'
+_write_stub "$remote_bin/relay-action" \
+  'action=$1' \
+  'port=$2' \
+  'handler=${3:-}' \
+  'printf "%s %s\n" "$action" "$port" >>"$ETTUN_REMOTE_TEST_LOG"' \
+  'case "$action" in' \
+  '  data)' \
+  '    printf "%s\n" "$$" >"$ETTUN_REMOTE_DATA_PID"' \
+  '    sleep 300 &' \
+  '    data_child=$!' \
+  '    printf "%s\n" "$data_child" >"$ETTUN_REMOTE_DATA_CHILD_PID"' \
+  '    wait "$data_child"' \
+  '    ;;' \
+  '  control)' \
+  '    if [[ "$port" == "${ETTUN_REMOTE_STOP_PORT:-}" && -n "${ETTUN_REMOTE_STOP_PID:-}" ]]; then' \
+  '      printf "%s\n" "$$" >"$ETTUN_REMOTE_STOP_PID"' \
+  '    elif [[ -n "${ETTUN_REMOTE_CONTROL_PID:-}" ]]; then' \
+  '      printf "%s\n" "$$" >"$ETTUN_REMOTE_CONTROL_PID"' \
+  '    fi' \
+  '    for _ in {1..50}; do [[ -p "$ETTUN_REMOTE_FIFO_DIR/$port" ]] && break; sleep 0.1; done' \
+  '    if [[ -n "$handler" ]]; then' \
+  '      exec "$handler" 127.0.0.1 "$port" <"$ETTUN_REMOTE_FIFO_DIR/$port" >"$ETTUN_REMOTE_FIFO_DIR/$port.reply"' \
+  '    else' \
+  '      exec "$ETTUN_REMOTE_FIFO_LISTENER" "$ETTUN_REMOTE_FIFO_DIR/$port" 127.0.0.1 "$port"' \
+  '    fi' \
+  '    ;;' \
+  '  send)' \
+  '    exec "$ETTUN_REMOTE_FIFO_SENDER" "$ETTUN_REMOTE_FIFO_DIR/$port"' \
+  '    ;;' \
+  'esac'
+_write_stub "$remote_bin/ncat" \
+  'mode=connect' \
+  'previous=' \
+  'handler=' \
+  'for arg in "$@"; do' \
+  '  [[ "$previous" == --exec ]] && handler=$arg' \
+  '  [[ "$arg" == --listen ]] && mode=control' \
+  '  [[ "$arg" == --keep-open ]] && mode=data' \
+  '  [[ "$arg" == --recv-only ]] && mode=control' \
+  '  [[ "$arg" == --send-only ]] && mode=send' \
+  '  previous=$arg' \
+  'done' \
+  'port="${!#}"' \
+  'source "${0%/*}/relay-action" "$mode" "$port" "$handler"'
+_write_stub "$remote_bin/socat" \
+  'listen_port=' \
+  'handler=' \
+  'peer=' \
+  'receive=0' \
+  'for arg in "$@"; do' \
+  '  case "$arg" in' \
+  '    TCP-LISTEN:*) listen_port=${arg#TCP-LISTEN:}; listen_port=${listen_port%%,*} ;;' \
+  '    EXEC:*) handler=${arg#EXEC:} ;;' \
+  '    TCP:*) peer=${arg#TCP:} ;;' \
+  '    -u) receive=1 ;;' \
+  '  esac' \
+  'done' \
+  '# Normalize socat address forms through the authoritative relay fixture contract.' \
+  'if [[ -n "$listen_port" ]]; then' \
+  '  if [[ -n "$handler" ]]; then' \
+  '    source "${0%/*}/relay-action" control "$listen_port" "$handler"' \
+  '  elif ((receive == 1)); then' \
+  '    source "${0%/*}/relay-action" control "$listen_port"' \
+  '  else' \
+  '    source "${0%/*}/relay-action" data "$listen_port"' \
+  '  fi' \
+  'fi' \
+  'port=${peer##*:}' \
+  'source "${0%/*}/relay-action" send "$port"'
+
+_start_remote_supervisor() {
+  local command="$1" control_port="$2" stop_port="$3"
+  mkfifo "$remote_fifos/$control_port" "$remote_fifos/$stop_port"
+  PATH="$remote_bin:/usr/bin:/bin" \
+    XDG_CACHE_HOME="$remote_cache" \
+    ETTUN_REMOTE_FIFO_DIR="$remote_fifos" \
+    ETTUN_REMOTE_DATA_PID="$tmp/remote-data.pid" \
+    ETTUN_REMOTE_DATA_CHILD_PID="$tmp/remote-data-child.pid" \
+    ETTUN_REMOTE_CONTROL_PID="$tmp/remote-control.pid" \
+    ETTUN_REMOTE_STOP_PID="$tmp/remote-stop.pid" \
+    ETTUN_REMOTE_STOP_FILE="$remote_state/stop" \
+    ETTUN_REMOTE_STOP_RACE_ARM="$remote_stop_race_arm" \
+    ETTUN_REMOTE_STOP_RACE_USED="$remote_stop_race_used" \
+    ETTUN_REMOTE_STOP_RACE_READY="$remote_stop_race_ready" \
+    ETTUN_REMOTE_STOP_PORT="$stop_port" \
+    ETTUN_REMOTE_FIFO_LISTENER="$remote_bin/fifo-listener" \
+    ETTUN_REMOTE_FIFO_SENDER="$remote_bin/fifo-sender" \
+    ETTUN_REMOTE_TEST_PYTHON="$test_python" \
+    ETTUN_REMOTE_REAL_FLOCK="$real_flock" \
+    ETTUN_REMOTE_TEST_LOG="$remote_log" \
+    sh -c "$command" >"$tmp/remote.stdout" 2>"$tmp/remote.stderr" &
+  remote_pid=$!
+}
+
+_write_remote_fifo() {
+  printf '%s\n' "$2" | ETTUN_REMOTE_TEST_PYTHON="$test_python" \
+    "$remote_bin/fifo-sender" "$1"
+}
+
+_wait_for_line() {
+  local path="$1" expected="$2"
+  local _
+  for _ in {1..80}; do
+    if [[ -r "$path" ]] && grep -Fxq -- "$expected" "$path"; then
+      return
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+_report_remote_timeout() {
+  local label="$1" supervisor="$2" owner_snapshot=""
+  local observed_pid path
+  local -a owner_fields=()
+
+  [[ ! -r "$remote_owner" ]] || owner_snapshot=$(cat "$remote_owner")
+  read -r -a owner_fields <<<"$owner_snapshot"
+  printf 'remote supervisor timeout (%s): requested=%s owner=%s\n' \
+    "$label" "$supervisor" "$owner_snapshot" >&2
+  for observed_pid in "$supervisor" "${owner_fields[2]:-}" \
+    "${owner_fields[3]:-}" "${owner_fields[6]:-}" "${owner_fields[7]:-}"; do
+    [[ "$observed_pid" =~ ^[0-9]+$ ]] || continue
+    ps -ww -o pid=,ppid=,stat=,command= -p "$observed_pid" >&2 || true
+  done
+  for path in "$remote_state/control" "$remote_state/stop"; do
+    printf '%s: ' "$path" >&2
+    if [[ -r "$path" ]]; then
+      sed -n '1,3p' "$path" >&2
+    else
+      printf '<missing>\n' >&2
+    fi
+  done
+  printf '%s\n' 'remote stderr:' >&2
+  tail -n 20 "$tmp/remote.stderr" >&2 || true
+  printf '%s\n' 'remote log:' >&2
+  tail -n 20 "$remote_log" >&2 || true
+}
+
+_wait_for_owner_control() {
+  local path="$1" expected="$2" token control _
+  for _ in {1..80}; do
+    token=
+    control=
+    [[ -r "$path" ]] && read -r token control _ <"$path"
+    if [[ -n "$token" && "$control" == "$expected" ]]; then
+      return
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+_activate_captured_remote_launch
+case "$remote_transport_command" in
+  *'awk "{ print \$1 }"'*) ;;
+  *) _fail "remote bootstrap command: preserves the nested awk program" ;;
+esac
+sh -n -c "$remote_transport_command" ||
+  _fail "remote bootstrap command: is valid POSIX shell syntax"
+remote_root="$remote_cache/ettun"
+remote_key="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10443"
+remote_state="$remote_root/$remote_key"
+remote_owner="$remote_state/owner"
+remote_startup_lock="$remote_root/.$remote_key.start.lock"
+
+bad_cache="$tmp/not-a-cache-directory"
+: >"$bad_cache"
+bootstrap_guard_target="$tmp/bootstrap-guard-target"
+mkdir -p "$bootstrap_guard_target"
+printf 'unchanged\n' >"$bootstrap_guard_target/w"
+ln -s "$bootstrap_guard_target" "$bootstrap_dir"
+bootstrap_guard_exit=0
+bootstrap_guard_output=$(sh -c "$remote_transport_command" 2>&1) ||
+  bootstrap_guard_exit=$?
+_assert_exit "remote bootstrap staging: refuses a preexisting shared path" \
+  73 "$bootstrap_guard_exit"
+_assert_contains "remote bootstrap staging: reports a tokenized state failure" \
+  "ETTUN_FATAL:$remote_token:73:bootstrap-state" "$bootstrap_guard_output"
+_assert_eq "remote bootstrap staging: does not follow a hostile symlink" \
+  "unchanged" "$(cat "$bootstrap_guard_target/w")"
+if [[ -L "$bootstrap_dir" ]]; then
+  _pass "remote bootstrap staging: leaves an unowned path untouched"
+else
+  _fail "remote bootstrap staging: leaves an unowned path untouched"
+fi
+rm -f "$bootstrap_dir"
+rm -rf "$bootstrap_guard_target"
+
+if command -v ncat >/dev/null 2>&1 || command -v socat >/dev/null 2>&1; then
+  _select_local_remote_launch
+  base64_invoked="$tmp/bootstrap-base64.invoked"
+  _write_stub "$remote_bin/base64" \
+    'touch "$ETTUN_REMOTE_BASE64_INVOKED"' \
+    'exit 127'
+  mv "$remote_bin/ncat" "$remote_bin/ncat.supervisor"
+  # This path exercises the real bootstrap listener, not the relay fixture.
+  mv "$remote_bin/socat" "$remote_bin/socat.supervisor"
+  decoder_exit=0
+  PATH="$remote_bin:$PATH" \
+    ETTUN_REMOTE_BASE64_INVOKED="$base64_invoked" \
+    sh -c "$remote_transport_command" >"$tmp/decoder.stdout" 2>"$tmp/decoder.stderr" &
+  decoder_pid=$!
+  for _ in {1..50}; do
+    [[ -d "$bootstrap_dir" ]] && break
+    sleep 0.05
+  done
+  bootstrap_mode=$(stat -c '%a' "$bootstrap_dir" 2>/dev/null ||
+    stat -f '%Lp' "$bootstrap_dir" 2>/dev/null || true)
+  _assert_eq "remote bootstrap staging: creates a private directory" \
+    "700" "$bootstrap_mode"
+
+  _bootstrap_exchange() {
+    "$test_python" - "$control_remote_port" "$1" <<'PY'
+import socket
+import sys
+import time
+
+port, request = sys.argv[1:]
+deadline = time.monotonic() + 5
+while True:
+    try:
+        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=1)
+    except ConnectionRefusedError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.05)
+        continue
+    response = b""
+    while b"\n" not in response:
+        chunk = connection.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    if response == b"ETTUN_BOOTSTRAP\n":
+        break
+    connection.close()
+    if time.monotonic() >= deadline:
+        raise RuntimeError(f"unexpected bootstrap marker: {response!r}")
+    time.sleep(0.05)
+with connection:
+    connection.sendall(request.encode())
+    connection.shutdown(socket.SHUT_WR)
+    while True:
+        chunk = connection.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+sys.stdout.buffer.write(response)
+PY
+  }
+
+  bootstrap_reply=$(_bootstrap_exchange "")
+  _assert_eq "remote bootstrap probe: identifies the pre-supervisor listener" \
+    "ETTUN_BOOTSTRAP" "$bootstrap_reply"
+  tampered_payload="${transport_remote_payload%?}X"
+  [[ "$tampered_payload" != "$transport_remote_payload" ]] ||
+    tampered_payload="${transport_remote_payload%?}Y"
+  _bootstrap_exchange "$tampered_payload" >/dev/null
+  if kill -0 "$decoder_pid" 2>/dev/null && [[ ! -e "$base64_invoked" ]]; then
+    _pass "remote bootstrap authentication: rejects a same-size altered payload before decoding"
+  else
+    _fail "remote bootstrap authentication: rejects a same-size altered payload before decoding"
+  fi
+  _bootstrap_exchange "$transport_remote_payload" >/dev/null
+  wait "$decoder_pid" || decoder_exit=$?
+  decoder_output=$(cat "$tmp/decoder.stdout" "$tmp/decoder.stderr")
+  _assert_exit "remote decoder failure: preserves an actionable status" 127 "$decoder_exit"
+  _assert_contains "remote decoder failure: emits a tokenized fatal marker" \
+    "ETTUN_FATAL:$remote_token:127:decode" "$decoder_output"
+  if [[ -e "$base64_invoked" ]]; then
+    _pass "remote bootstrap authentication: decodes the exact bound payload"
+  else
+    _fail "remote bootstrap authentication: decodes the exact bound payload"
+  fi
+  rm -f "$remote_bin/base64"
+  mv "$remote_bin/ncat.supervisor" "$remote_bin/ncat"
+  mv "$remote_bin/socat.supervisor" "$remote_bin/socat"
+
+  if _local_port_closed "$control_remote_port"; then
+    _pass "remote decoder failure: removes its listener"
+  else
+    _fail "remote decoder failure: removes its listener"
+  fi
+  if [[ ! -e "$bootstrap_dir" && ! -L "$bootstrap_dir" ]]; then
+    _pass "remote decoder failure: removes private temporary files"
+  else
+    _fail "remote decoder failure: removes private temporary files"
+  fi
+
+  _select_local_remote_launch
+  bootstrap_timeout_exit=0
+  bootstrap_timeout_output=$(ETTUN_BOOTSTRAP_TIMEOUT=1 \
+    sh -c "$remote_transport_command" 2>&1) || bootstrap_timeout_exit=$?
+  _assert_exit "remote bootstrap deadline: expires an abandoned listener" \
+    124 "$bootstrap_timeout_exit"
+  _assert_contains "remote bootstrap deadline: emits a tokenized fatal marker" \
+    "ETTUN_FATAL:$remote_token:124:bootstrap-timeout" \
+    "$bootstrap_timeout_output"
+  if _local_port_closed "$control_remote_port"; then
+    _pass "remote bootstrap deadline: removes its listener"
+  else
+    _fail "remote bootstrap deadline: removes its listener"
+  fi
+  if [[ ! -e "$bootstrap_dir" && ! -L "$bootstrap_dir" ]]; then
+    _pass "remote bootstrap deadline: removes private temporary files"
+  else
+    _fail "remote bootstrap deadline: removes private temporary files"
+  fi
+else
+  printf '  SKIP: real bootstrap relay checks require local ncat or socat\n'
+fi
+
+setup_exit=0
+setup_output=$(PATH="$remote_bin:/usr/bin:/bin" XDG_CACHE_HOME="$bad_cache" \
+  ETTUN_REMOTE_FIFO_DIR="$remote_fifos" \
+  ETTUN_REMOTE_REAL_FLOCK="$real_flock" \
+  ETTUN_REMOTE_TEST_LOG="$remote_log" \
+  sh -c "$remote_command" 2>&1) || setup_exit=$?
+_assert_exit "remote setup failure: preserves an actionable status" 74 "$setup_exit"
+_assert_contains "remote setup failure: emits a tokenized fatal marker" \
+  "ETTUN_FATAL:$remote_token:74:state-root" "$setup_output"
+
+mkdir -p "$remote_state"
+startup_lock_holder=""
+if [[ -n "$real_flock" ]]; then
+  "$real_flock" "$remote_startup_lock" sleep 2 &
+  startup_lock_holder=$!
+  for _ in {1..50}; do
+    "$real_flock" -n "$remote_startup_lock" true 2>/dev/null || break
+    sleep 0.1
+  done
+fi
+_start_remote_supervisor "$remote_command" "$control_remote_port" "$stop_remote_port"
+sleep 0.3
+if [[ -z "$real_flock" || ! -e "$remote_owner" ]]; then
+  _pass "remote startup lock: waits for a live same-key owner when flock is available"
+else
+  _fail "remote startup lock: waits for a live same-key owner when flock is available"
+fi
+if [[ -n "$startup_lock_holder" ]]; then
+  wait "$startup_lock_holder" 2>/dev/null || true
+fi
+if _wait_for_file "$remote_owner"; then
+  _pass "remote supervisor: reclaims an incomplete owner and publishes state"
+else
+  _fail "remote supervisor: reclaims an incomplete owner and publishes state"
+  wait "$remote_pid" 2>/dev/null || true
+  rm -f "$remote_owner" "$remote_state/control" \
+    "$remote_fifos/$control_remote_port" "$remote_fifos/$stop_remote_port"
+  rmdir "$remote_state" 2>/dev/null || true
+  _start_remote_supervisor "$remote_command" "$control_remote_port" "$stop_remote_port"
+  _wait_for_file "$remote_owner" || _fail "remote supervisor: clean fallback starts"
+fi
+startup_lock_released=1
+if [[ -n "$real_flock" ]]; then
+  startup_lock_released=0
+  for _ in {1..80}; do
+    if "$real_flock" -n "$remote_startup_lock" true 2>/dev/null; then
+      startup_lock_released=1
+      break
+    fi
+    sleep 0.1
+  done
+fi
+if ((startup_lock_released == 1)); then
+  _pass "remote startup lock: releases automatically after publication"
+else
+  _fail "remote startup lock: releases automatically after publication"
+fi
+read -r remote_token published_stop_port _ <"$remote_owner"
+_assert_eq "remote supervisor: publishes a separate reclaim listener" \
+  "$stop_remote_port" "$published_stop_port"
+_wait_for_file "$tmp/remote-data.pid" || _fail "remote supervisor: records its data child"
+_wait_for_file "$tmp/remote-data-child.pid" || _fail "remote supervisor: records its relay descendant"
+read -r remote_data_pid <"$tmp/remote-data.pid"
+read -r remote_data_child_pid <"$tmp/remote-data-child.pid"
+remote_control_reply="$remote_fifos/$control_remote_port.reply"
+exec 9<>"$remote_fifos/$control_remote_port"
+if _wait_for_line "$remote_control_reply" "ETTUN_CONTROL"; then
+  _pass "remote supervisor: held attachment advertises the control role"
+else
+  _fail "remote supervisor: held attachment advertises the control role"
+fi
+printf '%s\n' "$remote_token" >&9
+if _wait_for_line "$remote_control_reply" "ETTUN_ATTACHED:$remote_token"; then
+  _pass "remote supervisor: held attachment acknowledges the token"
+else
+  _fail "remote supervisor: held attachment acknowledges the token"
+fi
+printf 'ETTUN_CONFIRM:%s\n' "$remote_token" >&9
+if _wait_for_line "$remote_control_reply" "ETTUN_CONFIRMED:$remote_token"; then
+  _pass "remote supervisor: held attachment confirms the control stream"
+else
+  _fail "remote supervisor: held attachment confirms the control stream"
+fi
+if _wait_for_file "$remote_state/control"; then
+  _assert_eq "remote supervisor: held attachment records the exact token" \
+    "$remote_token" "$(cat "$remote_state/control")"
+else
+  _fail "remote supervisor: held attachment records the exact token"
+fi
+_wait_for_file "$tmp/remote-stop.pid" ||
+  _fail "remote supervisor: records its stop listener"
+: >"$remote_stop_race_arm"
+_wait_for_marker "$remote_stop_race_used" ||
+  _fail "remote supervisor: exercises the completed-listener stop race"
+_write_remote_fifo "$remote_fifos/$stop_remote_port" "$remote_token" ||
+  _fail "remote supervisor: reclaim listener accepts a stop request"
+_wait_for_marker "$remote_stop_race_ready" ||
+  _fail "remote supervisor: forces the completed-listener stop race"
+remote_exit=0
+if ! _wait_for_processes_stopped "$remote_pid"; then
+  _fail "remote supervisor: held attachment stop completes within deadline"
+  _report_remote_timeout "held attachment stop" "$remote_pid"
+  kill -KILL "$remote_pid" 2>/dev/null || true
+fi
+wait "$remote_pid" || remote_exit=$?
+exec 9>&-
+_assert_exit "remote supervisor: reclaim listener stops a held attachment" \
+  0 "$remote_exit"
+if [[ ! -e "$remote_state" ]]; then
+  _pass "remote supervisor: removes owned state after stop"
+else
+  _fail "remote supervisor: removes owned state after stop"
+fi
+if _wait_for_processes_stopped "$remote_data_pid"; then
+  _pass "remote supervisor: terminates its direct data child"
+else
+  _fail "remote supervisor: terminates its direct data child"
+fi
+if _wait_for_processes_stopped "$remote_data_child_pid"; then
+  _pass "remote supervisor: terminates active relay descendants"
+else
+  _fail "remote supervisor: terminates active relay descendants"
+  kill -KILL "$remote_data_child_pid" 2>/dev/null || true
+fi
+
+: >"$remote_log"
+rm -f "$remote_fifos/$control_remote_port" "$remote_fifos/$stop_remote_port" \
+  "$tmp/remote-data.pid" "$tmp/remote-data-child.pid" \
+  "$tmp/remote-control.pid" "$tmp/remote-stop.pid"
+_start_remote_supervisor "$remote_command" "$control_remote_port" "$stop_remote_port"
+_wait_for_file "$remote_owner" || _fail "remote control death: owner starts"
+_wait_for_file "$tmp/remote-control.pid" || _fail "remote control death: listener starts"
+read -r killed_control_pid <"$tmp/remote-control.pid"
+kill -KILL "$killed_control_pid"
+for _ in {1..50}; do
+  killed_control_state=$(ps -o stat= -p "$remote_pid" 2>/dev/null || true)
+  [[ -z "$killed_control_state" || "$killed_control_state" == *Z* ]] && break
+  sleep 0.1
+done
+killed_control_exit=0
+killed_control_state=$(ps -o stat= -p "$remote_pid" 2>/dev/null || true)
+if [[ -n "$killed_control_state" && "$killed_control_state" != *Z* ]]; then
+  kill -TERM "$remote_pid" 2>/dev/null || true
+fi
+wait "$remote_pid" || killed_control_exit=$?
+_assert_exit "remote control death: exits instead of hanging without a marker" \
+  75 "$killed_control_exit"
+if [[ ! -e "$remote_state" ]]; then
+  _pass "remote control death: removes owned state"
+else
+  _fail "remote control death: removes owned state"
+fi
+
+: >"$remote_log"
+rm -f "$remote_fifos/$control_remote_port" "$remote_fifos/$stop_remote_port" \
+  "$tmp/remote-data.pid" "$tmp/remote-data-child.pid" \
+  "$tmp/remote-control.pid" "$tmp/remote-stop.pid"
+_start_remote_supervisor "$remote_command" "$control_remote_port" "$stop_remote_port"
+_wait_for_file "$remote_owner" || _fail "remote replacement: first owner starts"
+_wait_for_file "$tmp/remote-data.pid" || _fail "remote replacement: first relay starts"
+_wait_for_file "$tmp/remote-control.pid" || _fail "remote replacement: first control starts"
+_wait_for_file "$tmp/remote-stop.pid" || _fail "remote replacement: first stop listener starts"
+first_remote_pid=$remote_pid
+read -r first_relay_pid <"$tmp/remote-data.pid"
+read -r first_control_pid <"$tmp/remote-control.pid"
+read -r first_stop_pid <"$tmp/remote-stop.pid"
+for _ in {1..80}; do
+  grep -Fq "control $control_remote_port" "$remote_log" && break
+  sleep 0.1
+done
+kill -KILL "$first_remote_pid" 2>/dev/null || true
+first_exit=0
+wait "$first_remote_pid" 2>/dev/null || first_exit=$?
+_assert_exit "remote replacement: observes an untrappable supervisor death" 137 "$first_exit"
+if ! _process_has_stopped "$first_relay_pid"; then
+  _pass "remote replacement: reproduces the orphaned relay before reclaim"
+else
+  _pass "remote replacement: accepts relay cleanup before reclaim"
+fi
+_run_ettun gateway.example 10443 service.internal 443
+replacement_payload=$(cat "$bootstrap_payload_file")
+replacement_command=$(_decode_remote_payload "$replacement_payload")
+replacement_control=$(sed -n 's/^ettun_control_port=//p' <<<"$replacement_command")
+replacement_stop=$(sed -n 's/^ettun_stop_port=//p' <<<"$replacement_command")
+_start_remote_supervisor "$replacement_command" \
+  "$replacement_control" "$replacement_stop"
+replacement_pid=$remote_pid
+_wait_for_owner_control "$remote_owner" "$replacement_stop" ||
+  _fail "remote replacement: new owner starts"
+read -r replacement_token replacement_owner_control _ <"$remote_owner"
+_assert_eq "remote replacement: publishes the new control port" \
+  "$replacement_stop" "$replacement_owner_control"
+_assert_contains "remote replacement: uses the old private control listener" \
+  "send $stop_remote_port" "$(cat "$remote_log")"
+if _wait_for_processes_stopped "$first_relay_pid"; then
+  _pass "remote replacement: reclaims the relay from a killed supervisor"
+else
+  _fail "remote replacement: reclaims the relay from a killed supervisor"
+  kill -KILL "$first_relay_pid" 2>/dev/null || true
+fi
+if _wait_for_processes_stopped "$first_control_pid" "$first_stop_pid"; then
+  _pass "remote replacement: reclaims listeners from a killed supervisor"
+else
+  _fail "remote replacement: reclaims listeners from a killed supervisor"
+  kill -KILL "$first_control_pid" "$first_stop_pid" 2>/dev/null || true
+fi
+_write_remote_fifo "$remote_fifos/$replacement_stop" "$replacement_token" ||
+  _fail "remote replacement: replacement listener accepts a stop request"
+if ! _wait_for_processes_stopped "$replacement_pid"; then
+  _fail "remote replacement: replacement supervisor stops"
+  _report_remote_timeout "replacement stop" "$replacement_pid"
+  kill -KILL "$replacement_pid" 2>/dev/null || true
+fi
+wait "$replacement_pid" || true
+rm -f "$remote_fifos/$control_remote_port" "$remote_fifos/$stop_remote_port" \
+  "$remote_fifos/$replacement_control" "$remote_fifos/$replacement_stop"
+
+if command -v flock >/dev/null 2>&1 && {
+  command -v ncat >/dev/null 2>&1 || command -v socat >/dev/null 2>&1
+}; then
+  control_stop_cache="$tmp/control-stop-cache"
+  control_stop_state="$control_stop_cache/ettun/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10451"
+  mkdir -p "$control_stop_cache"
+  _select_local_remote_launch 10451 all
+  control_stop_command="$remote_command"
+  control_stop_port=$(sed -n 's/^ettun_control_port=//p' <<<"$control_stop_command")
+  control_stop_token=$(sed -n 's/^ettun_token=//p' <<<"$control_stop_command")
+  XDG_CACHE_HOME="$control_stop_cache" HOME="$tmp" \
+    sh -c "$control_stop_command" \
+    >"$tmp/control-stop.stdout" 2>"$tmp/control-stop.stderr" &
+  control_stop_pid=$!
+  control_stop_exchange=$(
+    "$test_python" - "$control_stop_port" "$control_stop_token" <<'PY'
+import socket
+import sys
+import time
+
+port, token = sys.argv[1:]
+deadline = time.monotonic() + 8
+last_role = None
+while True:
+    try:
+        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=1)
+        with connection:
+            stream = connection.makefile("rb")
+            role = stream.readline().decode().strip()
+            last_role = role
+            if role == "ETTUN_CONTROL":
+                connection.sendall(f"ETTUN_STOP:{token}\n".encode())
+                stopped = stream.readline().decode().strip()
+                break
+    except (ConnectionRefusedError, TimeoutError):
+        pass
+    if time.monotonic() >= deadline:
+        raise TimeoutError(f"control role not ready; last role was {last_role!r}")
+    time.sleep(0.05)
+print(role)
+print(stopped)
+PY
+  )
+  control_stop_exit=0
+  wait "$control_stop_pid" || control_stop_exit=$?
+  _assert_contains "remote pre-attachment stop: advertises the control role" \
+    "ETTUN_CONTROL" "$control_stop_exchange"
+  _assert_contains "remote pre-attachment stop: acknowledges the authenticated request" \
+    "ETTUN_STOPPED:$control_stop_token" "$control_stop_exchange"
+  _assert_exit "remote pre-attachment stop: terminates the supervisor" \
+    0 "$control_stop_exit"
+  if [[ ! -e "$control_stop_state" ]]; then
+    _pass "remote pre-attachment stop: removes owned state"
+  else
+    _fail "remote pre-attachment stop: removes owned state"
+  fi
+  if _local_port_closed "$relay_port"; then
+    _pass "remote pre-attachment stop: releases the relay listener"
+  else
+    _fail "remote pre-attachment stop: releases the relay listener"
+  fi
+  if _local_port_closed "$control_remote_port"; then
+    _pass "remote pre-attachment stop: releases the control listener"
+  else
+    _fail "remote pre-attachment stop: releases the control listener"
+  fi
+  if _local_port_closed "$stop_remote_port"; then
+    _pass "remote pre-attachment stop: releases the stop listener"
+  else
+    _fail "remote pre-attachment stop: releases the stop listener"
+  fi
+else
+  printf '  SKIP: real supervisor stop check requires local flock and ncat or socat\n'
+fi
+
+echo ""
+
+_test_summary

@@ -1,0 +1,1413 @@
+#!/usr/bin/env bash
+# ettun-custom-test - custom transport and job-control behavior.
+
+# shellcheck disable=SC2016,SC2154
+# shellcheck source=ettun-fixture.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ettun-fixture.sh"
+
+echo "=== ettun custom transport ==="
+
+ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_TRANSPORT="$bin/test-transport" \
+  _run_ettun relay.example 5901 desktop.internal 5900
+unset ETTUN_TEST_TRANSPORT
+commands=$(cat "$log")
+
+_assert_exit "custom transport: succeeds" 0 "$run_exit"
+_assert_contains "custom transport: receives via host first" $'transport\n<relay.example>' "$commands"
+_assert_contains "custom transport: receives the complete ET tunnel spec second" \
+  $'<relay.example>\n<5901:' "$commands"
+_assert_contains "custom transport: receives the bounded bootstrap third" \
+  "et-bootstrap" "$commands"
+_assert_not_contains "custom transport: bypasses the default ET binary" $'\net\n' "$commands"
+
+ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_TRANSPORT="$bin/test-transport" \
+  _run_ettun __ettun_transport_worker 5902 desktop.internal 5900
+unset ETTUN_TEST_TRANSPORT
+commands=$(cat "$log")
+_assert_exit "custom transport: a worker-like VIA remains usable" 0 "$run_exit"
+_assert_contains "custom transport: passes a worker-like VIA unchanged" \
+  $'transport\n<__ettun_transport_worker>' "$commands"
+
+worker_runtime="$tmp/worker-runtime"
+worker_pgrps="$tmp/worker-pgrps"
+worker_bash_env="$tmp/worker-bash-env"
+mkdir -p "$worker_runtime"
+printf 'set -m\n' >"$worker_bash_env"
+worker_exit=0
+PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+  BASH_ENV="$worker_bash_env" \
+  ETTUN_TEST_WORKER_PGRPS="$worker_pgrps" \
+  "$BASH" "$SCRIPT" --ettun-transport-worker \
+  "$worker_runtime" 0 "$bin/worker-pgrp-transport" "" \
+  gateway.example 5902:5900 true "$$" || worker_exit=$?
+_assert_exit "transport worker: succeeds with inherited monitor mode" 0 "$worker_exit"
+if [[ -r "$worker_pgrps" ]]; then
+  read -r worker_pgid adapter_pgid <"$worker_pgrps"
+else
+  worker_pgid=missing
+  adapter_pgid=absent
+fi
+_assert_eq "transport worker: keeps the adapter in its process group" \
+  "$worker_pgid" "$adapter_pgid"
+
+tstp_exit_runtime="$tmp/tstp-exit-runtime"
+mkdir -p "$tstp_exit_runtime"
+tstp_exit=0
+PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+  "$test_python" - "$BASH" "$SCRIPT" "$tstp_exit_runtime" \
+  "$bin/tstp-exit-transport" <<'PY' || tstp_exit=$?
+import os
+import subprocess
+import sys
+
+bash, script, runtime, transport = sys.argv[1:]
+completed = subprocess.run(
+    [
+        bash,
+        script,
+        "--ettun-transport-worker",
+        runtime,
+        "0",
+        transport,
+        "",
+        "gateway.example",
+        "5902:5900",
+        "true",
+        str(os.getpid()),
+    ],
+    check=False,
+    start_new_session=True,
+    timeout=10,
+)
+raise SystemExit(completed.returncode)
+PY
+_assert_exit "transport worker: preserves exit 127 after Ctrl-Z" 127 "$tstp_exit"
+
+publication_runtime="$tmp/publication-runtime"
+publication_bin="$tmp/publication-bin"
+publication_marker="$tmp/publication.marker"
+publication_release="$tmp/publication.release"
+mkdir -p "$publication_runtime" "$publication_bin"
+# This mv performs the real atomic publication, then stops the whole process
+# group and blocks. The parent test withholds release long enough to prove that
+# seeing transport.status cannot make the worker return before reaping the
+# wrapper. The marker records that wrapper PID for the final no-orphan check.
+_write_stub "$publication_bin/mv" \
+  "real_mv=$real_mv_q" \
+  '"$real_mv" "$@"' \
+  'kill -TSTP 0' \
+  'printf "%s\n" "$PPID" >"$ETTUN_TEST_PUBLISHER_MARKER"' \
+  'while [[ ! -e "$ETTUN_TEST_PUBLISHER_RELEASE" ]]; do sleep 0.01; done'
+publication_exit=0
+PATH="$publication_bin:$bin:/usr/local/bin:/usr/bin:/bin" \
+  ETTUN_TEST_PUBLISHER_MARKER="$publication_marker" \
+  ETTUN_TEST_PUBLISHER_RELEASE="$publication_release" \
+  "$test_python" - "$BASH" "$SCRIPT" "$publication_runtime" \
+  "$bin/exit-127-transport" "$publication_marker" "$publication_release" <<'PY' || publication_exit=$?
+import os
+import signal
+import subprocess
+import sys
+import time
+
+bash, script, runtime, transport, marker, release = sys.argv[1:]
+worker = subprocess.Popen(
+    [
+        bash,
+        script,
+        "--ettun-transport-worker",
+        runtime,
+        "0",
+        transport,
+        "",
+        "gateway.example",
+        "5902:5900",
+        "true",
+        str(os.getpid()),
+    ],
+    start_new_session=True,
+)
+deadline = time.monotonic() + 5
+while not os.path.exists(marker) and time.monotonic() < deadline:
+    time.sleep(0.01)
+marker_seen = os.path.exists(marker)
+time.sleep(0.1)
+returned_before_release = worker.poll() is not None
+open(release, "wb").close()
+try:
+    returncode = worker.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    os.killpg(worker.pid, signal.SIGKILL)
+    returncode = worker.wait(timeout=1)
+
+publisher_gone = False
+try:
+    with open(marker, "r", encoding="utf-8") as marker_input:
+        publisher_pid = int(marker_input.read().strip())
+except (FileNotFoundError, ValueError):
+    publisher_pid = None
+if publisher_pid is not None:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(publisher_pid, 0)
+        except ProcessLookupError:
+            publisher_gone = True
+            break
+        time.sleep(0.01)
+
+success = marker_seen and not returned_before_release and returncode == 127 and publisher_gone
+if not success:
+    sys.stderr.write(
+        f"marker={marker_seen} early={returned_before_release} "
+        f"exit={returncode} publisher_gone={publisher_gone}\n"
+    )
+sys.exit(0 if success else 1)
+PY
+_assert_exit "transport worker: reaps the status publisher before returning" \
+  0 "$publication_exit"
+
+gate_runtime_root="$tmp/gate-runtime"
+gate_adapter_pid="$tmp/gate-adapter.pid"
+gate_results="$tmp/gate-results"
+gate_bin="$tmp/gate-bin"
+gate_bash_env="$tmp/gate-bash-env"
+mkdir -p "$gate_runtime_root" "$gate_bin"
+_write_stub "$gate_bin/ps" \
+  'for arg in "$@"; do' \
+  '  if [[ "$arg" == tpgid= ]]; then' \
+  '    if [[ -n "${ETTUN_TEST_PROBE_HELD:-}" ]]; then' \
+  '      : >"$ETTUN_TEST_PROBE_HELD"' \
+  '      # The helper ignores common signals, so retain an abnormal-exit bound.' \
+  '      probe_wait=0' \
+  '      while [[ ! -e "$ETTUN_TEST_PROBE_RELEASE" ]] && ((probe_wait < 600)); do' \
+  '        sleep 0.05' \
+  '        probe_wait=$((probe_wait + 1))' \
+  '      done' \
+  '    fi' \
+  '    sleep 0.05' \
+  '    exit 1' \
+  '  fi' \
+  'done' \
+  "exec $real_ps_q \"\$@\""
+# Bash 3.2 sources BASH_ENV before making the script's positional parameters
+# available. Classify on the first script command instead: ordinary Bash
+# subprocesses remove the DEBUG trap immediately, while the sentinel worker
+# retains it until its internal function call, before worker signal traps run.
+_write_stub "$gate_bash_env" \
+  'if [[ -n "${ETTUN_TEST_WORKER_START_MODE:-}${ETTUN_TEST_GATE_TIMEOUT:-}" ]]; then' \
+  "  trap '" \
+  '    if [[ "$BASH_COMMAND" == run_transport_worker\ * ]]; then' \
+  '      trap - DEBUG' \
+  '      if [[ -n "${ETTUN_TEST_GATE_TIMEOUT:-}" ]]; then' \
+  '        FOREGROUND_GATE_TIMEOUT="$ETTUN_TEST_GATE_TIMEOUT"' \
+  '      fi' \
+  '      case "$ETTUN_TEST_WORKER_START_MODE" in' \
+  '        block)' \
+  '          : >"$ETTUN_TEST_WORKER_BLOCKED"' \
+  '          IFS= read -r _ <"$ETTUN_TEST_WORKER_GATE"' \
+  '          ;;' \
+  '        exit) exit 42 ;;' \
+  '      esac' \
+  '    elif [[ "${1:-}" != --ettun-transport-worker ]]; then' \
+  '      trap - DEBUG' \
+  '    fi' \
+  "  ' DEBUG" \
+  'fi'
+gate_exit=0
+PATH="$gate_bin:$bin:/usr/local/bin:/usr/bin:/bin" \
+  TMPDIR="$gate_runtime_root" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  BASH_ENV="$gate_bash_env" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$gate_adapter_pid" \
+  ETTUN_TRANSPORT="$bin/interactive-transport" \
+  "$test_python" - "$BASH" "$SCRIPT" "$gate_runtime_root" \
+  "$gate_adapter_pid" "$gate_results" <<'PY' || gate_exit=$?
+import fcntl
+import os
+import pty
+import select
+import signal
+import sys
+import termios
+import time
+
+bash, script, runtime_root, adapter_pid_file, results_file = sys.argv[1:]
+
+def transport_worker_state():
+    for entry in os.listdir(runtime_root):
+        run_dir = os.path.join(runtime_root, entry)
+        pid_path = os.path.join(run_dir, "transport.pid")
+        try:
+            with open(pid_path, "r", encoding="utf-8") as pid_input:
+                worker_pid = int(pid_input.read().strip())
+        except (FileNotFoundError, ValueError):
+            pass
+        else:
+            return worker_pid, os.path.exists(os.path.join(run_dir, "transport.ready"))
+    return None, False
+
+def reap_child(pid, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True, None
+        if waited:
+            return True, status
+        time.sleep(0.05)
+    return False, None
+
+def run_case(port, cancel=False, startup_mode=""):
+    try:
+        os.unlink(adapter_pid_file)
+    except FileNotFoundError:
+        pass
+    blocked_marker = f"{results_file}.{port}.blocked"
+    gate_fifo = f"{results_file}.{port}.gate"
+    probe_held = f"{results_file}.{port}.probe-held"
+    probe_release = f"{results_file}.{port}.probe-release"
+    if startup_mode == "block":
+        os.mkfifo(gate_fifo)
+    # The gate is meaningful only with a controlling PTY: without one, the
+    # worker deliberately skips foreground ownership and starts immediately.
+    master, slave = pty.openpty()
+    child = os.fork()
+    if child == 0:
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+        for fd in (0, 1, 2):
+            os.dup2(slave, fd)
+        os.close(master)
+        os.close(slave)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "ETTUN_TEST_WORKER_START_MODE": startup_mode,
+                "ETTUN_TEST_WORKER_BLOCKED": blocked_marker,
+                "ETTUN_TEST_WORKER_GATE": gate_fifo,
+            }
+        )
+        if cancel and not startup_mode:
+            # Keep the worker's own gate deadline beyond this case's 20-second
+            # test bound so it cannot replace the cancellation outcome.
+            environment.update(
+                {
+                    "ETTUN_TEST_GATE_TIMEOUT": "30",
+                    "ETTUN_TEST_PROBE_HELD": probe_held,
+                    "ETTUN_TEST_PROBE_RELEASE": probe_release,
+                }
+            )
+        os.execve(
+            bash,
+            ["bash", script, "gateway.example", str(port), "service.internal", "443"],
+            environment,
+        )
+
+    os.close(slave)
+    output = b""
+    status = None
+    reaped = False
+    cancel_sent = False
+    blocked_seen = False
+    probe_held_seen = False
+    ready_before_cancel = False
+    launcher_foreground = False
+    worker_foreground = False
+    worker_pid = None
+    deadline = time.monotonic() + (5 if startup_mode else 20)
+    try:
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if readable:
+                try:
+                    output += os.read(master, 4096)
+                except OSError:
+                    pass
+            worker_pid, worker_ready = transport_worker_state()
+            if cancel and not cancel_sent and worker_pid is not None:
+                try:
+                    terminal_pgid = os.tcgetpgrp(master)
+                    launcher_foreground = terminal_pgid == child
+                    worker_foreground = terminal_pgid == worker_pid
+                    probe_held_seen = os.path.exists(probe_held)
+                    if startup_mode == "block" and os.path.exists(blocked_marker):
+                        blocked_seen = True
+                        ready_before_cancel = worker_ready
+                        os.write(master, b"\x03")
+                        cancel_sent = True
+                    # The normal gate case covers cancellation after the worker
+                    # really owns the terminal. The startup case above instead
+                    # requires Ctrl-C to remain with the launcher.
+                    # Keep the deliberately broken foreground probe parked
+                    # while cancellation is observed. Otherwise its independent
+                    # ten-second deadline can overtake this PTY write on a busy
+                    # runner and turn the fixture into a race between failures.
+                    elif (
+                        not startup_mode
+                        and worker_ready
+                        and worker_foreground
+                        and probe_held_seen
+                    ):
+                        ready_before_cancel = worker_ready
+                        os.write(master, b"\x03")
+                        cancel_sent = True
+                except OSError:
+                    pass
+            waited, candidate = os.waitpid(child, os.WNOHANG)
+            if waited:
+                status = candidate
+                reaped = True
+                break
+    finally:
+        open(probe_release, "ab").close()
+        if status is None:
+            if worker_pid is not None:
+                try:
+                    os.killpg(worker_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            try:
+                os.killpg(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            reaped, status = reap_child(child, 1)
+            if not reaped:
+                try:
+                    os.kill(child, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                reaped, status = reap_child(child, 1)
+        os.close(master)
+
+    exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
+    adapter_started = os.path.exists(adapter_pid_file)
+    return {
+        "adapter": adapter_started,
+        "blocked": blocked_seen,
+        "cancel_sent": cancel_sent,
+        "exit": exit_code,
+        "foreground": worker_foreground,
+        "launcher_foreground": launcher_foreground,
+        "output": output,
+        "probe_held": probe_held_seen,
+        "ready": ready_before_cancel,
+        "reaped": reaped,
+        "runtime_clean": not os.listdir(runtime_root),
+    }
+
+bounded_case = run_case(10454)
+cancel_case = run_case(10455, cancel=True)
+startup_cancel_case = run_case(10456, cancel=True, startup_mode="block")
+startup_exit_case = run_case(10457, startup_mode="exit")
+bounded = (
+    bounded_case["exit"] == 1
+    and bounded_case["reaped"]
+    and not bounded_case["adapter"]
+    and b"could not hand the terminal" in bounded_case["output"]
+)
+cancelled = (
+    cancel_case["cancel_sent"]
+    and cancel_case["exit"] == 130
+    and cancel_case["reaped"]
+    and cancel_case["probe_held"]
+    and cancel_case["ready"]
+    and not cancel_case["adapter"]
+)
+startup_cancelled = (
+    startup_cancel_case["blocked"]
+    and startup_cancel_case["cancel_sent"]
+    and startup_cancel_case["exit"] == 130
+    and startup_cancel_case["reaped"]
+    and startup_cancel_case["runtime_clean"]
+    and not startup_cancel_case["adapter"]
+    and not startup_cancel_case["ready"]
+    and not startup_cancel_case["foreground"]
+    and startup_cancel_case["launcher_foreground"]
+)
+startup_exit_preserved = (
+    startup_exit_case["exit"] == 42
+    and startup_exit_case["reaped"]
+    and startup_exit_case["runtime_clean"]
+    and not startup_exit_case["adapter"]
+)
+with open(results_file, "w", encoding="utf-8") as results:
+    results.write(f"bounded={int(bounded)}\n")
+    results.write(f"cancelled={int(cancelled)}\n")
+    results.write(f"startup_cancelled={int(startup_cancelled)}\n")
+    results.write(f"startup_exit_preserved={int(startup_exit_preserved)}\n")
+if not bounded:
+    sys.stderr.write(f"bounded: {bounded_case}\n")
+    sys.stderr.buffer.write(bounded_case["output"])
+if not cancelled:
+    sys.stderr.write(f"cancellation: {cancel_case}\n")
+    sys.stderr.buffer.write(cancel_case["output"])
+if not startup_cancelled:
+    sys.stderr.write(f"startup cancellation: {startup_cancel_case}\n")
+    sys.stderr.buffer.write(startup_cancel_case["output"])
+if not startup_exit_preserved:
+    sys.stderr.write(f"startup exit: {startup_exit_case}\n")
+    sys.stderr.buffer.write(startup_exit_case["output"])
+sys.exit(0 if all((bounded, cancelled, startup_cancelled, startup_exit_preserved)) else 1)
+PY
+_assert_exit "terminal gate: a failed foreground probe is bounded" 0 "$gate_exit"
+if [[ -r "$gate_results" ]]; then
+  gate_result_text=$(cat "$gate_results")
+else
+  gate_result_text=""
+fi
+_assert_contains "terminal gate: reports foreground handoff failure" \
+  "bounded=1" "$gate_result_text"
+_assert_contains "terminal gate: cancellation launches no adapter" \
+  "cancelled=1" "$gate_result_text"
+_assert_contains "terminal gate: startup Ctrl-C stays with the launcher until traps are armed" \
+  "startup_cancelled=1" "$gate_result_text"
+_assert_contains "terminal gate: preserves a worker failure before readiness" \
+  "startup_exit_preserved=1" "$gate_result_text"
+
+# Exercise a real controlling PTY rather than piping input. macOS Bash job
+# control differs from noninteractive subprocess behavior: Ctrl-Z is terminal
+# input, foreground PGID determines signal delivery, and fg restores termios.
+interactive_transport_pid_file="$tmp/interactive-transport.pid"
+interactive_auth_result="$tmp/interactive-auth.result"
+interactive_auth_state="$tmp/interactive-auth.state"
+interactive_resume_marker="$tmp/interactive-resumed"
+interactive_exit=0
+PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$interactive_transport_pid_file" \
+  ETTUN_TEST_AUTH_RESULT="$interactive_auth_result" \
+  ETTUN_TEST_AUTH_STATE="$interactive_auth_state" \
+  ETTUN_TEST_PYTHON="$test_python" \
+  ETTUN_TEST_RESUME_MARKER="$interactive_resume_marker" \
+  ETTUN_TRANSPORT="$bin/interactive-transport" \
+  "$test_python" - "$BASH" "$SCRIPT" "$interactive_transport_pid_file" \
+  "$interactive_auth_result" "$interactive_auth_state" \
+  "$interactive_resume_marker" <<'PY' || interactive_exit=$?
+import fcntl
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+
+bash, script, transport_pid_file, auth_result, auth_state, resume_marker = sys.argv[1:]
+
+def reap_child(pid, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if waited:
+            return True
+        time.sleep(0.05)
+    return False
+
+def wait_process_gone(pid, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if not state or state.startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
+
+def read_pty(fd, output):
+    try:
+        chunk = os.read(fd, 4096)
+    except OSError:
+        return output, False
+    return output + chunk, bool(chunk)
+
+# Create a new session and explicitly acquire the slave as its controlling TTY,
+# matching an actual terminal tab rather than Python's inherited test terminal.
+master, slave = pty.openpty()
+child = os.fork()
+if child == 0:
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    for fd in (0, 1, 2):
+        os.dup2(slave, fd)
+    os.close(master)
+    os.close(slave)
+    os.execv(bash, ["bash", script, "gateway.example", "10447", "service.internal", "443"])
+
+os.close(slave)
+output = b""
+sent = False
+suspend_sent = False
+suspend_observed = False
+continue_observed = False
+resume_observed = False
+authenticated = False
+adapter_gone_before_cleanup = False
+observer_gone_before_cleanup = False
+foreground_at_prompt = False
+launcher_reaped = False
+status = None
+transport_pid = None
+observer_pid = None
+prompt_deadline = time.monotonic() + 20
+try:
+    while time.monotonic() < prompt_deadline:
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            output, pty_open = read_pty(master, output)
+            if not pty_open:
+                break
+        if not suspend_sent and b"Passcode: " in output:
+            os.write(master, b"\x1a")
+            suspend_sent = True
+            break
+    suspend_deadline = time.monotonic() + 20
+    while suspend_sent and time.monotonic() < suspend_deadline:
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            output, pty_open = read_pty(master, output)
+            if not pty_open:
+                break
+        if b"^Z" in output:
+            suspend_observed = True
+            break
+    resume_deadline = time.monotonic() + 20
+    while suspend_observed and time.monotonic() < resume_deadline:
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            output, pty_open = read_pty(master, output)
+            if not pty_open:
+                break
+        if os.path.exists(resume_marker):
+            continue_observed = True
+            try:
+                with open(transport_pid_file, "r", encoding="utf-8") as pid_file:
+                    transport_pid = int(pid_file.read().strip())
+                transport_state = subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(transport_pid)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                transport_pgid = os.getpgid(transport_pid)
+                resume_observed = (
+                    bool(transport_state)
+                    and not transport_state.startswith(("T", "Z"))
+                    and os.tcgetpgrp(master) == transport_pgid
+                )
+            except (FileNotFoundError, OSError, ProcessLookupError, ValueError):
+                pass
+            if resume_observed:
+                break
+    if resume_observed:
+        # The ^Z echo precedes signal handling. Wait for proof that the worker
+        # resumed its process group so the terminal cannot flush this input.
+        os.write(master, b"test-passcode\n")
+        sent = True
+    auth_deadline = time.monotonic() + 20
+    while sent and time.monotonic() < auth_deadline:
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            output, pty_open = read_pty(master, output)
+            if not pty_open:
+                break
+        if os.path.exists(auth_result):
+            with open(auth_result, "r", encoding="utf-8") as result:
+                authenticated = result.read().strip() == "test-passcode"
+            try:
+                with open(auth_state, "r", encoding="utf-8") as state_input:
+                    state_fields = state_input.read().split()
+                foreground_at_prompt = (
+                    len(state_fields) >= 3 and state_fields[1] == state_fields[2]
+                )
+            except FileNotFoundError:
+                pass
+            break
+    if authenticated:
+        os.write(master, b"\x03")
+        cancel_deadline = time.monotonic() + 20
+        while time.monotonic() < cancel_deadline:
+            # Keep draining the PTY while Bash fg restores terminal attributes.
+            # macOS uses a drain-waiting tcsetattr path here; if the test stops
+            # reading output, cleanup can deadlock even though a real terminal
+            # emulator would continue consuming those bytes.
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if readable:
+                try:
+                    output += os.read(master, 4096)
+                except OSError:
+                    pass
+            waited, candidate = os.waitpid(child, os.WNOHANG)
+            if waited:
+                status = candidate
+                launcher_reaped = True
+                break
+    try:
+        with open(transport_pid_file, "r", encoding="utf-8") as pid_file:
+            transport_pid = int(pid_file.read().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    try:
+        with open(f"{resume_marker}.pid", "r", encoding="utf-8") as pid_file:
+            observer_pid = int(pid_file.read().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    if launcher_reaped and transport_pid is not None:
+        adapter_gone_before_cleanup = wait_process_gone(transport_pid, 5)
+    if launcher_reaped and observer_pid is not None:
+        observer_gone_before_cleanup = wait_process_gone(observer_pid, 5)
+finally:
+    if not adapter_gone_before_cleanup and transport_pid is not None:
+        try:
+            if os.getsid(transport_pid) == child:
+                os.killpg(os.getpgid(transport_pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if not observer_gone_before_cleanup and observer_pid is not None:
+        try:
+            if os.getsid(observer_pid) == child:
+                os.killpg(os.getpgid(observer_pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if not launcher_reaped:
+        try:
+            os.killpg(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        launcher_reaped = reap_child(child, 2)
+        if not launcher_reaped:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            launcher_reaped = reap_child(child, 1)
+    os.close(master)
+
+exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
+success = (
+    suspend_sent
+    and suspend_observed
+    and resume_observed
+    and authenticated
+    and foreground_at_prompt
+    and launcher_reaped
+    and adapter_gone_before_cleanup
+    and observer_gone_before_cleanup
+    and exit_code == 130
+)
+if not success:
+    sys.stderr.write(
+        f"suspend_sent={suspend_sent} suspend_observed={suspend_observed} "
+        f"continue_observed={continue_observed} resume_observed={resume_observed} "
+        f"authenticated={authenticated} "
+        f"foreground_at_prompt={foreground_at_prompt} "
+        f"launcher_reaped={launcher_reaped} "
+        f"adapter_gone={adapter_gone_before_cleanup} "
+        f"observer_gone={observer_gone_before_cleanup} exit={exit_code}\n"
+    )
+    sys.stderr.buffer.write(output)
+sys.exit(0 if success else 1)
+PY
+if ((interactive_exit != 0)) && [[ -r "$interactive_auth_state" ]]; then
+  printf 'interactive state: %s\n' "$(cat "$interactive_auth_state")" >&2
+fi
+_assert_exit "interactive transport: ignores Ctrl-Z and reads authentication from a controlling TTY" \
+  0 "$interactive_exit"
+
+# Cancel at the credential prompt before remote control attachment. This proves
+# Ctrl-C is handled by the existing worker once, returns 130, and is not mistaken
+# for a collision that would launch a second authentication attempt.
+interactive_cancel_count="$tmp/interactive-cancel.count"
+interactive_cancel_runtime="$tmp/interactive-cancel-runtime"
+interactive_cancel_exit=0
+: >"$interactive_cancel_count"
+mkdir -p "$interactive_cancel_runtime"
+rm -f "$interactive_transport_pid_file"
+PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+  TMPDIR="$interactive_cancel_runtime" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$interactive_transport_pid_file" \
+  ETTUN_TEST_TRANSPORT_COUNT="$interactive_cancel_count" \
+  ETTUN_TEST_AUTH_RESULT="$interactive_auth_result" \
+  ETTUN_TEST_AUTH_STATE="$interactive_auth_state" \
+  ETTUN_TRANSPORT="$bin/interactive-transport" \
+  "$test_python" - "$BASH" "$SCRIPT" "$interactive_transport_pid_file" \
+  "$interactive_cancel_runtime" <<'PY' ||
+\
+import fcntl
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+
+bash, script, transport_pid_file, runtime_root = sys.argv[1:]
+
+def process_state(pid):
+    try:
+        session_id = os.getsid(pid)
+    except ProcessLookupError:
+        session_id = None
+    process = subprocess.run(
+        ["ps", "-o", "pid=,ppid=,pgid=,tpgid=,stat=", "-p", str(pid)],
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return f"sid={session_id} {process}".strip()
+
+def observe_runtime():
+    runtime_dirs = [
+        os.path.join(runtime_root, entry)
+        for entry in os.listdir(runtime_root)
+        if entry.startswith("ettun.")
+    ]
+    interrupted = any(
+        os.path.exists(os.path.join(runtime_dir, "transport.interrupted"))
+        for runtime_dir in runtime_dirs
+    )
+    return bool(runtime_dirs), interrupted
+
+master, slave = pty.openpty()
+child = os.fork()
+if child == 0:
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    for fd in (0, 1, 2):
+        os.dup2(slave, fd)
+    os.close(master)
+    os.close(slave)
+    os.execv(bash, ["bash", script, "gateway.example", "10450", "service.internal", "443"])
+
+os.close(slave)
+output = b""
+status = None
+cancel_sent = False
+completed_before_cleanup = False
+interrupted_seen = False
+launcher_state_before_cleanup = ""
+runtime_seen = False
+transport_state_before_cleanup = ""
+transport_gone_before_cleanup = False
+prompt_deadline = time.monotonic() + 20
+try:
+    while time.monotonic() < prompt_deadline:
+        observed_runtime, observed_interrupt = observe_runtime()
+        runtime_seen = runtime_seen or observed_runtime
+        interrupted_seen = interrupted_seen or observed_interrupt
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            try:
+                output += os.read(master, 4096)
+            except OSError:
+                break
+        if b"Passcode: " in output:
+            os.write(master, b"\x03")
+            cancel_sent = True
+            break
+    exit_deadline = time.monotonic() + 20
+    while cancel_sent and time.monotonic() < exit_deadline:
+        observed_runtime, observed_interrupt = observe_runtime()
+        runtime_seen = runtime_seen or observed_runtime
+        interrupted_seen = interrupted_seen or observed_interrupt
+        # Do not stop reading after Ctrl-C. Bash may need the PTY output queue to
+        # drain before macOS completes fg's terminal-state restoration.
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            try:
+                output += os.read(master, 4096)
+            except OSError:
+                pass
+        waited, candidate = os.waitpid(child, os.WNOHANG)
+        if waited:
+            status = candidate
+            break
+    completed_before_cleanup = status is not None
+    launcher_state_before_cleanup = process_state(child)
+    observed_runtime, observed_interrupt = observe_runtime()
+    runtime_seen = runtime_seen or observed_runtime
+    interrupted_seen = interrupted_seen or observed_interrupt
+    try:
+        with open(transport_pid_file, "r", encoding="utf-8") as pid_file:
+            observed_transport_pid = int(pid_file.read().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    else:
+        transport_state_before_cleanup = process_state(observed_transport_pid)
+    if completed_before_cleanup:
+        try:
+            with open(transport_pid_file, "r", encoding="utf-8") as pid_file:
+                completed_transport_pid = int(pid_file.read().strip())
+        except (FileNotFoundError, ValueError):
+            pass
+        else:
+            transport_deadline = time.monotonic() + 5
+            while time.monotonic() < transport_deadline:
+                transport_state = subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(completed_transport_pid)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                if not transport_state or transport_state.startswith("Z"):
+                    transport_gone_before_cleanup = True
+                    break
+                time.sleep(0.05)
+finally:
+    transport_pid = None
+    try:
+        with open(transport_pid_file, "r", encoding="utf-8") as pid_file:
+            transport_pid = int(pid_file.read().strip())
+        if os.getsid(transport_pid) == child:
+            os.killpg(os.getpgid(transport_pid), signal.SIGKILL)
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        pass
+    if status is None:
+        try:
+            os.killpg(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        reap_deadline = time.monotonic() + 2
+        while time.monotonic() < reap_deadline:
+            try:
+                waited, candidate = os.waitpid(child, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if waited:
+                status = candidate
+                break
+            time.sleep(0.05)
+    os.close(master)
+
+exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
+success = (
+    cancel_sent
+    and completed_before_cleanup
+    and transport_gone_before_cleanup
+    and exit_code == 130
+)
+if not success:
+    sys.stderr.write(
+        f"cancel_sent={cancel_sent} completed={completed_before_cleanup} "
+        f"runtime_seen={runtime_seen} interrupted_seen={interrupted_seen} "
+        f"transport_gone={transport_gone_before_cleanup} exit={exit_code}\n"
+        f"launcher_state={launcher_state_before_cleanup!r} "
+        f"transport_state={transport_state_before_cleanup!r}\n"
+    )
+    sys.stderr.buffer.write(output)
+sys.exit(0 if success else 1)
+PY
+  interactive_cancel_exit=$?
+_assert_exit "interactive authentication: Ctrl-C returns the conventional status" \
+  0 "$interactive_cancel_exit"
+_assert_eq "interactive authentication: Ctrl-C is not retried as a collision" \
+  "1" "$(wc -l <"$interactive_cancel_count" | tr -d ' ')"
+
+# Drive the hardest handoff ordering: the adapter repeatedly stops during attach,
+# Ctrl-Z must leave the launcher and its process group runnable, and a subsequent
+# Ctrl-C must still complete remote EOF cleanup with the conventional status.
+interactive_control_token="$tmp/interactive-control.token"
+interactive_control_eof="$tmp/interactive-control.eof"
+interactive_control_held="$tmp/interactive-control.held"
+interactive_control_resumed="$tmp/interactive-control.resumed"
+interactive_control_ready="$tmp/interactive-control.ready"
+interactive_pre_auth_stopped="$tmp/interactive-pre-auth.stopped"
+interactive_handoff_exit=0
+PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$interactive_transport_pid_file" \
+  ETTUN_TEST_AUTH_RESULT="$interactive_auth_result" \
+  ETTUN_TEST_CONTROL_TOKEN="$interactive_control_token" \
+  ETTUN_TEST_CONTROL_EOF="$interactive_control_eof" \
+  ETTUN_TEST_CONTROL_HELD="$interactive_control_held" \
+  ETTUN_TEST_CONTROL_RESUMED="$interactive_control_resumed" \
+  ETTUN_TEST_CONTROL_READY="$interactive_control_ready" \
+  ETTUN_TEST_PREAUTH_STOPPED="$interactive_pre_auth_stopped" \
+  ETTUN_TEST_RESTOP_AFTER_CONT=1 \
+  ETTUN_TEST_ACK_DELAY=1 \
+  ETTUN_TRANSPORT="$bin/interactive-attached-transport" \
+  "$test_python" - "$BASH" "$SCRIPT" "$interactive_transport_pid_file" \
+  "$interactive_auth_result" "$interactive_control_token" \
+  "$interactive_control_eof" "$interactive_control_held" \
+  "$interactive_control_resumed" "$interactive_control_ready" <<'PY' ||
+\
+import fcntl
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+
+(
+    bash,
+    script,
+    transport_pid_file,
+    auth_result,
+    token_file,
+    eof_file,
+    held_file,
+    resumed_file,
+    ready_file,
+) = sys.argv[1:]
+
+def read_integer(path):
+    try:
+        with open(path, "r", encoding="utf-8") as input_file:
+            return int(input_file.read().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+for path in (
+    transport_pid_file,
+    auth_result,
+    token_file,
+    eof_file,
+    held_file,
+    resumed_file,
+    ready_file,
+):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+master, slave = pty.openpty()
+child = os.fork()
+if child == 0:
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    for fd in (0, 1, 2):
+        os.dup2(slave, fd)
+    os.close(master)
+    os.close(slave)
+    os.execv(bash, ["bash", script, "gateway.example", "10449", "service.internal", "443"])
+
+os.close(slave)
+output = b""
+sent = False
+handoff = False
+suspend_sent = False
+suspend_proven = False
+status = None
+auth_ok = False
+foreground_pgid = None
+progress = None
+restop_count = None
+transport_pid = None
+deadline = time.monotonic() + 20
+try:
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            try:
+                output += os.read(master, 4096)
+            except OSError:
+                break
+        if not sent and b"Passcode: " in output:
+            os.write(master, b"test-passcode\n")
+            sent = True
+        restop_count = read_integer(resumed_file)
+        transport_pid = read_integer(transport_pid_file)
+        try:
+            with open(auth_result, "r", encoding="utf-8") as auth_input:
+                auth_ok = auth_input.read().strip() == "test-passcode"
+        except FileNotFoundError:
+            auth_ok = False
+        current_progress = (
+            sent,
+            auth_ok,
+            os.path.exists(ready_file),
+            os.path.exists(token_file),
+            os.path.exists(held_file),
+            restop_count,
+        )
+        if current_progress != progress:
+            progress = current_progress
+            deadline = time.monotonic() + 20
+        waited, candidate = os.waitpid(child, os.WNOHANG)
+        if waited:
+            status = candidate
+            break
+        ready = (
+            auth_ok
+            and os.path.exists(ready_file)
+            and os.path.exists(token_file)
+            and restop_count is not None
+            and restop_count >= 4
+            and transport_pid is not None
+            and os.path.exists(held_file)
+            and os.tcgetpgrp(master) == child
+        )
+        if ready:
+            # First prove an actual terminal Ctrl-Z cannot suspend the launcher.
+            # Then manufacture repeated transport stops so Ctrl-C arrives while
+            # both launcher and adapter are stopped, the macOS failure mode that
+            # originally stranded cleanup behind Bash job control.
+            os.write(master, b"\x1a")
+            suspend_sent = True
+            resume_target = restop_count + 1
+            os.killpg(os.getpgid(transport_pid), signal.SIGSTOP)
+            resume_deadline = time.monotonic() + 2
+            while time.monotonic() < resume_deadline:
+                launcher_state = subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(child)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                if launcher_state.startswith("T"):
+                    raise RuntimeError("launcher stopped after Ctrl-Z")
+                resumed_after_suspend = read_integer(resumed_file)
+                if (
+                    resumed_after_suspend is not None
+                    and resumed_after_suspend >= resume_target
+                    and os.tcgetpgrp(master) == child
+                ):
+                    break
+                time.sleep(0.01)
+            else:
+                raise RuntimeError("launcher made no progress after Ctrl-Z")
+
+            launcher_group = subprocess.run(
+                ["ps", "-axo", "pgid=,stat="],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            stopped = []
+            for process in launcher_group:
+                fields = process.split(None, 1)
+                if len(fields) == 2 and fields[0] == str(child) and fields[1].startswith("T"):
+                    stopped.append(process.strip())
+            if stopped:
+                raise RuntimeError(f"launcher process group stopped after Ctrl-Z: {stopped}")
+            suspend_proven = True
+
+            launcher_stopped = False
+            try:
+                os.kill(child, signal.SIGSTOP)
+                launcher_stopped = True
+                launcher_stop_deadline = time.monotonic() + 1
+                while time.monotonic() < launcher_stop_deadline:
+                    launcher_state = subprocess.run(
+                        ["ps", "-o", "stat=", "-p", str(child)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    if launcher_state.startswith("T"):
+                        break
+                    time.sleep(0.01)
+                else:
+                    raise RuntimeError("launcher did not stop before Ctrl-C")
+
+                os.killpg(os.getpgid(transport_pid), signal.SIGSTOP)
+            except ProcessLookupError:
+                if launcher_stopped:
+                    try:
+                        os.kill(child, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+                continue
+            try:
+                stop_deadline = time.monotonic() + 1
+                while time.monotonic() < stop_deadline:
+                    transport_state = subprocess.run(
+                        ["ps", "-o", "stat=", "-p", str(transport_pid)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    if transport_state.startswith("T"):
+                        break
+                    time.sleep(0.01)
+                else:
+                    raise RuntimeError("transport did not stop before Ctrl-C")
+                if os.tcgetpgrp(master) != child:
+                    raise RuntimeError("launcher lost the terminal before Ctrl-C")
+                os.write(master, b"\x03")
+                handoff = True
+            finally:
+                if launcher_stopped:
+                    try:
+                        os.kill(child, signal.SIGCONT)
+                    except ProcessLookupError:
+                        pass
+            break
+
+    exit_deadline = time.monotonic() + 8
+    while handoff and time.monotonic() < exit_deadline:
+        waited, candidate = os.waitpid(child, os.WNOHANG)
+        if waited:
+            status = candidate
+            break
+        # Continue draining for the same reason as the simpler authentication
+        # case: terminal restoration may wait for queued output on macOS.
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            try:
+                output += os.read(master, 4096)
+            except OSError:
+                pass
+finally:
+    transport_pid = read_integer(transport_pid_file)
+    try:
+        foreground_pgid = os.tcgetpgrp(master)
+    except OSError:
+        pass
+    if status is None:
+        try:
+            os.killpg(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            _, status = os.waitpid(child, 0)
+        except ChildProcessError:
+            pass
+    if transport_pid is not None:
+        try:
+            os.killpg(os.getpgid(transport_pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    os.close(master)
+
+exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
+token_ok = False
+try:
+    with open(token_file, "rb") as token_input:
+        token = token_input.read().strip()
+        token_ok = len(token) == 32 and all(character in b"0123456789abcdef" for character in token)
+except FileNotFoundError:
+    pass
+
+success = (
+    suspend_sent
+    and suspend_proven
+    and handoff
+    and exit_code == 130
+    and token_ok
+    and os.path.exists(eof_file)
+)
+if not success:
+    restop_count = read_integer(resumed_file)
+    sys.stderr.write(
+        f"suspend={suspend_sent}/{suspend_proven} handoff={handoff} "
+        f"exit={exit_code} token={token_ok} "
+        f"auth={auth_ok} ready={os.path.exists(ready_file)} "
+        f"resumes={restop_count} held={os.path.exists(held_file)} "
+        f"eof={os.path.exists(eof_file)} transport={transport_pid} "
+        f"foreground={foreground_pgid}\n"
+    )
+    sys.stderr.buffer.write(output)
+sys.exit(0 if success else 1)
+PY
+  interactive_handoff_exit=$?
+_assert_exit "interactive handoff: Ctrl-Z does not block Ctrl-C cleanup during a repeated stop" \
+  0 "$interactive_handoff_exit"
+_assert_file_exists "interactive handoff: forces a pre-attachment transport stop" \
+  "$interactive_pre_auth_stopped"
+
+# Simulate the narrow case where the worker records Ctrl-C and dies after control
+# handoff but before the launcher's wait has reaped it. The marker must dominate
+# the transient wait status, and the adapter process group must still disappear.
+late_interrupt_transport_pid="$tmp/late-interrupt-transport.pid"
+late_interrupt_auth_result="$tmp/late-interrupt-auth.result"
+late_interrupt_control_token="$tmp/late-interrupt-control.token"
+late_interrupt_control_eof="$tmp/late-interrupt-control.eof"
+late_interrupt_control_held="$tmp/late-interrupt-control.held"
+late_interrupt_control_resumed="$tmp/late-interrupt-control.resumed"
+late_interrupt_control_ready="$tmp/late-interrupt-control.ready"
+late_interrupt_runtime_root="$tmp/late-interrupt-runtime"
+mkdir -p "$late_interrupt_runtime_root"
+late_interrupt_exit=0
+PATH="$bin:/usr/local/bin:/usr/bin:/bin" \
+  TMPDIR="$late_interrupt_runtime_root" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$late_interrupt_transport_pid" \
+  ETTUN_TEST_AUTH_RESULT="$late_interrupt_auth_result" \
+  ETTUN_TEST_CONTROL_TOKEN="$late_interrupt_control_token" \
+  ETTUN_TEST_CONTROL_EOF="$late_interrupt_control_eof" \
+  ETTUN_TEST_CONTROL_HELD="$late_interrupt_control_held" \
+  ETTUN_TEST_CONTROL_RESUMED="$late_interrupt_control_resumed" \
+  ETTUN_TEST_CONTROL_READY="$late_interrupt_control_ready" \
+  ETTUN_TRANSPORT="$bin/interactive-attached-transport" \
+  "$test_python" - "$BASH" "$SCRIPT" "$late_interrupt_transport_pid" \
+  "$late_interrupt_auth_result" "$late_interrupt_control_resumed" \
+  "$late_interrupt_runtime_root" <<'PY'
+import fcntl
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+
+bash, script, transport_pid_file, auth_result, resumed_file, runtime_root = sys.argv[1:]
+
+def reap_child(pid, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True, None
+        if waited:
+            return True, status
+        time.sleep(0.05)
+    return False, None
+
+master, slave = pty.openpty()
+child = os.fork()
+if child == 0:
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    for fd in (0, 1, 2):
+        os.dup2(slave, fd)
+    os.close(master)
+    os.close(slave)
+    os.execv(bash, ["bash", script, "gateway.example", "10456", "service.internal", "443"])
+
+os.close(slave)
+output = b""
+sent = False
+status = None
+launcher_reaped = False
+transport_pid = None
+adapter_gone = False
+interrupt_injected = False
+deadline = time.monotonic() + 15
+try:
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([master], [], [], 0.1)
+        if readable:
+            try:
+                output += os.read(master, 4096)
+            except OSError:
+                pass
+        if not sent and b"Passcode: " in output:
+            os.write(master, b"test-passcode\n")
+            sent = True
+        if not interrupt_injected and os.path.exists(resumed_file):
+            try:
+                with open(transport_pid_file, "r", encoding="utf-8") as pid_input:
+                    resumed_transport_pid = int(pid_input.read().strip())
+            except (FileNotFoundError, ValueError):
+                pass
+            else:
+                runtime_dirs = [
+                    os.path.join(runtime_root, entry)
+                    for entry in os.listdir(runtime_root)
+                    if entry.startswith("ettun.")
+                ]
+                if runtime_dirs:
+                    open(
+                        os.path.join(runtime_dirs[0], "transport.interrupted"), "wb"
+                    ).close()
+                    os.killpg(os.getpgid(resumed_transport_pid), signal.SIGKILL)
+                    interrupt_injected = True
+        waited, candidate = os.waitpid(child, os.WNOHANG)
+        if waited:
+            status = candidate
+            launcher_reaped = True
+            break
+    try:
+        with open(transport_pid_file, "r", encoding="utf-8") as pid_input:
+            transport_pid = int(pid_input.read().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    if status is not None and transport_pid is not None:
+        gone_deadline = time.monotonic() + 2
+        while time.monotonic() < gone_deadline:
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(transport_pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                adapter_gone = True
+                break
+            time.sleep(0.05)
+finally:
+    if status is None:
+        try:
+            os.killpg(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        launcher_reaped, status = reap_child(child, 1)
+        if not launcher_reaped:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            launcher_reaped, status = reap_child(child, 1)
+    if not adapter_gone and transport_pid is not None:
+        try:
+            os.killpg(os.getpgid(transport_pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    os.close(master)
+
+exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
+authenticated = False
+try:
+    with open(auth_result, "r", encoding="utf-8") as auth_input:
+        authenticated = auth_input.read().strip() == "test-passcode"
+except FileNotFoundError:
+    pass
+success = (
+    sent
+    and authenticated
+    and os.path.exists(resumed_file)
+    and interrupt_injected
+    and adapter_gone
+    and launcher_reaped
+    and exit_code == 130
+)
+if not success:
+    sys.stderr.write(
+        f"sent={sent} auth={authenticated} resumed={os.path.exists(resumed_file)} "
+        f"injected={interrupt_injected} "
+        f"adapter_gone={adapter_gone} reaped={launcher_reaped} exit={exit_code}\n"
+    )
+    sys.stderr.buffer.write(output)
+sys.exit(0 if success else 1)
+PY
+late_interrupt_exit=$?
+_assert_exit "interactive handoff: late transport Ctrl-C returns status 130" \
+  0 "$late_interrupt_exit"
+
+echo ""
+
+_test_summary

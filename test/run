@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# Shared CI owns one required inventory lint; local runs still lint by default.
+# Reading the same typed inventory keeps the two paths from acquiring different
+# ideas of which generated fixtures and executable scripts are production shell.
+if [[ "${ETTUN_SKIP_SHELLCHECK:-0}" != 1 ]] &&
+  command -v shellcheck >/dev/null 2>&1; then
+  shell_files=()
+  while IFS=$'\t' read -r record_type path ||
+    [[ -n "$record_type$path" ]]; do
+    if [[ "$record_type" == program ]]; then
+      shell_files+=("$ROOT/$path")
+    fi
+  done <"$ROOT/.github/shellcheck-files.txt"
+  ((${#shell_files[@]} > 0)) || {
+    printf 'test/run: ShellCheck inventory has no programs\n' >&2
+    exit 1
+  }
+  (
+    cd "$ROOT"
+    shellcheck -x -P SCRIPTDIR "${shell_files[@]}"
+  )
+fi
+
+# Keep these suites ordered. They deliberately manipulate process groups,
+# pseudo-terminals, and loopback listeners whose timing signal is weakened when
+# multiple suites compete on one runner.
+for suite in \
+  "$ROOT/test/ettun-collision-test" \
+  "$ROOT/test/ettun-custom-test" \
+  "$ROOT/test/ettun-default-test"; do
+  "$suite"
+done
