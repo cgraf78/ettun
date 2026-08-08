@@ -78,6 +78,39 @@ _local_port_closed() {
   return 1
 }
 
+_ncat_supports_ettun() {
+  local help
+
+  command -v ncat >/dev/null 2>&1 || return 1
+  help=$(ncat --help 2>&1 || true)
+  [[ "$help" == *--listen* && "$help" == *--keep-open* &&
+    "$help" == *--sh-exec* && "$help" == *--exec* &&
+    "$help" == *--recv-only* ]]
+}
+
+_real_relay_available() {
+  command -v socat >/dev/null 2>&1 || _ncat_supports_ettun
+}
+
+# Some platforms expose OpenBSD netcat under the `ncat` name even though its
+# interface is not Nmap Ncat's. Gate the optional real-relay scenarios on the
+# flags the generated supervisor actually uses, not merely the executable name.
+relay_probe_bin="$tmp/relay-probe-bin"
+mkdir -p "$relay_probe_bin"
+_write_stub "$relay_probe_bin/ncat" \
+  'printf "%s\n" "--listen --keep-open --sh-exec --exec --recv-only"'
+if PATH="$relay_probe_bin:$test_system_path" _ncat_supports_ettun; then
+  _pass "relay capability: accepts the Nmap Ncat interface"
+else
+  _fail "relay capability: accepts the Nmap Ncat interface"
+fi
+_write_stub "$relay_probe_bin/ncat" 'printf "%s\n" "usage: nc [-l]"'
+if PATH="$relay_probe_bin:$test_system_path" _ncat_supports_ettun; then
+  _fail "relay capability: rejects an OpenBSD netcat alias"
+else
+  _pass "relay capability: rejects an OpenBSD netcat alias"
+fi
+
 _capture_default_launch() {
   local local_port="${1:-10443}"
   _run_ettun gateway.example "$local_port" service.internal 443
@@ -520,7 +553,7 @@ fi
 rm -f "$bootstrap_dir"
 rm -rf "$bootstrap_guard_target"
 
-if command -v ncat >/dev/null 2>&1 || command -v socat >/dev/null 2>&1; then
+if _real_relay_available; then
   _select_local_remote_launch
   base64_invoked="$tmp/bootstrap-base64.invoked"
   _write_stub "$remote_bin/base64" \
@@ -641,7 +674,7 @@ PY
     _fail "remote bootstrap deadline: removes private temporary files"
   fi
 else
-  printf '  SKIP: real bootstrap relay checks require local ncat or socat\n'
+  printf '  SKIP: real bootstrap relay checks require local socat or Nmap Ncat\n'
 fi
 
 setup_exit=0
@@ -861,9 +894,7 @@ wait "$replacement_pid" || true
 rm -f "$remote_fifos/$control_remote_port" "$remote_fifos/$stop_remote_port" \
   "$remote_fifos/$replacement_control" "$remote_fifos/$replacement_stop"
 
-if command -v flock >/dev/null 2>&1 && {
-  command -v ncat >/dev/null 2>&1 || command -v socat >/dev/null 2>&1
-}; then
+if command -v flock >/dev/null 2>&1 && _real_relay_available; then
   control_stop_cache="$tmp/control-stop-cache"
   control_stop_state="$control_stop_cache/ettun/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10451"
   mkdir -p "$control_stop_cache"
@@ -933,7 +964,7 @@ PY
     _fail "remote pre-attachment stop: releases the stop listener"
   fi
 else
-  printf '  SKIP: real supervisor stop check requires local flock and ncat or socat\n'
+  printf '  SKIP: real supervisor stop check requires local flock and socat or Nmap Ncat\n'
 fi
 
 echo ""
