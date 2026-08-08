@@ -1,0 +1,652 @@
+#!/usr/bin/env bash
+# ettun-collision-test - collision, signal, and validation behavior.
+
+# shellcheck disable=SC2016,SC2154
+# shellcheck source=ettun-fixture.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ettun-fixture.sh"
+
+echo "=== test harness safety ==="
+
+tmpdir_failure_exit=0
+tmpdir_failure_output=$(
+  # _tmpdir resolves this subshell-local fault injector by command name;
+  # ShellCheck cannot see that indirect call through the shared helper.
+  # shellcheck disable=SC2329
+  mktemp() { return 1; }
+  _tmpdir 2>&1
+) || tmpdir_failure_exit=$?
+_assert_exit "temporary directory: mktemp failure is fatal" 1 \
+  "$tmpdir_failure_exit"
+_assert_contains "temporary directory: mktemp failure is actionable" \
+  "could not create suite temporary directory" "$tmpdir_failure_output"
+
+tmpdir_escape_exit=0
+tmpdir_escape_output=$(
+  # Model a compromised mktemp result without creating or touching /bin.
+  # _tmpdir invokes this subshell-local function indirectly by command name.
+  # shellcheck disable=SC2329
+  mktemp() { printf '/bin\n'; }
+  _tmpdir 2>&1
+) || tmpdir_escape_exit=$?
+_assert_exit "temporary directory: out-of-root result is rejected" 1 \
+  "$tmpdir_escape_exit"
+_assert_contains "temporary directory: out-of-root result is actionable" \
+  "unsafe suite temporary directory" "$tmpdir_escape_output"
+
+echo "=== ettun collision handling ==="
+
+ETTUN_TEST_COLLISIONS=2 \
+  _run_ettun gateway.example 10443 service.internal 443
+unset ETTUN_TEST_COLLISIONS
+attempts=$(grep -c '^et$' "$log")
+mappings=$(sed -n '/^<-t>$/{n;p;}' "$log")
+unique_mappings=$(printf '%s\n' "$mappings" | sort -u | wc -l | tr -d ' ')
+_assert_exit "relay collision: retries to success" 0 "$run_exit"
+_assert_eq "relay collision: makes exactly three attempts" "3" "$attempts"
+_assert_eq "relay collision: selects a distinct mapping per attempt" "3" "$unique_mappings"
+_assert_contains "relay collision: preserves collision diagnostics" \
+  "ETTUN_COLLISION:" "$(cat "$stderr")"
+
+ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example 10443 service.internal 443
+unset ETTUN_TEST_EXIT
+attempts=$(grep -c '^et$' "$log")
+_assert_exit "transport failure: preserves the exit status" 23 "$run_exit"
+_assert_eq "transport failure: is not retried without a collision marker" "1" "$attempts"
+
+ETTUN_TEST_FATAL_STATUS=127 \
+  _run_ettun gateway.example 10443 service.internal 443
+unset ETTUN_TEST_FATAL_STATUS
+attempts=$(grep -c '^et$' "$log")
+_assert_exit "remote fatal error: survives ET masking the remote status" 127 "$run_exit"
+_assert_eq "remote fatal error: is not retried as a port collision" "1" "$attempts"
+
+ETTUN_TEST_ECHO_ARGS=1 \
+  _run_ettun gateway.example 10443 service.internal 443
+unset ETTUN_TEST_ECHO_ARGS
+attempts=$(grep -c '^et$' "$log")
+_assert_exit "verbose transport: echoed argv does not forge a collision" 0 "$run_exit"
+_assert_eq "verbose transport: is not retried" "1" "$attempts"
+
+signal_transport_pid_file="$tmp/signal-transport.pid"
+signal_child_pid_file="$tmp/signal-child.pid"
+signal_runtime_root="$tmp/signal-runtime"
+mkdir -p "$signal_runtime_root"
+PATH="$bin:$test_system_path" \
+  TMPDIR="$signal_runtime_root" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$signal_transport_pid_file" \
+  ETTUN_TEST_TRANSPORT_CHILD_PID="$signal_child_pid_file" \
+  ETTUN_TRANSPORT="$bin/blocking-transport" \
+  bash "$SCRIPT" gateway.example 10443 service.internal 443 \
+  </dev/null >"$tmp/signal.stdout" 2>"$tmp/signal.stderr" &
+signal_tunnel_pid=$!
+_wait_for_file "$signal_transport_pid_file" || _fail "signal handling: transport starts"
+_wait_for_file "$signal_child_pid_file" || _fail "signal handling: adapter child starts"
+read -r signal_transport_pid <"$signal_transport_pid_file"
+read -r signal_child_pid <"$signal_child_pid_file"
+signal_runtime_dir=""
+for _ in {1..50}; do
+  for candidate in "$signal_runtime_root"/ettun.*; do
+    if [[ -d "$candidate" ]]; then
+      signal_runtime_dir="$candidate"
+      break 2
+    fi
+  done
+  sleep 0.1
+done
+if [[ -n "$signal_runtime_dir" ]]; then
+  # Model interruption on either side of the atomic rename. TERM kills the
+  # worker before it can consume these, so only outer cleanup can remove both
+  # files and successfully remove the private runtime directory.
+  : >"$signal_runtime_dir/transport.status"
+  : >"$signal_runtime_dir/transport.status.tmp"
+else
+  _fail "signal handling: creates private runtime state"
+fi
+kill -TERM "$signal_tunnel_pid"
+for _ in {1..50}; do
+  signal_state=$(ps -o stat= -p "$signal_tunnel_pid" 2>/dev/null || true)
+  [[ -z "$signal_state" || "$signal_state" == *Z* ]] && break
+  sleep 0.1
+done
+signal_exit=0
+wait "$signal_tunnel_pid" || signal_exit=$?
+_assert_exit "signal handling: preserves TERM status" 143 "$signal_exit"
+if _wait_for_processes_stopped "$signal_transport_pid" "$signal_child_pid"; then
+  _pass "signal handling: terminates the adapter process tree"
+else
+  _fail "signal handling: terminates the adapter process tree"
+  kill -KILL "$signal_transport_pid" "$signal_child_pid" 2>/dev/null || true
+fi
+if [[ -n "$signal_runtime_dir" && ! -e "$signal_runtime_dir" ]]; then
+  _pass "signal handling: removes status publication state"
+else
+  _fail "signal handling: removes status publication state"
+fi
+
+rm -f "$signal_transport_pid_file" "$signal_child_pid_file"
+PATH="$bin:$test_system_path" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$signal_transport_pid_file" \
+  ETTUN_TEST_TRANSPORT_CHILD_PID="$signal_child_pid_file" \
+  ETTUN_TRANSPORT="$bin/blocking-transport" \
+  bash "$SCRIPT" gateway.example 10451 service.internal 443 \
+  </dev/null >"$tmp/sigkill.stdout" 2>"$tmp/sigkill.stderr" &
+sigkill_tunnel_pid=$!
+_wait_for_file "$signal_transport_pid_file" ||
+  _fail "parent death: transport starts"
+_wait_for_file "$signal_child_pid_file" ||
+  _fail "parent death: adapter child starts"
+read -r sigkill_transport_pid <"$signal_transport_pid_file"
+read -r sigkill_child_pid <"$signal_child_pid_file"
+kill -KILL "$sigkill_tunnel_pid"
+sigkill_exit=0
+wait "$sigkill_tunnel_pid" 2>/dev/null || sigkill_exit=$?
+_assert_exit "parent death: launcher reports SIGKILL" 137 "$sigkill_exit"
+for _ in {1..50}; do
+  sigkill_transport_state=$(ps -o stat= -p "$sigkill_transport_pid" 2>/dev/null || true)
+  sigkill_child_state=$(ps -o stat= -p "$sigkill_child_pid" 2>/dev/null || true)
+  if [[ -z "$sigkill_transport_state" || "$sigkill_transport_state" == *Z* ]] &&
+    [[ -z "$sigkill_child_state" || "$sigkill_child_state" == *Z* ]]; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ -z "$sigkill_transport_state" || "$sigkill_transport_state" == *Z* ]] &&
+  [[ -z "$sigkill_child_state" || "$sigkill_child_state" == *Z* ]]; then
+  _pass "parent death: watchdog terminates the adapter process tree"
+else
+  _fail "parent death: watchdog terminates the adapter process tree"
+  kill -KILL "$sigkill_transport_pid" "$sigkill_child_pid" 2>/dev/null || true
+fi
+
+delayed_transport_pid_file="$tmp/delayed-transport.pid"
+delayed_control_token_file="$tmp/delayed-control.token"
+PATH="$bin:$test_extended_system_path" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$delayed_transport_pid_file" \
+  ETTUN_TEST_CONTROL_TOKEN="$delayed_control_token_file" \
+  ETTUN_TRANSPORT="$bin/delayed-control-transport" \
+  bash "$SCRIPT" gateway.example 10445 service.internal 443 \
+  </dev/null >"$tmp/delayed.stdout" 2>"$tmp/delayed.stderr" &
+delayed_tunnel_pid=$!
+_wait_for_file "$delayed_transport_pid_file" ||
+  _fail "signal handling: delayed-control transport starts"
+read -r delayed_transport_pid <"$delayed_transport_pid_file"
+kill -TERM "$delayed_tunnel_pid"
+delayed_exit=0
+wait "$delayed_tunnel_pid" || delayed_exit=$?
+_assert_exit "signal handling: delayed control preserves TERM status" 143 "$delayed_exit"
+if _wait_for_file "$delayed_control_token_file"; then
+  delayed_control_token=$(tr -d '\r\n' <"$delayed_control_token_file")
+  if [[ "$delayed_control_token" =~ ^ETTUN_STOP:[0-9a-f]{32}$ ]]; then
+    _pass "signal handling: retries a control channel still starting"
+  else
+    _fail "signal handling: delayed control receives the exact stop token"
+  fi
+else
+  _fail "signal handling: retries a control channel still starting"
+fi
+if _wait_for_processes_stopped "$delayed_transport_pid"; then
+  _pass "signal handling: terminates the delayed-control transport"
+else
+  _fail "signal handling: terminates the delayed-control transport"
+  kill -KILL "$delayed_transport_pid" 2>/dev/null || true
+fi
+
+dropping_transport_pid_file="$tmp/dropping-transport.pid"
+dropping_control_token_file="$tmp/dropping-control.token"
+dropping_control_ready_file="$tmp/dropping-control.ready"
+dropping_control_gate_file="$tmp/dropping-control.gate"
+dropping_control_dropped_file="$tmp/dropping-control.dropped"
+PATH="$bin:$test_extended_system_path" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$dropping_transport_pid_file" \
+  ETTUN_TEST_CONTROL_TOKEN="$dropping_control_token_file" \
+  ETTUN_TEST_CONTROL_READY="$dropping_control_ready_file" \
+  ETTUN_TEST_CONTROL_GATE="$dropping_control_gate_file" \
+  ETTUN_TEST_CONTROL_DROPPED="$dropping_control_dropped_file" \
+  ETTUN_TRANSPORT="$bin/dropping-control-transport" \
+  bash "$SCRIPT" gateway.example 10448 service.internal 443 \
+  </dev/null >"$tmp/dropping.stdout" 2>"$tmp/dropping.stderr" &
+dropping_tunnel_pid=$!
+_wait_for_file "$dropping_transport_pid_file" ||
+  _fail "signal handling: early-drop transport starts"
+_wait_for_marker "$dropping_control_ready_file" ||
+  _fail "signal handling: early-drop listener starts"
+read -r dropping_transport_pid <"$dropping_transport_pid_file"
+: >"$dropping_control_gate_file"
+kill -TERM "$dropping_tunnel_pid"
+dropping_exit=0
+wait "$dropping_tunnel_pid" || dropping_exit=$?
+_assert_exit "signal handling: early-drop control preserves TERM status" 143 "$dropping_exit"
+_wait_for_marker "$dropping_control_dropped_file" ||
+  _fail "signal handling: reproduces a locally accepted control drop"
+if _wait_for_file "$dropping_control_token_file"; then
+  dropping_control_token=$(tr -d '\r\n' <"$dropping_control_token_file")
+  if [[ "$dropping_control_token" =~ ^ETTUN_STOP:[0-9a-f]{32}$ ]]; then
+    _pass "signal handling: retries after a locally accepted control drop"
+  else
+    _fail "signal handling: retry sends the exact stop token after a drop"
+  fi
+else
+  _fail "signal handling: retries after a locally accepted control drop"
+fi
+if _wait_for_processes_stopped "$dropping_transport_pid"; then
+  _pass "signal handling: terminates the early-drop transport"
+else
+  _fail "signal handling: terminates the early-drop transport"
+  kill -KILL "$dropping_transport_pid" 2>/dev/null || true
+fi
+
+terminal_transport_pid_file="$tmp/terminal-transport.pid"
+terminal_control_token_file="$tmp/terminal-control.token"
+terminal_control_ready_file="$tmp/terminal-control.ready"
+terminal_control_attached_file="$tmp/terminal-control.attached"
+terminal_control_eof_file="$tmp/terminal-control.eof"
+PATH="$bin:$test_extended_system_path" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$terminal_transport_pid_file" \
+  ETTUN_TEST_CONTROL_TOKEN="$terminal_control_token_file" \
+  ETTUN_TEST_CONTROL_READY="$terminal_control_ready_file" \
+  ETTUN_TEST_CONTROL_ATTACHED="$terminal_control_attached_file" \
+  ETTUN_TEST_CONTROL_EOF="$terminal_control_eof_file" \
+  ETTUN_TRANSPORT="$bin/delayed-control-transport" \
+  "$test_python" - "$BASH" "$SCRIPT" gateway.example 10446 service.internal 443 \
+  >"$tmp/terminal.stdout" 2>"$tmp/terminal.stderr" <<'PY' &
+import os
+import signal
+import sys
+
+os.setsid()
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+bash, *command = sys.argv[1:]
+os.execv(bash, ["bash", *command])
+PY
+terminal_tunnel_pid=$!
+_wait_for_file "$terminal_transport_pid_file" ||
+  _fail "signal handling: terminal-interrupt transport starts"
+_wait_for_marker "$terminal_control_ready_file" ||
+  _fail "signal handling: terminal-interrupt control channel starts"
+_wait_for_file "$terminal_control_token_file" ||
+  _fail "signal handling: terminal-interrupt control handoff starts"
+_wait_for_marker "$terminal_control_attached_file" ||
+  _fail "signal handling: terminal-interrupt control handoff is acknowledged"
+read -r terminal_transport_pid <"$terminal_transport_pid_file"
+terminal_pgid=$(ps -o pgid= -p "$terminal_tunnel_pid" | tr -d ' ')
+kill -INT -- "-$terminal_pgid"
+terminal_exit=0
+wait "$terminal_tunnel_pid" || terminal_exit=$?
+_assert_exit "signal handling: terminal Ctrl-C preserves INT status" 130 "$terminal_exit"
+if _wait_for_file "$terminal_control_token_file"; then
+  terminal_control_token=$(tr -d '\r\n' <"$terminal_control_token_file")
+  if [[ "$terminal_control_token" =~ ^[0-9a-f]{32}$ ]] &&
+    _wait_for_marker "$terminal_control_eof_file"; then
+    _pass "signal handling: terminal Ctrl-C keeps control forwarding alive for cleanup"
+  elif [[ ! "$terminal_control_token" =~ ^[0-9a-f]{32}$ ]]; then
+    _fail "signal handling: terminal Ctrl-C sends the exact handoff token"
+  else
+    _fail "signal handling: terminal Ctrl-C closes the acknowledged control stream"
+  fi
+else
+  _fail "signal handling: terminal Ctrl-C keeps control forwarding alive for cleanup"
+fi
+if _wait_for_processes_stopped "$terminal_transport_pid"; then
+  _pass "signal handling: terminates the terminal-interrupt transport"
+else
+  _fail "signal handling: terminates the terminal-interrupt transport"
+  kill -KILL "$terminal_transport_pid" 2>/dev/null || true
+fi
+
+_write_stub "$bin/od" \
+  ': >"$ETTUN_TEST_SETUP_READY"' \
+  'sleep 1' \
+  'printf " 01 23 45 67 89 ab cd ef 01 23 45 67 89 ab cd ef\\n"'
+setup_suspend_ready="$tmp/setup-suspend-ready"
+setup_suspend_transport_log="$tmp/setup-suspend-transport.log"
+setup_suspend_exit=0
+PATH="$bin:$test_extended_system_path" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_SETUP_READY="$setup_suspend_ready" \
+  ETTUN_TEST_LOG="$setup_suspend_transport_log" \
+  ETTUN_TRANSPORT="$bin/test-transport" \
+  "$test_python" - "$BASH" "$SCRIPT" "$setup_suspend_ready" \
+  "$setup_suspend_transport_log" \
+  >"$tmp/setup-suspend.stdout" 2>"$tmp/setup-suspend.stderr" <<'PY' ||
+setup_suspend_exit=$?
+import os
+import signal
+import sys
+import time
+
+bash, script, ready_file, transport_log = sys.argv[1:]
+os.setsid()
+signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+child = os.fork()
+if child == 0:
+    os.setpgid(0, 0)
+    os.execv(
+        bash,
+        ["bash", script, "gateway.example", "10452", "service.internal", "443"],
+    )
+
+status = None
+ready_deadline = time.monotonic() + 5
+while not os.path.exists(ready_file) and time.monotonic() < ready_deadline:
+    time.sleep(0.01)
+
+progress = False
+if os.path.exists(ready_file):
+    os.killpg(child, signal.SIGTSTP)
+    progress_deadline = time.monotonic() + 5
+    while time.monotonic() < progress_deadline:
+        try:
+            progress = os.path.getsize(transport_log) > 0
+        except FileNotFoundError:
+            progress = False
+        if progress:
+            break
+        time.sleep(0.01)
+
+if progress:
+    exit_deadline = time.monotonic() + 5
+    while time.monotonic() < exit_deadline:
+        waited, candidate = os.waitpid(child, os.WNOHANG)
+        if waited:
+            status = candidate
+            break
+        time.sleep(0.01)
+
+if status is None:
+    try:
+        os.killpg(child, signal.SIGCONT)
+        os.killpg(child, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    exit_deadline = time.monotonic() + 2
+    while time.monotonic() < exit_deadline:
+        try:
+            waited, candidate = os.waitpid(child, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if waited:
+            status = candidate
+            break
+        time.sleep(0.01)
+if status is None:
+    try:
+        os.killpg(child, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        _, status = os.waitpid(child, 0)
+    except ChildProcessError:
+        pass
+
+exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
+success = os.path.exists(ready_file) and progress and exit_code == 0
+if not success:
+    sys.stderr.write(
+        f"ready={os.path.exists(ready_file)} progress={progress} exit={exit_code}\n"
+    )
+sys.exit(0 if success else 1)
+PY
+  _assert_exit "signal handling: Ctrl-Z is ignored during setup" 0 "$setup_suspend_exit"
+if ((setup_suspend_exit != 0)); then
+  cat "$tmp/setup-suspend.stderr" >&2
+fi
+
+setup_ready="$tmp/setup-ready"
+setup_transport_log="$tmp/setup-transport.log"
+PATH="$bin:$test_system_path" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_SETUP_READY="$setup_ready" \
+  ETTUN_TEST_LOG="$setup_transport_log" \
+  ETTUN_TRANSPORT="$bin/test-transport" \
+  bash "$SCRIPT" gateway.example 10444 service.internal 443 \
+  </dev/null >"$tmp/setup.stdout" 2>"$tmp/setup.stderr" &
+setup_tunnel_pid=$!
+_wait_for_marker "$setup_ready" || _fail "signal handling: setup reaches token generation"
+kill -TERM "$setup_tunnel_pid"
+setup_exit=0
+wait "$setup_tunnel_pid" || setup_exit=$?
+_assert_exit "signal handling: TERM during setup exits" 143 "$setup_exit"
+if [[ ! -s "$setup_transport_log" ]]; then
+  _pass "signal handling: TERM during setup launches no transport"
+else
+  _fail "signal handling: TERM during setup launches no transport"
+fi
+
+# The delayed od stub above belongs to the setup-signal scenarios: its marker
+# proves those tests reached token generation before delivering a signal.
+# Remove it before testing persistent identity so that scenario exercises the
+# platform's real entropy tool without depending on the now-unset marker.
+rm -f "$bin/od"
+
+ETTUN_TEST_CLIENT_ID='' \
+  _run_ettun gateway.example 10443 service.internal 443
+client_id_file="$test_home/state/ettun/client-id"
+client_id=""
+[[ -r "$client_id_file" ]] && read -r client_id <"$client_id_file"
+if [[ "$client_id" =~ ^[0-9a-f]{32}$ ]]; then
+  _pass "client identity: creates a stable random id"
+else
+  _fail "client identity: creates a stable random id (got '$client_id')"
+  printf '    ettun exit: %s\n' "$run_exit" >&2
+  if [[ -s "$stderr" ]]; then
+    sed 's/^/    ettun stderr: /' "$stderr" >&2
+  else
+    printf '    ettun stderr: <empty>\n' >&2
+  fi
+fi
+client_mode=""
+if [[ -e "$client_id_file" ]]; then
+  client_mode=$(stat -c '%a' "$client_id_file" 2>/dev/null ||
+    stat -f '%Lp' "$client_id_file")
+fi
+_assert_eq "client identity: protects the id file" "600" "$client_mode"
+first_client_id=$client_id
+ETTUN_TEST_CLIENT_ID='' \
+  _run_ettun gateway.example 10443 service.internal 443
+client_id=""
+[[ -r "$client_id_file" ]] && read -r client_id <"$client_id_file"
+if [[ "$first_client_id" =~ ^[0-9a-f]{32}$ &&
+  "$client_id" == "$first_client_id" ]]; then
+  _pass "client identity: remains stable across launches"
+else
+  _fail "client identity: remains stable across launches"
+fi
+
+# Android app storage rejects hard links. Reproduce that constraint while two
+# first launches compete, and hold the elected publisher at its final rename so
+# the other launch must observe the lock rather than merely reuse a finished ID.
+identity_race_home="$tmp/identity-race-home"
+identity_race_state="$identity_race_home/state/ettun"
+identity_ln_attempts="$tmp/identity-ln-attempts"
+identity_lock_attempts="$tmp/identity-lock-attempts"
+identity_mv_ready="$tmp/identity-mv-ready"
+identity_mv_release="$tmp/identity-mv-release"
+mkdir -p "$identity_race_home"
+: >"$identity_ln_attempts"
+: >"$identity_lock_attempts"
+_write_stub "$bin/ln" \
+  'printf "%s\n" "$PPID" >>"$ETTUN_TEST_IDENTITY_LN_ATTEMPTS"' \
+  'exit 1'
+_write_stub "$bin/mkdir" \
+  "real_mkdir=$real_mkdir_q" \
+  'for arg in "$@"; do' \
+  '  case "$arg" in' \
+  '    */client-id.lock)' \
+  '      printf "%s\n" "$PPID" >>"$ETTUN_TEST_IDENTITY_LOCK_ATTEMPTS"' \
+  '      ;;' \
+  '  esac' \
+  'done' \
+  'exec "$real_mkdir" "$@"'
+_write_stub "$bin/mv" \
+  "real_mv=$real_mv_q" \
+  'if [[ "${2:-}" == */client-id ]]; then' \
+  '  : >"$ETTUN_TEST_IDENTITY_MV_READY"' \
+  '  while [[ ! -e "$ETTUN_TEST_IDENTITY_MV_RELEASE" ]]; do sleep 0.01; done' \
+  'fi' \
+  'exec "$real_mv" "$@"'
+
+_run_identity_candidate() {
+  local name="$1" local_port="$2"
+
+  PATH="$bin:$test_system_path" \
+    HOME="$identity_race_home" \
+    XDG_STATE_HOME="$identity_race_home/state" \
+    ETTUN_CLIENT_ID='' \
+    ETTUN_TRANSPORT=true \
+    ETTUN_TEST_PYTHON="$test_python" \
+    ETTUN_TEST_PORT_PROBE_ERROR="$tmp/identity-$name-probe.error" \
+    ETTUN_TEST_IDENTITY_LN_ATTEMPTS="$identity_ln_attempts" \
+    ETTUN_TEST_IDENTITY_LOCK_ATTEMPTS="$identity_lock_attempts" \
+    ETTUN_TEST_IDENTITY_MV_READY="$identity_mv_ready" \
+    ETTUN_TEST_IDENTITY_MV_RELEASE="$identity_mv_release" \
+    bash "$SCRIPT" gateway.example "$local_port" service.internal 443 \
+    >"$tmp/identity-$name.stdout" 2>"$tmp/identity-$name.stderr"
+}
+
+_run_identity_candidate first 10461 &
+identity_first_pid=$!
+if _wait_for_marker "$identity_mv_ready"; then
+  _pass "client identity fallback: stages a complete elected candidate"
+else
+  _fail "client identity fallback: stages a complete elected candidate"
+fi
+_run_identity_candidate second 10462 &
+identity_second_pid=$!
+identity_lock_observed=0
+for _ in {1..80}; do
+  identity_lock_count=$(wc -l <"$identity_lock_attempts")
+  if ((identity_lock_count >= 2)); then
+    identity_lock_observed=1
+    break
+  fi
+  sleep 0.1
+done
+if ((identity_lock_observed == 1)); then
+  _pass "client identity fallback: serializes competing first launches"
+else
+  _fail "client identity fallback: serializes competing first launches"
+fi
+: >"$identity_mv_release"
+identity_first_exit=0
+wait "$identity_first_pid" || identity_first_exit=$?
+identity_second_exit=0
+wait "$identity_second_pid" || identity_second_exit=$?
+_assert_exit "client identity fallback: elected launch succeeds" \
+  0 "$identity_first_exit"
+_assert_exit "client identity fallback: waiting launch succeeds" \
+  0 "$identity_second_exit"
+
+identity_race_file="$identity_race_state/client-id"
+identity_race_value=""
+[[ -r "$identity_race_file" ]] && read -r identity_race_value <"$identity_race_file"
+if [[ "$identity_race_value" =~ ^[0-9a-f]{32}$ ]]; then
+  _pass "client identity fallback: publishes one valid identity"
+else
+  _fail "client identity fallback: publishes one valid identity"
+fi
+identity_race_mode=""
+if [[ -e "$identity_race_file" ]]; then
+  identity_race_mode=$(stat -c '%a' "$identity_race_file" 2>/dev/null ||
+    stat -f '%Lp' "$identity_race_file")
+fi
+_assert_eq "client identity fallback: protects the published identity" \
+  "600" "$identity_race_mode"
+if [[ ! -e "$identity_race_file.lock" ]]; then
+  _pass "client identity fallback: releases its publication lock"
+else
+  _fail "client identity fallback: releases its publication lock"
+fi
+identity_temp_count=0
+for identity_temp in "$identity_race_state"/client-id.tmp.*; do
+  [[ ! -e "$identity_temp" ]] || identity_temp_count=$((identity_temp_count + 1))
+done
+_assert_eq "client identity fallback: removes losing candidates" \
+  0 "$identity_temp_count"
+rm -f "$bin/ln" "$bin/mkdir" "$bin/mv"
+
+echo ""
+echo "=== ettun validation and errors ==="
+
+ETTUN_TEST_CLIENT_ID=invalid _run_ettun gateway.example 10443 service.internal 443
+unset ETTUN_TEST_CLIENT_ID
+_assert_exit "invalid canonical client id: rejected" 1 "$run_exit"
+_assert_contains "invalid canonical client id: names the new variable" \
+  "ETTUN_CLIENT_ID must be 32 lowercase hex characters" "$(cat "$stderr")"
+_assert_file_content "invalid canonical client id: launches no transport" "" "$log"
+
+_run_ettun --help
+_assert_exit "help: succeeds" 0 "$run_exit"
+_assert_contains "help: shows the compact positional interface" \
+  "ettun VIA LOCAL_PORT TARGET TARGET_PORT" "$(cat "$stderr")"
+_assert_contains "help: documents Ctrl-Z behavior for the tunnel lifetime" \
+  "Ctrl-Z is ignored for the tunnel's lifetime" "$(cat "$stderr")"
+_assert_file_content "help: launches no transport" "" "$log"
+
+_run_ettun gateway.example 10443 service.internal
+_assert_exit "missing argument: rejected" 2 "$run_exit"
+_assert_contains "missing argument: error is actionable" "expected four arguments" "$(cat "$stderr")"
+_assert_file_content "missing argument: rejected before transport" "" "$log"
+
+_run_ettun 'bad;command' 10443 service.internal 443
+_assert_exit "unsafe via host: rejected" 2 "$run_exit"
+_assert_contains "unsafe via host: error is actionable" "invalid via host" "$(cat "$stderr")"
+_assert_file_content "unsafe via host: rejected before transport" "" "$log"
+
+_run_ettun gateway.example 10443 'bad;command' 443
+_assert_exit "unsafe target host: rejected" 2 "$run_exit"
+_assert_contains "unsafe target host: error is actionable" "invalid target host" "$(cat "$stderr")"
+_assert_file_content "unsafe target host: rejected before transport" "" "$log"
+
+_run_ettun gateway.example 0 service.internal 443
+_assert_exit "invalid local port: rejected" 2 "$run_exit"
+_assert_contains "invalid local port: error is actionable" "invalid local port" "$(cat "$stderr")"
+_assert_file_content "invalid local port: rejected before transport" "" "$log"
+
+_run_ettun gateway.example 10443 service.internal 70000
+_assert_exit "invalid target port: rejected" 2 "$run_exit"
+_assert_contains "invalid target port: error is actionable" "invalid target port" "$(cat "$stderr")"
+_assert_file_content "invalid target port: rejected before transport" "" "$log"
+
+ETTUN_TEST_LSOF_EXIT=0 _run_ettun gateway.example 10443 service.internal 443
+unset ETTUN_TEST_LSOF_EXIT
+_assert_exit "occupied local port: rejected" 1 "$run_exit"
+_assert_contains "occupied local port: suggests an existing tunnel" \
+  "may already be running" "$(cat "$stderr")"
+_assert_file_content "occupied local port: rejected before transport" "" "$log"
+
+ETTUN_TEST_ET=missing-et _run_ettun gateway.example 10443 service.internal 443
+unset ETTUN_TEST_ET
+_assert_exit "missing ET: rejected" 1 "$run_exit"
+_assert_contains "missing ET: error names the dependency" \
+  "ET client 'missing-et' was not found" "$(cat "$stderr")"
+_assert_file_content "missing ET: launches no transport" "" "$log"
+
+ETTUN_TEST_TRANSPORT='test-transport --unsafe' \
+  _run_ettun gateway.example 10443 service.internal 443
+unset ETTUN_TEST_TRANSPORT
+_assert_exit "transport string: is treated as one executable name" 1 "$run_exit"
+_assert_contains "transport string: is never shell-evaluated" \
+  "transport 'test-transport --unsafe' was not found" "$(cat "$stderr")"
+_assert_file_content "transport string: launches no command" "" "$log"
+
+_test_summary

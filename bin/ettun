@@ -1,0 +1,1653 @@
+#!/usr/bin/env bash
+# ettun - expose a remote TCP endpoint locally through Eternal Terminal.
+#
+# Architecture:
+# - The launcher owns user-facing signals, the controlling terminal, retries,
+#   and local cleanup.
+# - A dedicated worker process group owns the ET client or custom adapter. This
+#   isolates job control and makes whole-transport cleanup possible.
+# - A generated POSIX-shell supervisor on VIA owns the loopback relay plus
+#   authenticated attach and stop listeners.
+# - Files in a private per-run directory are deliberate synchronization points
+#   between launcher, worker, and control helper. Treat their ordering as part
+#   of the protocol, not as incidental temporary state.
+
+set -uo pipefail
+# The foreground command must not behave like a normal suspendable shell job.
+# More specific worker/launcher traps below coordinate adapters that restore the
+# default disposition while authenticating.
+trap '' TSTP
+
+# Relay candidates live in the dynamic/private range. Coprime strides and fixed
+# offsets spread retries while keeping relay, control, and stop ports distinct.
+RELAY_PORT_MIN=49152
+RELAY_PORT_SPAN=16384
+RELAY_PORT_STRIDE=7919
+CONTROL_PORT_OFFSET=8192
+STOP_PORT_OFFSET=4096
+MAX_RELAY_ATTEMPTS=5
+MAX_HANDOFF_RESUMES=8
+FOREGROUND_GATE_TIMEOUT=10
+REMOTE_COMMAND_MAX_BYTES=3072
+
+# The launcher starts this internal mode as its own job. The worker is the
+# stable process-group leader seen by Bash job control; the adapter runs below
+# it so all descendants share one terminal and one cleanup boundary.
+run_transport_worker() {
+  local worker_runtime_dir="$1" worker_terminal_handoff="$2"
+  local worker_transport_path="$3" worker_et_path="$4"
+  local worker_via_host="$5" worker_tunnel_spec="$6" worker_remote_command="$7"
+  local worker_launcher_pid="$8" child_pid child_status=0 retry_status=0
+  local worker_status_file="$worker_runtime_dir/transport.status"
+  local worker_status_tmp="$worker_status_file.tmp"
+  local recorded_status=""
+  local gate_deadline=$((SECONDS + FOREGROUND_GATE_TIMEOUT + 2))
+
+  # An adapter may restore SIGTSTP to its default while asking for credentials,
+  # stopping this entire process group even though the launcher ignores Ctrl-Z.
+  # Before control attachment no other process can safely resume that group, so
+  # this worker does it. After attachment the launcher owns the bg/CONT handoff.
+  trap '[[ -e "$worker_runtime_dir/control.attached" ]] || kill -CONT 0 2>/dev/null || true' TSTP
+  # While the worker owns the terminal, Ctrl-C is delivered here rather than to
+  # the launcher. Publish intent first, then kill the whole group. The launcher
+  # uses the marker to return 130 even when macOS Bash reports a transient fg or
+  # wait status; ignoring INT inside the trap prevents recursive group delivery.
+  trap 'trap "" INT; : >"$worker_runtime_dir/transport.interrupted"; kill -KILL 0 2>/dev/null || exit 130' INT
+  trap '' TERM HUP
+  set +m
+  # The launcher must not foreground this process group before its terminal
+  # signal traps are armed. Otherwise an immediate Ctrl-C can be lost during
+  # Bash startup and a later foreground-probe failure masks the cancellation.
+  : >"$worker_runtime_dir/transport.ready" || return 1
+
+  if ((worker_terminal_handoff == 1)); then
+    # Do not start an interactive adapter in the background. Reads from the
+    # controlling terminal would otherwise stop it with TTIN before the
+    # launcher can call fg. The helper publishes the gate only after the worker
+    # process group really owns the terminal.
+    while [[ ! -e "$worker_runtime_dir/transport.foreground" ]]; do
+      if [[ -e "$worker_runtime_dir/transport.foreground.failed" ]]; then
+        printf 'ettun: could not hand the terminal to the transport\n' >&2
+        return 1
+      fi
+      [[ ! -e "$worker_runtime_dir/control.stop" ]] || return 130
+      kill -0 "$worker_launcher_pid" 2>/dev/null || return 130
+      if ((SECONDS >= gate_deadline)); then
+        printf 'ettun: timed out handing the terminal to the transport\n' >&2
+        return 1
+      fi
+      sleep 0.01
+    done
+    [[ ! -e "$worker_runtime_dir/control.stop" ]] || return 130
+    kill -0 "$worker_launcher_pid" 2>/dev/null || return 130
+  fi
+
+  rm -f "$worker_status_file" "$worker_status_tmp"
+  # A trapped TSTP makes Bash wait statuses platform- and timing-dependent. In
+  # practice, the same stop/resume race produced 128+TSTP, 255, and a later -1
+  # that became 255, while the adapter's real exit was 126 or 127. Retrying wait
+  # cannot always recover a status Bash has already discarded.
+  #
+  # Keep a Bash wrapper in this process group and run the adapter synchronously
+  # beneath it. The wrapper shares the adapter's terminal, file descriptors, and
+  # signal group, but records the adapter's real exit through a same-directory
+  # temporary file plus rename. This makes the file authoritative without
+  # weakening Ctrl-C tree cleanup or terminal foregrounding.
+  (
+    local adapter_status=0
+
+    [[ ! -e "$worker_runtime_dir/control.stop" ]] || exit 130
+    kill -0 "$worker_launcher_pid" 2>/dev/null || exit 130
+    trap - INT
+    trap - TSTP
+    set +e
+    if [[ -n "$worker_transport_path" ]]; then
+      "$worker_transport_path" "$worker_via_host" \
+        "$worker_tunnel_spec" "$worker_remote_command" || adapter_status=$?
+    else
+      "$worker_et_path" -N --keepalive 5 -t "$worker_tunnel_spec" \
+        --command "$worker_remote_command" "$worker_via_host" || adapter_status=$?
+    fi
+    if printf '%s\n' "$adapter_status" >"$worker_status_tmp"; then
+      mv -f "$worker_status_tmp" "$worker_status_file" || rm -f "$worker_status_tmp"
+    else
+      rm -f "$worker_status_tmp"
+    fi
+    exit "$adapter_status"
+  ) <&0 &
+  child_pid=$!
+  # Rename happens before the wrapper exits. A TSTP can interrupt wait in that
+  # narrow window, so file existence alone does not mean the wrapper is gone.
+  # Keep waiting while the direct child PID is live; otherwise its publisher or
+  # an inherited FIFO descriptor could be orphaned outside later PID-tree
+  # cleanup. Once the wrapper is gone, the atomically published file is stable.
+  while :; do
+    retry_status=0
+    wait "$child_pid" || retry_status=$?
+    child_status="$retry_status"
+    if kill -0 "$child_pid" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  if [[ -r "$worker_status_file" ]]; then
+    IFS= read -r recorded_status <"$worker_status_file" || true
+    # A killed wrapper may never publish. Validate before overriding the best
+    # wait result so abnormal cleanup still has a usable fallback status.
+    if [[ "$recorded_status" =~ ^[0-9]+$ ]] &&
+      ((10#$recorded_status <= 255)); then
+      child_status="$recorded_status"
+    fi
+  fi
+  rm -f "$worker_status_file" "$worker_status_tmp"
+  if [[ -e "$worker_runtime_dir/transport.interrupted" ]] &&
+    kill -0 "$child_pid" 2>/dev/null; then
+    wait "$child_pid" || child_status=$?
+  fi
+  return "$child_status"
+}
+
+# Keep the worker entry point ahead of public argument parsing. Its fixed arity
+# and sentinel cannot collide with a valid four-argument public invocation.
+if [[ $# -eq 9 && "${1:-}" == --ettun-transport-worker ]]; then
+  shift
+  run_transport_worker "$@"
+  exit $?
+fi
+
+# Public interface and local-only validation helpers.
+usage() {
+  cat >&2 <<'EOF'
+Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT
+
+Expose TARGET:TARGET_PORT at localhost:LOCAL_PORT through the ET server VIA.
+The command stays in the foreground; press Ctrl-C to stop it. If cleanup is
+waiting for ET to reconnect, press Ctrl-C again to force a local stop.
+Ctrl-Z is ignored for the tunnel's lifetime.
+
+VIA must be an ET host or SSH-config name. TARGET must be a hostname or IPv4
+literal. Both ends need base64, gzip, and a SHA-256 tool (sha256sum, shasum, or
+openssl). VIA also needs /bin/sh, etserver, flock, and either socat (preferred)
+or ncat. Set ETTUN_TRANSPORT to an executable adapter when the connection
+must be established by something other than et. The adapter must remain in the
+foreground for the lifetime of its ET connection.
+EOF
+}
+
+die_usage() {
+  printf 'ettun: %s\n' "$1" >&2
+  usage
+  exit 2
+}
+
+valid_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  ((10#$value >= 1 && 10#$value <= 65535))
+}
+
+valid_via_host() {
+  [[ "$1" =~ ^[[:alnum:]_][[:alnum:]_.@:-]*$ ]]
+}
+
+valid_target_host() {
+  [[ "$1" =~ ^[[:alnum:]_][[:alnum:]_.-]*$ ]]
+}
+
+# Resolve an executable path once, before any user-controlled value reaches a
+# child process. ETTUN_TRANSPORT is intentionally one executable name, not
+# a shell command string; adapters receive the three contract arguments as argv.
+resolve_command() {
+  local description="$1" command_name="$2" path
+
+  if path=$(command -v "$command_name" 2>/dev/null); then
+    printf '%s\n' "$path"
+    return
+  fi
+
+  printf "ettun: %s '%s' was not found\n" "$description" "$command_name" >&2
+  return 1
+}
+
+local_port_in_use() {
+  local port="$1" endpoint
+
+  if command -v lsof >/dev/null 2>&1; then
+    # lsof -iTCP:PORT matches PORT on either endpoint. Inspect only the local
+    # side (before ->), or an unrelated connection to a remote service using
+    # PORT would falsely make the requested local port look occupied.
+    while IFS= read -r endpoint; do
+      [[ "$endpoint" == n* ]] || continue
+      endpoint=${endpoint#n}
+      endpoint=${endpoint%%->*}
+      case "$endpoint" in
+        *":$port" | *":$port (LISTEN)")
+          return 0
+          ;;
+      esac
+    done < <(lsof -nP -iTCP:"$port" -Fn 2>/dev/null)
+    return 1
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    # Include every TCP state, not only LISTEN: an established connection may
+    # already own the candidate as its local ephemeral source port.
+    [[ -n "$(ss -H -atn "sport = :$port" 2>/dev/null)" ]]
+    return
+  fi
+
+  return 1
+}
+
+random_hex() {
+  local value
+  value=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
+  [[ "$value" =~ ^[0-9a-f]{32}$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+sha256_text() {
+  local value="$1" digest
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$value" | sha256sum) || return 1
+    digest=${digest%% *}
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$value" | shasum -a 256) || return 1
+    digest=${digest%% *}
+  elif command -v openssl >/dev/null 2>&1; then
+    digest=$(printf '%s' "$value" | openssl dgst -sha256) || return 1
+    digest=${digest##* }
+  else
+    printf 'ettun: SHA-256 requires sha256sum, shasum, or openssl\n' >&2
+    return 1
+  fi
+
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+client_id() {
+  local state_dir state_file lock_dir lock_cleanup tmp value attempt publish_status
+
+  if [[ -n "${ETTUN_CLIENT_ID:-}" ]]; then
+    value="$ETTUN_CLIENT_ID"
+    if [[ ! "$value" =~ ^[0-9a-f]{32}$ ]]; then
+      printf 'ettun: ETTUN_CLIENT_ID must be 32 lowercase hex characters\n' >&2
+      return 1
+    fi
+    printf '%s\n' "$value"
+    return
+  fi
+
+  # Remote ownership is keyed by a stable client id plus local port. Persisting
+  # the id lets a new local process reclaim its own abandoned remote relay while
+  # preventing unrelated clients from sharing that remote state directory.
+  state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/ettun"
+  state_file="$state_dir/client-id"
+  umask 077
+  mkdir -p "$state_dir" || return 1
+  chmod 700 "$state_dir" || return 1
+
+  if [[ ! -e "$state_file" ]]; then
+    value=$(random_hex) || {
+      printf 'ettun: could not generate a client identity\n' >&2
+      return 1
+    }
+    tmp=$(mktemp "${state_file}.tmp.XXXXXX") || {
+      printf 'ettun: could not stage the client identity\n' >&2
+      return 1
+    }
+    if ! printf '%s\n' "$value" >"$tmp" || ! chmod 600 "$tmp"; then
+      rm -f "$tmp"
+      return 1
+    fi
+    # Prefer a hard link because it publishes an already-complete inode and
+    # makes concurrent first runs converge without an intermediate read state.
+    # Android app storage rejects hard links, however. An atomic lock-directory
+    # fallback elects one publisher, which renames the complete same-directory
+    # temporary file while contenders wait for that canonical file to appear.
+    if ! ln "$tmp" "$state_file" 2>/dev/null; then
+      lock_dir="${state_file}.lock"
+      publish_status=1
+      for attempt in {1..100}; do
+        if [[ -f "$state_file" ]]; then
+          publish_status=0
+          break
+        fi
+        if mkdir "$lock_dir" 2>/dev/null; then
+          # client_id runs in a command-substitution shell. Keep its EXIT trap
+          # scoped there so catchable termination cannot strand the empty lock;
+          # the deadline below still prevents a SIGKILL-stale lock from hanging
+          # every future invocation indefinitely.
+          printf -v lock_cleanup 'rmdir %q 2>/dev/null || true' "$lock_dir"
+          # Expand the quoted cleanup command now: lock_dir is local to this
+          # function and may be out of scope by the time an EXIT trap runs.
+          # shellcheck disable=SC2064
+          trap "$lock_cleanup" EXIT
+          publish_status=0
+          if [[ ! -f "$state_file" ]] && ! mv "$tmp" "$state_file"; then
+            publish_status=1
+          fi
+          rmdir "$lock_dir" 2>/dev/null || true
+          trap - EXIT
+          break
+        fi
+        sleep 0.1
+      done
+      if ((publish_status != 0)); then
+        rm -f "$tmp"
+        printf 'ettun: could not publish client identity: %s\n' "$state_file" >&2
+        return 1
+      fi
+    fi
+    rm -f "$tmp"
+  fi
+
+  value=""
+  [[ -f "$state_file" ]] && IFS= read -r value <"$state_file"
+  if [[ ! "$value" =~ ^[0-9a-f]{32}$ ]]; then
+    printf 'ettun: invalid client identity file: %s\n' "$state_file" >&2
+    return 1
+  fi
+  chmod 600 "$state_file" || return 1
+  printf '%s\n' "$value"
+}
+
+choose_local_control_port() {
+  local seed="$1" attempt="$2" probe candidate
+
+  # ET needs a second local forward for its control protocol. Probe a
+  # deterministic-but-spread sequence and exclude the user-facing local port;
+  # the remote collision retry changes the sequence again on each attempt.
+  for ((probe = 0; probe < 64; probe++)); do
+    candidate=$((RELAY_PORT_MIN + (\
+      seed + attempt * RELAY_PORT_STRIDE + probe * 3571) % RELAY_PORT_SPAN))
+    if ((candidate != local_port)) && ! local_port_in_use "$candidate"; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  printf 'ettun: could not find a free local control port\n' >&2
+  return 1
+}
+
+# Remote supervisor and bounded bootstrap generation.
+build_remote_script() {
+  local relay_port="$1" control_port="$2" stop_port="$3" token="$4" key="$5"
+
+  # This here-document becomes a standalone /bin/sh supervisor on VIA. It must
+  # stay POSIX-shell compatible because personal servers need only etserver and
+  # standard Unix tools, not the local Bash implementation or an SSH wrapper.
+  # Its main phases are annotated in the generated script below.
+  cat <<EOF
+# Per-attempt identity and private state paths. The random token authenticates
+# every local control action; the stable key identifies the logical tunnel.
+ettun_key=$key
+ettun_token=$token
+ettun_relay_port=$relay_port
+ettun_control_port=$control_port
+ettun_stop_port=$stop_port
+ettun_marker=ETTUN_COLLISION:\$ettun_token:\$ettun_relay_port
+ettun_attached_marker=ETTUN_ATTACHED:\$ettun_token
+ettun_control_marker=ETTUN_CONTROL
+ettun_confirm_marker=ETTUN_CONFIRM:\$ettun_token
+ettun_confirmed_marker=ETTUN_CONFIRMED:\$ettun_token
+ettun_stop_marker=ETTUN_STOP:\$ettun_token
+ettun_stopped_marker=ETTUN_STOPPED:\$ettun_token
+ettun_root=\${XDG_CACHE_HOME:-\$HOME/.cache}/ettun
+ettun_state=\$ettun_root/\$ettun_key
+ettun_owner=\$ettun_state/owner
+ettun_owner_tmp=\$ettun_state/owner.\$ettun_token.tmp
+ettun_control_file=\$ettun_state/control
+ettun_control_gate=\$ettun_state/control-ready
+ettun_control_handler=\$ettun_state/control-handler
+ettun_stop_file=\$ettun_state/stop
+ettun_stop_gate=\$ettun_state/stop-ready
+ettun_relay_gate=\$ettun_state/relay-ready
+umask 077
+# Fatal markers carry the attempt token so unrelated adapter output cannot
+# forge a retryable or actionable remote failure.
+fatal() {
+  fatal_status=\$1
+  fatal_reason=\$2
+  printf 'ETTUN_FATAL:%s:%s:%s\n' "\$ettun_token" "\$fatal_status" "\$fatal_reason" >&2
+  exit "\$fatal_status"
+}
+# Prefer socat for its transparent forked relay; retain ncat for small servers.
+if command -v socat >/dev/null 2>&1; then
+  ettun_relay=socat
+elif command -v ncat >/dev/null 2>&1; then
+  ettun_relay=ncat
+else
+  printf 'ettun: remote relay requires ncat or socat\\n' >&2
+  fatal 127 missing-relay
+fi
+mkdir -p "\$ettun_root" || fatal 74 state-root
+chmod 700 "\$ettun_root" || fatal 74 state-root
+if ! command -v flock >/dev/null 2>&1; then
+  printf 'ettun: remote startup serialization requires flock\\n' >&2
+  fatal 127 missing-flock
+fi
+startup_lock=\$ettun_root/.\$ettun_key.start.lock
+startup_lock_owned=0
+startup_lock_fd_open=0
+# The lock file is persistent; ownership is the open, flocked descriptor. Close
+# it explicitly once listeners and the owner record are published.
+release_startup_lock() {
+  if [ "\$startup_lock_fd_open" -eq 1 ]; then
+    exec 7>&-
+    startup_lock_fd_open=0
+    startup_lock_owned=0
+  fi
+}
+startup_abort() {
+  trap - EXIT HUP INT TERM
+  release_startup_lock
+}
+trap startup_abort EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if ! { exec 7>>"\$startup_lock"; }; then
+  fatal 74 startup-lock-file
+fi
+startup_lock_fd_open=1
+startup_attempt=0
+while [ "\$startup_attempt" -lt 12 ]; do
+  if flock -n 7; then
+    startup_lock_owned=1
+    break
+  fi
+  startup_attempt=\$((startup_attempt + 1))
+  sleep 1
+done
+if [ "\$startup_lock_owned" -ne 1 ]; then
+  fatal 73 startup-lock
+fi
+# Freeze each generation before discovering children so a relay cannot fork a
+# new connection handler beyond the cleanup snapshot.
+kill_tree() {
+  kill_root=\$1
+  case "\$kill_root" in ''|*[!0-9]*) return ;; esac
+  kill -0 "\$kill_root" 2>/dev/null || return
+  kill_list=\$kill_root
+  kill_frontier=\$kill_root
+  while [ -n "\$kill_frontier" ]; do
+    kill_next=
+    for kill_parent in \$kill_frontier; do
+      kill -STOP "\$kill_parent" 2>/dev/null || :
+      kill_children=\$(ps -eo pid=,ppid= 2>/dev/null | awk -v parent="\$kill_parent" '\$2 == parent { print \$1 }')
+      kill_next="\$kill_next \$kill_children"
+    done
+    kill_list="\$kill_next \$kill_list"
+    kill_frontier=\$kill_next
+  done
+  # Word splitting is intentional: kill every numeric PID collected above.
+  kill -KILL \$kill_list 2>/dev/null || :
+}
+process_is_running() {
+  process_pid=\$1
+  kill -0 "\$process_pid" 2>/dev/null || return 1
+  process_state=\$(ps -o stat= -p "\$process_pid" 2>/dev/null || :)
+  case "\$process_state" in *Z*) return 1 ;; esac
+  return 0
+}
+# Never kill a recycled PID solely because it appears in an owner file. Verify
+# that its command line still names the recorded loopback listener first.
+kill_recorded_listener() {
+  listener_pid=\$1
+  listener_port=\$2
+  case "\$listener_pid:\$listener_port" in
+    *[!0-9:]*|:|*:|0:*) return ;;
+  esac
+  listener_command=\$(ps -ww -o command= -p "\$listener_pid" 2>/dev/null || :)
+  case "\$listener_command" in
+    *"127.0.0.1 \$listener_port"*|*"TCP-LISTEN:\$listener_port,"*)
+      kill_tree "\$listener_pid"
+      ;;
+  esac
+}
+if [ -d "\$ettun_state" ]; then
+  # Ask the prior logical owner to stop through its authenticated control port.
+  # Reclamation below is allowed only after its supervisor is no longer live.
+  old_token=
+  old_control=
+  old_pid=
+  old_relay_pid=
+  old_relay_port=
+  if [ -r "\$ettun_owner" ]; then
+    IFS=' ' read -r old_token old_control old_pid old_relay_pid old_relay_port <"\$ettun_owner" || :
+  fi
+  case "\$old_control" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ -n "\$old_token" ]; then
+        if [ "\$ettun_relay" = ncat ]; then
+          printf '%s\\n' "\$old_token" | ncat --send-only --wait 2 127.0.0.1 "\$old_control" >/dev/null 2>&1 || :
+        else
+          printf '%s\\n' "\$old_token" | socat -T2 - "TCP:127.0.0.1:\$old_control" >/dev/null 2>&1 || :
+        fi
+      fi
+      ;;
+  esac
+  stop_wait=0
+  while [ -d "\$ettun_state" ] && [ "\$stop_wait" -lt 5 ]; do
+    sleep 1
+    stop_wait=\$((stop_wait + 1))
+  done
+  if [ -d "\$ettun_state" ]; then
+    current_token=
+    current_pid=
+    current_relay_pid=
+    current_relay_port=
+    current_control_port=
+    current_stop_pid=
+    current_control_pid=
+    if [ -r "\$ettun_owner" ]; then
+      IFS=' ' read -r current_token current_stop_port current_pid \
+        current_relay_pid current_relay_port current_control_port \
+        current_stop_pid current_control_pid <"\$ettun_owner" || :
+    fi
+    if [ -n "\$old_token" ] && [ -n "\$current_token" ] && [ "\$current_token" != "\$old_token" ]; then
+      fatal 73 concurrent-owner
+    fi
+    owner_live=0
+    case "\$current_pid" in
+      ''|*[!0-9]*) ;;
+      *) process_is_running "\$current_pid" && owner_live=1 ;;
+    esac
+    if [ "\$owner_live" -eq 0 ]; then
+      verify_token=
+      if [ -r "\$ettun_owner" ]; then
+        IFS=' ' read -r verify_token _ <"\$ettun_owner" || :
+      fi
+      if [ "\$verify_token" != "\$current_token" ]; then
+        fatal 73 concurrent-owner
+      fi
+      case "\$current_relay_pid:\$current_relay_port" in
+        *[!0-9:]*|:|*:)
+          ;;
+        *)
+          relay_command=\$(ps -ww -o command= -p "\$current_relay_pid" 2>/dev/null || :)
+          case "\$relay_command" in
+            *"127.0.0.1 \$current_relay_port"*|*"TCP-LISTEN:\$current_relay_port,"*)
+              kill_tree "\$current_relay_pid"
+              ;;
+          esac
+          ;;
+      esac
+      kill_recorded_listener "\$current_stop_pid" "\$current_stop_port"
+      kill_recorded_listener "\$current_control_pid" "\$current_control_port"
+      rm -f "\$ettun_owner" "\$ettun_owner_tmp" \
+        "\$ettun_control_file" "\$ettun_control_gate" \
+        "\$ettun_control_handler" \
+        "\$ettun_stop_file" "\$ettun_stop_gate" \
+        "\$ettun_relay_gate"
+      rmdir "\$ettun_state" 2>/dev/null || :
+    fi
+  fi
+fi
+if ! mkdir "\$ettun_state" 2>/dev/null; then
+  # mkdir is the final ownership claim. Failure means a live or concurrent owner
+  # kept the directory, so do not guess which listeners are safe to replace.
+  printf 'ettun: prior remote relay for this client did not stop\\n' >&2
+  fatal 73 stale-owner
+fi
+owns_state=1
+relay_pid=
+control_pid=
+stop_pid=
+# Publish all cleanup-relevant PIDs atomically. A replacement reads this record
+# only while holding the same-key startup lock.
+publish_owner() {
+  printf '%s %s %s %s %s %s %s %s\\n' \
+    "\$ettun_token" "\$ettun_stop_port" "\$supervisor_pid" \
+    "\$relay_pid" "\$ettun_relay_port" "\$ettun_control_port" \
+    "\${stop_pid:-0}" "\${control_pid:-0}" >"\$ettun_owner_tmp" || \
+    fatal 74 owner-write
+  mv "\$ettun_owner_tmp" "\$ettun_owner" || fatal 74 owner-write
+}
+# Tear children down before removing the owner record. Token comparison prevents
+# an old exiting supervisor from deleting state already adopted by a successor.
+cleanup() {
+  trap - EXIT HUP INT TERM
+  if [ -n "\$control_pid" ]; then
+    kill_tree "\$control_pid"
+    wait "\$control_pid" 2>/dev/null || :
+    control_pid=
+  fi
+  if [ -n "\$stop_pid" ]; then
+    kill_tree "\$stop_pid"
+    wait "\$stop_pid" 2>/dev/null || :
+    stop_pid=
+  fi
+  if [ -n "\$relay_pid" ]; then
+    kill_tree "\$relay_pid"
+    wait "\$relay_pid" 2>/dev/null || :
+    relay_pid=
+  fi
+  owner_token=
+  if [ -r "\$ettun_owner" ]; then
+    IFS=' ' read -r owner_token _ <"\$ettun_owner" || :
+  fi
+  if [ "\$owner_token" = "\$ettun_token" ] || {
+    [ -z "\$owner_token" ] && [ "\$owns_state" -eq 1 ];
+  }; then
+    rm -f "\$ettun_owner" "\$ettun_owner_tmp" \
+      "\$ettun_control_file" "\$ettun_control_gate" \
+      "\$ettun_control_handler" \
+      "\$ettun_stop_file" "\$ettun_stop_gate" \
+      "\$ettun_relay_gate"
+    rmdir "\$ettun_state" 2>/dev/null || :
+  fi
+  release_startup_lock
+}
+# Listener launch has small windows where a child exists but its PID is not yet
+# published. Defer signals across those windows, publish, then replay the signal.
+install_remote_signal_traps() {
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+defer_remote_signals() {
+  trap 'pending_remote_signal=129' HUP
+  trap 'pending_remote_signal=130' INT
+  trap 'pending_remote_signal=143' TERM
+}
+trap cleanup EXIT
+install_remote_signal_traps
+rm -f "\$ettun_owner_tmp" "\$ettun_stop_file" \
+  "\$ettun_stop_gate" "\$ettun_control_handler" \
+  "\$ettun_relay_gate"
+# One loopback control listener serves two authenticated protocols: a replacement
+# can request shutdown, or the current client can attach and hold the stream open
+# as proof that its ET forwarding connection is still alive.
+cat >"\$ettun_control_handler" <<'ETTUN_HANDLER'
+#!/bin/sh
+printf '%s\n' "\$ETTUN_CONTROL_MARKER" || exit 0
+received_token=
+IFS= read -r received_token || :
+# A full stop marker is a pre-attachment shutdown request. A bare token starts
+# the attach/confirm handshake and holds stdin open as a connection-liveness
+# lease. Unknown input is recorded so the supervisor can reject and recreate the
+# listener without accepting an unauthenticated client.
+if [ "\$received_token" = "\$ETTUN_STOP_MARKER" ]; then
+  control_tmp=\$ETTUN_CONTROL_FILE.\$\$
+  printf '%s\n' "\$ETTUN_TOKEN" >"\$control_tmp" || exit 74
+  mv "\$control_tmp" "\$ETTUN_CONTROL_FILE" || exit 74
+  printf '%s\n' "\$ETTUN_STOPPED_MARKER" || exit 0
+elif [ "\$received_token" = "\$ETTUN_TOKEN" ]; then
+  printf '%s\n' "\$ETTUN_ATTACHED_MARKER" || exit 0
+  received_confirm=
+  IFS= read -r received_confirm || exit 0
+  [ "\$received_confirm" = "\$ETTUN_CONFIRM_MARKER" ] || exit 0
+  printf '%s\n' "\$ETTUN_CONFIRMED_MARKER" || exit 0
+  control_tmp=\$ETTUN_CONTROL_FILE.\$\$
+  printf '%s\n' "\$received_token" >"\$control_tmp" || exit 74
+  mv "\$control_tmp" "\$ETTUN_CONTROL_FILE" || exit 74
+  while IFS= read -r _; do :; done
+else
+  control_tmp=\$ETTUN_CONTROL_FILE.\$\$
+  printf '%s\n' "\$received_token" >"\$control_tmp" || exit 74
+  mv "\$control_tmp" "\$ETTUN_CONTROL_FILE" || exit 74
+fi
+ETTUN_HANDLER
+chmod 700 "\$ettun_control_handler" || fatal 74 control-handler
+export ETTUN_CONTROL_FILE="\$ettun_control_file"
+export ETTUN_TOKEN="\$ettun_token"
+export ETTUN_ATTACHED_MARKER="\$ettun_attached_marker"
+export ETTUN_CONTROL_MARKER="\$ettun_control_marker"
+export ETTUN_CONFIRM_MARKER="\$ettun_confirm_marker"
+export ETTUN_CONFIRMED_MARKER="\$ettun_confirmed_marker"
+export ETTUN_STOP_MARKER="\$ettun_stop_marker"
+export ETTUN_STOPPED_MARKER="\$ettun_stopped_marker"
+# Child listeners wait on gate files. This lets the supervisor record their PIDs
+# before they accept traffic, closing startup and signal-cleanup races.
+supervisor_pid=\$\$
+pending_remote_signal=0
+defer_remote_signals
+if [ "\$ettun_relay" = ncat ]; then
+  (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec ncat --listen --keep-open --sh-exec 'exec ncat -- $target_host $target_port' 127.0.0.1 "\$ettun_relay_port") &
+else
+  (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec socat "TCP-LISTEN:\$ettun_relay_port,bind=127.0.0.1,reuseaddr,fork" "TCP:$target_host:$target_port") &
+fi
+relay_pid=\$!
+install_remote_signal_traps
+if [ "\$pending_remote_signal" -ne 0 ]; then
+  exit "\$pending_remote_signal"
+fi
+publish_owner
+: >"\$ettun_relay_gate" || fatal 74 relay-gate
+# Give the listener one scheduling interval to bind. Early death means this
+# candidate collided; the tokenized marker lets only its launcher retry.
+sleep 1
+if ! process_is_running "\$relay_pid"; then
+  wait "\$relay_pid" 2>/dev/null || :
+  relay_pid=
+  printf '%s\\n' "\$ettun_marker" >&2
+  exit 75
+fi
+# Listener output is file-backed because ncat and socat expose different process
+# models. Read only complete lines and treat unauthenticated content as disposable.
+read_control_line() {
+  control_input=\$1
+  control_line_count=\$(wc -l <"\$control_input" 2>/dev/null | awk '{ print \$1 }' || :)
+  case "\$control_line_count" in ''|*[!0-9]*) return 1 ;; esac
+  [ "\$control_line_count" -gt 0 ] || return 1
+  received_token=
+  IFS= read -r received_token <"\$control_input" || :
+  return 0
+}
+# The separate one-shot stop listener remains reachable before the main control
+# handler is attached. It is the cleanup path for cancelled authentication.
+start_stop_listener() {
+  : >"\$ettun_stop_file" || fatal 74 stop-file
+  pending_remote_signal=0
+  defer_remote_signals
+  (
+    exec 7>&-
+    while [ ! -e "\$ettun_stop_gate" ]; do
+      kill -0 "\$supervisor_pid" 2>/dev/null || exit 1
+      sleep 1
+    done
+    trap '' HUP INT TERM
+    if [ "\$ettun_relay" = ncat ]; then
+      exec ncat --listen --recv-only 127.0.0.1 "\$ettun_stop_port"
+    else
+      exec socat -u "TCP-LISTEN:\$ettun_stop_port,bind=127.0.0.1,reuseaddr" -
+    fi
+  ) >"\$ettun_stop_file" &
+  stop_pid=\$!
+  install_remote_signal_traps
+  if [ "\$pending_remote_signal" -ne 0 ]; then
+    exit "\$pending_remote_signal"
+  fi
+  : >"\$ettun_stop_gate" || fatal 74 stop-gate
+  publish_owner
+}
+check_stop_listener() {
+  if read_control_line "\$ettun_stop_file"; then
+    if [ "\$received_token" = "\$ettun_token" ]; then
+      exit 0
+    fi
+    # Discard unauthenticated data and recreate a clean one-shot listener.
+    if process_is_running "\$stop_pid"; then kill_tree "\$stop_pid"; fi
+    wait "\$stop_pid" 2>/dev/null || :
+    stop_pid=
+    start_stop_listener
+    return
+  fi
+  if ! process_is_running "\$stop_pid"; then
+    stop_status=0
+    wait "\$stop_pid" || stop_status=\$?
+    stop_pid=
+    if [ "\$stop_status" -ne 0 ]; then
+      printf '%s\\n' "\$ettun_marker" >&2
+      exit 75
+    fi
+    if read_control_line "\$ettun_stop_file" && \
+      [ "\$received_token" = "\$ettun_token" ]; then
+      exit 0
+    fi
+    start_stop_listener
+  fi
+}
+start_stop_listener
+# Recreate the main control listener after invalid tokens. Once an authenticated
+# attachment is confirmed, keep that connection open; its EOF is the reliable
+# signal that ET disconnected and the supervisor may exit normally.
+while process_is_running "\$relay_pid"; do
+  : >"\$ettun_control_file" || fatal 74 control-file
+  rm -f "\$ettun_control_gate"
+  pending_remote_signal=0
+  defer_remote_signals
+  (
+    exec 7>&-
+    while [ ! -e "\$ettun_control_gate" ]; do
+      kill -0 "\$supervisor_pid" 2>/dev/null || exit 1
+      sleep 1
+    done
+    trap '' HUP INT TERM
+    if [ "\$ettun_relay" = ncat ]; then
+      exec ncat --listen --exec "\$ettun_control_handler" \
+        127.0.0.1 "\$ettun_control_port"
+    else
+      exec socat "TCP-LISTEN:\$ettun_control_port,bind=127.0.0.1,reuseaddr" \
+        "EXEC:\$ettun_control_handler"
+    fi
+  ) &
+  control_pid=\$!
+  publish_owner
+  install_remote_signal_traps
+  if [ "\$pending_remote_signal" -ne 0 ]; then
+    exit "\$pending_remote_signal"
+  fi
+  : >"\$ettun_control_gate" || fatal 74 control-gate
+  release_startup_lock
+  control_attached=0
+  control_invalid=0
+  while process_is_running "\$relay_pid" && process_is_running "\$control_pid"; do
+    check_stop_listener
+    if read_control_line "\$ettun_control_file"; then
+      if [ "\$received_token" = "\$ettun_token" ]; then
+        control_attached=1
+      else
+        control_invalid=1
+        kill_tree "\$control_pid"
+      fi
+      break
+    fi
+    sleep 1
+  done
+  check_stop_listener
+  if [ "\$control_attached" -eq 0 ] && \
+    read_control_line "\$ettun_control_file" && \
+    [ "\$received_token" = "\$ettun_token" ]; then
+    control_attached=1
+  fi
+  if ! process_is_running "\$relay_pid"; then
+    wait "\$relay_pid" 2>/dev/null || :
+    relay_pid=
+    if process_is_running "\$control_pid"; then kill_tree "\$control_pid"; fi
+    wait "\$control_pid" 2>/dev/null || :
+    control_pid=
+    printf '%s\\n' "\$ettun_marker" >&2
+    exit 75
+  fi
+  if [ "\$control_attached" -eq 1 ]; then
+    while process_is_running "\$relay_pid" && process_is_running "\$control_pid"; do
+      check_stop_listener
+      sleep 1
+    done
+    check_stop_listener
+    if ! process_is_running "\$relay_pid"; then
+      wait "\$relay_pid" 2>/dev/null || :
+      relay_pid=
+      if process_is_running "\$control_pid"; then kill_tree "\$control_pid"; fi
+      wait "\$control_pid" 2>/dev/null || :
+      control_pid=
+      printf '%s\\n' "\$ettun_marker" >&2
+      exit 75
+    fi
+  fi
+  control_status=0
+  wait "\$control_pid" || control_status=\$?
+  control_pid=
+  rm -f "\$ettun_control_gate"
+  if [ "\$control_attached" -eq 1 ]; then
+    if [ "\$control_status" -ne 0 ]; then
+      printf '%s\\n' "\$ettun_marker" >&2
+      exit 75
+    fi
+    exit 0
+  fi
+  if [ "\$control_invalid" -eq 1 ]; then
+    continue
+  fi
+  if [ "\$control_status" -ne 0 ]; then
+    printf '%s\\n' "\$ettun_marker" >&2
+    exit 75
+  fi
+done
+printf '%s\\n' "\$ettun_marker" >&2
+exit 75
+EOF
+}
+
+build_remote_payload() {
+  local script payload token="$4"
+
+  # Compressing keeps the supervisor below practical ET command-input limits.
+  # The token stays outside the base64 body so the bootstrap can reject a
+  # cross-attempt payload before decoding or executing anything.
+  script=$(build_remote_script "$@") || return 1
+  payload=$(
+    printf '%s' "$script" |
+      gzip -c |
+      base64 |
+      tr -d '\r\n'
+  ) || return 1
+  [[ "$payload" =~ ^[A-Za-z0-9+/=]+$ ]] || return 1
+
+  printf 'ETTUN_PAYLOAD:%s:%s\n' "$token" "$payload"
+}
+
+build_remote_command() {
+  local bootstrap_port="$1" token="$2" marker="$3"
+  local payload_hash="$4" payload_size="$5" command
+
+  # ET's --command must stay a single bounded argv value, so the bootstrap is a
+  # compact POSIX-shell program rather than the full supervisor. It creates a
+  # private staging directory, exposes a loopback-only one-shot receiver, caps
+  # bytes with ulimit, enforces a deadline, verifies exact size and SHA-256, then
+  # decodes and runs the supervisor. Invalid or partial clients are retried;
+  # authenticated setup failures emit token-scoped fatal markers.
+  printf -v command '%s' \
+    "exec /bin/sh -c 'p=\$1; t=\$2; m=\$3; h=\$4; n=\$5; b=\${TMPDIR:-/tmp}/ettun-bootstrap.\$t; o=0; w=\$b/w; z=\$b/z; s=\$b/s; a=\$b/a; c=\$b/c; l=; d=; umask 077; " \
+    "stop_child() { k=; [ ! -r \"\$c\" ] || IFS= read -r k <\"\$c\" || :; case \"\$k\" in *[!0-9]*|\"\") ;; *) kill \"\$k\" 2>/dev/null || : ;; esac; }; cleanup() { [ \"\$o\" != 1 ] || stop_child; [ -z \"\$l\" ] || kill \"\$l\" 2>/dev/null || :; [ -z \"\$d\" ] || kill \"\$d\" 2>/dev/null || :; if [ \"\$o\" = 1 ]; then rm -f \"\$w\" \"\$z\" \"\$s\" \"\$a\" \"\$c\"; rmdir \"\$b\" 2>/dev/null || :; fi; }; fail() { status=\$1; reason=\$2; printf \"ETTUN_FATAL:%s:%s:%s\\n\" \"\$t\" \"\$status\" \"\$reason\" >&2; exit \"\$status\"; }; trap cleanup EXIT; trap \"exit 129\" HUP; trap \"exit 130\" INT; trap \"exit 143\" TERM; trap \"fail 124 bootstrap-timeout\" ALRM; mkdir \"\$b\" 2>/dev/null || fail 73 bootstrap-state; o=1; " \
+    "command -v base64 >/dev/null 2>&1 || fail 127 missing-base64; command -v gzip >/dev/null 2>&1 || fail 127 missing-gzip; if command -v sha256sum >/dev/null 2>&1; then v=sha256sum; elif command -v shasum >/dev/null 2>&1; then v=shasum; elif command -v openssl >/dev/null 2>&1; then v=openssl; else fail 127 missing-sha256; fi; if command -v socat >/dev/null 2>&1; then r=socat; elif command -v ncat >/dev/null 2>&1; then r=ncat; else fail 127 missing-relay; fi; " \
+    "printf \"#!/bin/sh\\necho \\\$\\\$ >\\\"\\\$ETB_C\\\"\\necho \\\"\\\$ETB_M\\\"\\nexec cat >\\\"\\\$ETB_W\\\"\\n\" >\"\$a\" || fail 74 bootstrap-handler; chmod 700 \"\$a\" || fail 74 bootstrap-handler; export ETB_W=\$w ETB_C=\$c ETB_M=ETTUN_BOOTSTRAP; " \
+    "timeout=\${ETTUN_BOOTSTRAP_TIMEOUT:-60}; case \"\$timeout\" in \"\"|*[!0-9]*|0) timeout=60 ;; esac; (sleep \"\$timeout\"; kill -ALRM \"\$\$\") & d=\$!; limit=\$(((n + 511) / 512)); while :; do rm -f \"\$w\" \"\$z\" \"\$s\" \"\$c\"; if [ \"\$r\" = socat ]; then (ulimit -f \"\$limit\"; exec socat \"TCP-LISTEN:\$p,bind=127.0.0.1,reuseaddr\" \"EXEC:\$a\") & else (ulimit -f \"\$limit\"; exec ncat --listen --exec \"\$a\" 127.0.0.1 \"\$p\") & fi; l=\$!; wait \"\$l\"; receive_status=\$?; l=; rm -f \"\$c\"; size=\$(wc -c <\"\$w\" 2>/dev/null | awk \"{ print \\\$1 }\" || :); case \"\$size\" in \"\"|*[!0-9]*) size=0 ;; esac; if [ \"\$receive_status\" -ne 0 ]; then [ \"\$size\" -gt \"\$n\" ] && continue; printf \"%s\\n\" \"\$m\" >&2; exit 75; fi; [ \"\$size\" -eq \"\$n\" ] || continue; " \
+    "case \"\$v\" in sha256sum) q=\$(sha256sum \"\$w\"); q=\${q%% *} ;; shasum) q=\$(shasum -a 256 \"\$w\"); q=\${q%% *} ;; openssl) q=\$(openssl dgst -sha256 \"\$w\"); q=\${q##* } ;; esac; [ \"\$q\" = \"\$h\" ] || continue; magic=; got=; payload=; IFS=: read -r magic got payload <\"\$w\" || :; [ \"\$magic\" = ETTUN_PAYLOAD ] && [ \"\$got\" = \"\$t\" ] || continue; case \"\$payload\" in \"\"|*[!A-Za-z0-9+/=]*) continue ;; esac; if ! { printf %s \"\$payload\" | base64 -d >\"\$z\" 2>/dev/null || printf %s \"\$payload\" | base64 -D >\"\$z\" 2>/dev/null; }; then fail 127 decode; fi; gzip -dc \"\$z\" >\"\$s\" 2>/dev/null || fail 127 decode; kill \"\$d\" 2>/dev/null || :; wait \"\$d\" 2>/dev/null || :; d=; /bin/sh \"\$s\"; status=\$?; exit \"\$status\"; done' et-bootstrap " \
+    "'$bootstrap_port' '$token' '$marker' '$payload_hash' '$payload_size'"
+
+  # Fail locally rather than rely on terminal/transport truncation, which could
+  # leave an unauthenticated bootstrap listener alive on VIA.
+  ((${#command} <= REMOTE_COMMAND_MAX_BYTES)) || return 1
+  printf '%s' "$command"
+}
+
+# Local launcher state and lifecycle helpers.
+transport_pid=""
+control_helper_pid=""
+control_helper_job=""
+stdout_pid=""
+stderr_pid=""
+signal_status=0
+pending_signal=0
+control_local_port=""
+stop_token=""
+bootstrap_payload=""
+runtime_dir=""
+control_attached=0
+
+# These globals are the launcher's cleanup ledger. Signal and EXIT traps can run
+# between any two startup steps, so each PID/marker is published immediately
+# after ownership and cleared immediately after reaping.
+# Stop the adapter and every child it still owns. The adapter is frozen before
+# each process-tree snapshot so it cannot fork past the cleanup boundary.
+kill_transport_tree() {
+  local root="$1" index parent snapshot pid ppid tree_index
+  local -a tree
+
+  [[ "$root" =~ ^[0-9]+$ ]] || return
+  tree=("$root")
+  for ((index = 0; index < ${#tree[@]}; index++)); do
+    parent="${tree[index]}"
+    kill -STOP "$parent" 2>/dev/null || true
+    snapshot=$(ps -axo pid=,ppid= 2>/dev/null) || snapshot=""
+    while read -r pid ppid; do
+      if [[ "$pid" =~ ^[0-9]+$ && "$ppid" == "$parent" ]]; then
+        tree+=("$pid")
+      fi
+    done <<<"$snapshot"
+  done
+
+  for ((tree_index = ${#tree[@]} - 1; tree_index >= 0; tree_index--)); do
+    kill -KILL "${tree[tree_index]}" 2>/dev/null || true
+  done
+}
+
+install_stop_traps() {
+  # Preserve conventional shell statuses. The first signal requests authenticated
+  # remote cleanup; a second signal enters force_stop for bounded local teardown.
+  trap 'stop_transport 129' HUP
+  trap 'stop_transport 130' INT
+  trap 'stop_transport 143' TERM
+}
+
+transport_is_running() {
+  local state
+
+  kill -0 "$transport_pid" 2>/dev/null || return 1
+  state=$(ps -o stat= -p "$transport_pid" 2>/dev/null || true)
+  [[ "$state" != Z* ]]
+}
+
+job_for_pid() {
+  # Bash fg/bg operate on jobspecs, not arbitrary PIDs. Capture the jobspec while
+  # monitor mode is enabled instead of assuming a stable %1 ordering.
+  jobs -l | awk -v pid="$1" '
+    $2 == pid {
+      job = $1
+      gsub(/[^0-9]/, "", job)
+      print "%" job
+      exit
+    }
+  '
+}
+
+stop_control_helper_now() {
+  local helper_pid="$control_helper_pid"
+
+  [[ -n "$helper_pid" ]] || return
+  if [[ -n "$control_helper_job" ]]; then
+    kill -KILL "$control_helper_job" 2>/dev/null || true
+  else
+    # This fallback is used only between launch and jobspec capture.
+    kill -KILL "$helper_pid" 2>/dev/null || true
+  fi
+  wait "$helper_pid" 2>/dev/null || true
+  control_helper_pid=""
+  control_helper_job=""
+}
+
+# Invoked if another signal arrives while graceful shutdown is in progress.
+# shellcheck disable=SC2329
+force_stop() {
+  local status="$1"
+
+  trap '' HUP INT TERM
+  if ((signal_status != 0)); then
+    status="$signal_status"
+  fi
+  if [[ -n "$transport_pid" ]]; then
+    kill_transport_tree "$transport_pid"
+  fi
+  if [[ -n "$control_helper_pid" ]]; then
+    stop_control_helper_now
+  fi
+  exit "$status"
+}
+
+# Invoked by the signal traps installed below.
+# shellcheck disable=SC2329
+stop_transport() {
+  local status="$1" wait_count=0 stop_connected=0
+  local control_role stop_marker stopped_marker stop_reply
+
+  # Signal traps are reentrant. Once graceful shutdown starts, another Ctrl-C
+  # means the user prefers immediate local cleanup over waiting for ET recovery.
+  if ((signal_status != 0)); then
+    force_stop "$status"
+  fi
+  signal_status="$status"
+  trap 'force_stop 129' HUP
+  trap 'force_stop 130' INT
+  trap 'force_stop 143' TERM
+
+  [[ -n "$transport_pid" ]] || exit "$status"
+  : >"$runtime_dir/control.stop"
+
+  if ((control_attached == 1)) || [[ -e "$runtime_dir/control.attached" ]]; then
+    # After attachment, closing the held control stream is the stop request. Keep
+    # a stopped transport group runnable so ET can deliver EOF and the remote
+    # supervisor can reap its relay before the launcher exits.
+    while transport_is_running; do
+      # A signal can arrive while Bash is handling a stopped transport job.
+      # Let the transport consume the control EOF before waiting for its exit.
+      kill -CONT -- "-$transport_pid" 2>/dev/null || true
+      wait_count=$((wait_count + 1))
+      if ((wait_count == 5)); then
+        printf 'ettun: waiting for ET cleanup; press Ctrl-C again to force stop\n' >&2
+      fi
+      sleep 1
+    done
+    return
+  fi
+
+  if [[ -n "$control_local_port" && -n "$stop_token" ]]; then
+    # Before attachment, use the forwarded control listener explicitly. This
+    # covers Ctrl-C at a password/passcode prompt, where no held stream exists
+    # yet and simply killing the local client would orphan remote state.
+    stop_marker="ETTUN_STOP:$stop_token"
+    stopped_marker="ETTUN_STOPPED:$stop_token"
+    # A successful local write is not proof that ET delivered it remotely.
+    # Require the supervisor's role banner and authenticated acknowledgement.
+    # A bootstrap listener is deliberately left empty so its watchdog can reap
+    # the remote command after local authentication is cancelled.
+    while transport_is_running; do
+      if { exec 9<>"/dev/tcp/127.0.0.1/$control_local_port"; } 2>/dev/null; then
+        control_role=""
+        if IFS= read -r -t 2 -u 9 control_role 2>/dev/null &&
+          [[ "$control_role" == ETTUN_CONTROL ]] &&
+          printf '%s\n' "$stop_marker" >&9 2>/dev/null; then
+          stop_reply=""
+          if IFS= read -r -t 15 -u 9 stop_reply 2>/dev/null &&
+            [[ "$stop_reply" == "$stopped_marker" ]]; then
+            stop_connected=1
+          fi
+        fi
+        exec 9>&- 9<&-
+      fi
+      transport_is_running || return
+      if ((stop_connected == 0 && wait_count >= 20)); then
+        break
+      fi
+      if ((stop_connected == 1 && wait_count >= 30)); then
+        break
+      fi
+      wait_count=$((wait_count + 1))
+      if ((stop_connected == 1)); then
+        sleep 1
+      else
+        sleep 0.25
+      fi
+    done
+  fi
+  kill_transport_tree "$transport_pid"
+}
+
+# Invoked by the EXIT trap installed below.
+# shellcheck disable=SC2329
+cleanup_local() {
+  if [[ -n "$runtime_dir" ]]; then
+    : >"$runtime_dir/control.stop" 2>/dev/null || true
+  fi
+  if [[ -n "$transport_pid" ]]; then
+    kill_transport_tree "$transport_pid"
+    wait "$transport_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$control_helper_pid" ]]; then
+    stop_control_helper_now
+  fi
+  if [[ -n "$stdout_pid" ]]; then
+    kill -KILL "$stdout_pid" 2>/dev/null || true
+    wait "$stdout_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$stderr_pid" ]]; then
+    kill -KILL "$stderr_pid" 2>/dev/null || true
+    wait "$stderr_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$runtime_dir" ]]; then
+    # The worker normally consumes its status files, but Ctrl-C/SIGKILL can end
+    # it before or during publication. Kill the process tree first so no writer
+    # remains, then remove both sides of the rename here. Without both names the
+    # final rmdir can silently leave private per-run state behind.
+    rm -f "$runtime_dir/stdout" "$runtime_dir/stderr" \
+      "$runtime_dir/stdout.fifo" "$runtime_dir/stderr.fifo" \
+      "$runtime_dir/transport.pid" "$runtime_dir/control.attached" \
+      "$runtime_dir/control.stop" "$runtime_dir/transport.foreground" \
+      "$runtime_dir/transport.foreground.failed" \
+      "$runtime_dir/transport.interrupted" "$runtime_dir/transport.ready" \
+      "$runtime_dir/transport.status" \
+      "$runtime_dir/transport.status.tmp"
+    rmdir "$runtime_dir" 2>/dev/null || true
+  fi
+}
+
+control_handoff_helper() {
+  local launcher_pid="$1" stop_for_handoff="$2"
+  local attached_marker="ETTUN_ATTACHED:$stop_token"
+  local bootstrap_marker=ETTUN_BOOTSTRAP
+  local control_marker=ETTUN_CONTROL
+  local confirm_marker="ETTUN_CONFIRM:$stop_token"
+  local confirmed_marker="ETTUN_CONFIRMED:$stop_token"
+  local child_pid="" cleanup_count foreground_pgid received_reply state
+  local foreground_deadline=$((SECONDS + FOREGROUND_GATE_TIMEOUT))
+
+  trap '' HUP INT TERM
+
+  # The helper is deliberately outside the transport job. It can observe both
+  # terminal foreground ownership and the forwarded control port while the
+  # launcher is blocked inside fg waiting for an interactive adapter.
+  while [[ ! -s "$runtime_dir/transport.pid" ]]; do
+    kill -0 "$launcher_pid" 2>/dev/null || return 0
+    [[ ! -e "$runtime_dir/control.stop" ]] || return 0
+    sleep 0.05
+  done
+  IFS= read -r child_pid <"$runtime_dir/transport.pid" || return 1
+  [[ "$child_pid" =~ ^[0-9]+$ ]] || return 1
+
+  if ((stop_for_handoff == 1)); then
+    # tcsetpgrp is complete only when the terminal reports the worker PGID. A
+    # mere successful fg call is insufficient on macOS, where job state and
+    # terminal ownership can become observable at different moments.
+    while kill -0 "$child_pid" 2>/dev/null; do
+      kill -0 "$launcher_pid" 2>/dev/null || return 0
+      [[ ! -e "$runtime_dir/control.stop" ]] || return 0
+      foreground_pgid=$(ps -o tpgid= -p "$child_pid" 2>/dev/null || true)
+      foreground_pgid=${foreground_pgid//[[:space:]]/}
+      [[ "$foreground_pgid" == "$child_pid" ]] && break
+      if ((SECONDS >= foreground_deadline)); then
+        : >"$runtime_dir/transport.foreground.failed"
+        return 1
+      fi
+      sleep 0.01
+    done
+    kill -0 "$child_pid" 2>/dev/null || return 0
+  fi
+  kill -0 "$launcher_pid" 2>/dev/null || return 0
+  [[ ! -e "$runtime_dir/control.stop" ]] || return 0
+  kill -0 "$child_pid" 2>/dev/null || return 0
+  # Release the worker's pre-launch gate only after foreground ownership is
+  # proven. This prevents the adapter's first credential read from receiving
+  # TTIN in the background.
+  : >"$runtime_dir/transport.foreground"
+
+  while kill -0 "$child_pid" 2>/dev/null; do
+    if ! kill -0 "$launcher_pid" 2>/dev/null; then
+      exec 9>&- 9<&-
+      kill -KILL -- "-$child_pid" 2>/dev/null || true
+      return 0
+    fi
+    state=$(ps -o stat= -p "$child_pid" 2>/dev/null || true)
+    [[ "$state" != Z* ]] || return 0
+    if { exec 9<>"/dev/tcp/127.0.0.1/$control_local_port"; } 2>/dev/null; then
+      received_reply=""
+      if IFS= read -r -t 15 -u 9 received_reply 2>/dev/null; then
+        if [[ "$received_reply" == "$control_marker" ]] &&
+          printf '%s\n' "$stop_token" >&9 2>/dev/null; then
+          received_reply=""
+          if IFS= read -r -t 15 -u 9 received_reply 2>/dev/null &&
+            [[ "$received_reply" == "$attached_marker" ]] &&
+            printf '%s\n' "$confirm_marker" >&9 2>/dev/null; then
+            received_reply=""
+            if IFS= read -r -t 15 -u 9 received_reply 2>/dev/null &&
+              [[ "$received_reply" == "$confirmed_marker" ]]; then
+              # Publish attachment only after the three-message handshake. For
+              # terminal sessions, stop the group immediately afterward so the
+              # launcher can observe the marker and perform one ordered bg/CONT.
+              : >"$runtime_dir/control.attached"
+              if ((stop_for_handoff == 1)); then
+                kill -STOP -- "-$child_pid" 2>/dev/null || return 1
+              fi
+              while kill -0 "$child_pid" 2>/dev/null &&
+                [[ ! -e "$runtime_dir/control.stop" ]]; do
+                kill -0 "$launcher_pid" 2>/dev/null || {
+                  exec 9>&- 9<&-
+                  break
+                }
+                sleep 0.1
+              done
+              exec 9>&- 9<&-
+              if ! kill -0 "$launcher_pid" 2>/dev/null; then
+                for ((cleanup_count = 0; cleanup_count < 20; cleanup_count++)); do
+                  kill -0 "$child_pid" 2>/dev/null || return 0
+                  sleep 0.1
+                done
+                kill -KILL -- "-$child_pid" 2>/dev/null || true
+              fi
+              return 0
+            fi
+          fi
+        elif [[ "$received_reply" == "$bootstrap_marker" ]]; then
+          printf '%s' "$bootstrap_payload" >&9 2>/dev/null || true
+        fi
+      fi
+      exec 9>&- 9<&-
+    fi
+    [[ ! -e "$runtime_dir/control.stop" ]] || return 0
+    sleep 0.25
+  done
+}
+
+run_transport() {
+  local tunnel_spec="$1" remote_command="$2" marker="$3"
+  local stdout_log="$runtime_dir/stdout" stderr_log="$runtime_dir/stderr"
+  local stdout_fifo="$runtime_dir/stdout.fifo" stderr_fifo="$runtime_dir/stderr.fifo"
+  local foreground_status=0 handoff_resume_count=0 pre_attach_resume_count=0
+  local worker_ready_deadline=0 worker_ready_timed_out=0
+  local pre_attach_stop_signal=""
+  local transport_job="" transport_reaped=0 use_terminal_handoff=0
+
+  # tee processes drain adapter output into searchable logs without stealing its
+  # controlling terminal. Keep stdin on fd 8 so the worker can authenticate
+  # directly even though stdout/stderr pass through FIFOs.
+  control_attached=0
+  rm -f "$stdout_log" "$stderr_log" "$stdout_fifo" "$stderr_fifo"
+  : >"$stdout_log"
+  : >"$stderr_log"
+  mkfifo "$stdout_fifo" "$stderr_fifo" || return 1
+
+  pending_signal=0
+  trap 'pending_signal=129' HUP
+  trap 'pending_signal=130' INT
+  trap 'pending_signal=143' TERM
+  (
+    trap '' INT TERM HUP
+    exec tee "$stdout_log" <"$stdout_fifo"
+  ) &
+  stdout_pid=$!
+  (
+    trap '' INT TERM HUP
+    exec tee "$stderr_log" <"$stderr_fifo" >&2
+  ) &
+  stderr_pid=$!
+
+  [[ -t 8 ]] && use_terminal_handoff=1
+  rm -f "$runtime_dir/transport.pid" "$runtime_dir/control.attached" \
+    "$runtime_dir/control.stop" "$runtime_dir/transport.foreground" \
+    "$runtime_dir/transport.foreground.failed" \
+    "$runtime_dir/transport.interrupted" "$runtime_dir/transport.ready"
+  set -m
+  # POSIX preserves SIG_IGN across exec, which caused macOS adapters to inherit
+  # an unwanted Ctrl-Z policy during authentication. A caught no-op disposition
+  # instead resets to default when Bash execs the worker; the worker can then
+  # install its own TSTP coordination trap before launching the adapter.
+  trap ':' TSTP
+  "$BASH" "${BASH_SOURCE[0]}" --ettun-transport-worker \
+    "$runtime_dir" "$use_terminal_handoff" "$transport_path" "$et_path" \
+    "$via_host" "$tunnel_spec" "$remote_command" "$$" \
+    <&8 >"$stdout_fifo" 2>"$stderr_fifo" &
+  transport_pid=$!
+  trap '' TSTP
+  transport_job=$(job_for_pid "$transport_pid")
+  if [[ -z "$transport_job" ]]; then
+    printf 'ettun: could not identify the transport job\n' >&2
+    kill_transport_tree "$transport_pid"
+    set +m
+    return 1
+  fi
+  printf '%s\n' "$transport_pid" >"$runtime_dir/transport.pid"
+  if ((use_terminal_handoff == 1)); then
+    worker_ready_deadline=$((SECONDS + FOREGROUND_GATE_TIMEOUT))
+    while [[ ! -e "$runtime_dir/transport.ready" ]] &&
+      ((pending_signal == 0)) && transport_is_running; do
+      if ((SECONDS >= worker_ready_deadline)); then
+        printf 'ettun: timed out preparing the transport for terminal handoff\n' >&2
+        worker_ready_timed_out=1
+        break
+      fi
+      # A synchronous command becomes the terminal's foreground process group
+      # under monitor mode. Keep the launcher foreground so Ctrl-C reaches its
+      # pending-signal trap while the worker is still gated.
+      sleep 0.01 &
+      wait "$!" 2>/dev/null || true
+    done
+
+    if ((pending_signal != 0)); then
+      # The launcher still owns the terminal until readiness is published, so a
+      # signal here cannot have reached an adapter or created remote state.
+      # Reap the blocked worker locally and preserve the conventional status.
+      signal_status="$pending_signal"
+      : >"$runtime_dir/control.stop"
+      kill_transport_tree "$transport_pid"
+      wait "$transport_job" 2>/dev/null || true
+      foreground_status="$signal_status"
+      transport_reaped=1
+    elif ((worker_ready_timed_out == 1)); then
+      : >"$runtime_dir/control.stop"
+      kill_transport_tree "$transport_pid"
+      wait "$transport_job" 2>/dev/null || true
+      foreground_status=1
+      transport_reaped=1
+    elif [[ ! -e "$runtime_dir/transport.ready" ]]; then
+      # Preserve a worker failure that happens before trap readiness rather than
+      # waiting for a marker that can no longer be published.
+      wait "$transport_job" 2>/dev/null || foreground_status=$?
+      transport_reaped=1
+    fi
+  fi
+
+  if ((transport_reaped == 0)); then
+    control_handoff_helper "$$" "$use_terminal_handoff" &
+    control_helper_pid=$!
+    control_helper_job=$(job_for_pid "$control_helper_pid")
+    if [[ -z "$control_helper_job" ]]; then
+      printf 'ettun: could not identify the control helper job\n' >&2
+      : >"$runtime_dir/control.stop"
+      kill_transport_tree "$transport_pid"
+      stop_control_helper_now
+      wait "$transport_job" 2>/dev/null || true
+      foreground_status=1
+      transport_reaped=1
+    fi
+  fi
+  if ((transport_reaped == 1)); then
+    # Do not leave a reaped PID in the cleanup ledger when force-stop traps
+    # become active; the kernel may already have reused it for another process.
+    transport_pid=""
+  fi
+  install_stop_traps
+  if ((pending_signal != 0 && signal_status == 0)); then
+    stop_transport "$pending_signal"
+  fi
+
+  if ((use_terminal_handoff == 1 && transport_reaped == 0)); then
+    # fg simultaneously transfers the terminal and waits for job state. On
+    # macOS, an adapter can stop with TTIN/TSTP during that transition and fg
+    # returns a signal-shaped status even though the same job is still healthy.
+    # Re-enter fg for those expected stops; do not launch a replacement adapter,
+    # which would duplicate authentication prompts and remote sessions.
+    while :; do
+      foreground_status=0
+      # Bash uses stderr's terminal for job-control ioctls, so only suppress the
+      # command summary on stdout while the transport owns the terminal.
+      fg "$transport_job" >/dev/null || foreground_status=$?
+      if [[ -e "$runtime_dir/transport.interrupted" ]]; then
+        signal_status=130
+        foreground_status=130
+        break
+      fi
+      if ! transport_is_running; then
+        transport_reaped=1
+        break
+      fi
+      pre_attach_stop_signal=$(kill -l "$foreground_status" 2>/dev/null || true)
+      pre_attach_stop_signal=${pre_attach_stop_signal#SIG}
+      if [[ -e "$runtime_dir/control.attached" ]]; then
+        # The helper froze the authenticated group before publishing this marker.
+        # bg both resumes it and completes the foreground-to-control handoff.
+        if bg "$transport_job" >/dev/null 2>&1; then
+          control_attached=1
+          foreground_status=0
+        else
+          printf 'ettun: could not complete terminal handoff\n' >&2
+          : >"$runtime_dir/control.stop"
+          kill_transport_tree "$transport_pid"
+        fi
+        break
+      fi
+      if ((signal_status != 0)); then
+        break
+      fi
+
+      case "$pre_attach_stop_signal" in
+        TTIN | TSTP)
+          ;;
+        *)
+          printf 'ettun: transport stopped unexpectedly before control attachment\n' >&2
+          : >"$runtime_dir/control.stop"
+          kill_transport_tree "$transport_pid"
+          wait "$transport_job" 2>/dev/null || true
+          foreground_status=1
+          transport_reaped=1
+          break
+          ;;
+      esac
+
+      # A background launch can receive TTIN as fg takes ownership, and an
+      # adapter can reset inherited TSTP handling before authentication.
+      # Re-foreground that same live job until the control handoff completes.
+      pre_attach_resume_count=$((pre_attach_resume_count + 1))
+      if ((pre_attach_resume_count > MAX_HANDOFF_RESUMES)); then
+        printf 'ettun: transport repeatedly stopped before control attachment\n' >&2
+        : >"$runtime_dir/control.stop"
+        kill_transport_tree "$transport_pid"
+        wait "$transport_job" 2>/dev/null || true
+        foreground_status=1
+        transport_reaped=1
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+
+  transport_status=0
+  if ((transport_reaped == 1)); then
+    transport_status="$foreground_status"
+  else
+    while :; do
+      transport_status=0
+      wait "$transport_job" 2>/dev/null || transport_status=$?
+      if ((control_attached == 0 || signal_status != 0)) ||
+        ! transport_is_running; then
+        break
+      fi
+
+      # Bash can observe another stopped state immediately after bg during the
+      # terminal handoff, especially on macOS where the helper's STOP and bg's
+      # CONT race with job-table notification. Resume that same job before
+      # waiting again, with a bound so a genuinely broken adapter cannot loop.
+      handoff_resume_count=$((handoff_resume_count + 1))
+      if ((handoff_resume_count > MAX_HANDOFF_RESUMES)); then
+        printf 'ettun: transport repeatedly stopped during terminal handoff\n' >&2
+        : >"$runtime_dir/control.stop"
+        kill_transport_tree "$transport_pid"
+        wait "$transport_job" 2>/dev/null || true
+        transport_status=1
+        break
+      fi
+      sleep 0.1
+      if ((signal_status != 0)) || ! transport_is_running; then
+        continue
+      fi
+      if ! bg "$transport_job" >/dev/null 2>&1; then
+        printf 'ettun: could not complete terminal handoff\n' >&2
+        : >"$runtime_dir/control.stop"
+        kill_transport_tree "$transport_pid"
+        wait "$transport_job" 2>/dev/null || true
+        transport_status=1
+        break
+      fi
+    done
+    if ((signal_status != 0)); then
+      # macOS Bash can run the Ctrl-C trap and return from wait before recording
+      # the child's death. Re-wait to consume that status and prevent a zombie;
+      # the user-visible status remains the signal_status captured by the trap.
+      wait "$transport_job" 2>/dev/null || true
+      kill -KILL "$stdout_pid" "$stderr_pid" 2>/dev/null || true
+    fi
+  fi
+  if [[ -e "$runtime_dir/transport.interrupted" ]]; then
+    # The worker writes this marker before killing its own process group. It is
+    # authoritative when launcher job-control bookkeeping reports a different
+    # transient status for the same terminal Ctrl-C.
+    signal_status=130
+    transport_status=130
+  fi
+  set +m
+  transport_pid=""
+  if [[ -n "$control_helper_pid" ]]; then
+    : >"$runtime_dir/control.stop"
+    if ((signal_status != 0)); then
+      stop_control_helper_now
+    else
+      wait "$control_helper_pid" 2>/dev/null || true
+      control_helper_pid=""
+      control_helper_job=""
+    fi
+  fi
+  wait "$stdout_pid" 2>/dev/null || true
+  stdout_pid=""
+  wait "$stderr_pid" 2>/dev/null || true
+  stderr_pid=""
+
+  collision_seen=0
+  if grep -Fxq -- "$marker" "$stdout_log" || grep -Fxq -- "$marker" "$stderr_log"; then
+    collision_seen=1
+  fi
+  fatal_status=$(sed -n \
+    "s/.*ETTUN_FATAL:$stop_token:\([0-9][0-9]*\):.*/\1/p" \
+    "$stdout_log" "$stderr_log" | head -n 1)
+}
+
+# Public command entry point.
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+[[ $# -eq 4 ]] || die_usage "expected four arguments"
+
+via_host="$1"
+local_port="$2"
+target_host="$3"
+target_port="$4"
+
+# These values become ET argv and generated shell literals. The deliberately
+# narrow grammars make that interpolation safe without shell evaluation or a
+# second quoting language.
+valid_via_host "$via_host" || die_usage "invalid via host: $via_host"
+valid_port "$local_port" || die_usage "invalid local port: $local_port"
+valid_target_host "$target_host" || die_usage "invalid target host: $target_host"
+valid_port "$target_port" || die_usage "invalid target port: $target_port"
+
+local_port=$((10#$local_port))
+target_port=$((10#$target_port))
+
+if local_port_in_use "$local_port"; then
+  printf 'ettun: localhost:%s is already in use; this tunnel may already be running.\n' \
+    "$local_port" >&2
+  exit 1
+fi
+
+transport_path=""
+et_path=""
+# A custom adapter changes only how the ET connection is established. Bootstrap,
+# authentication, forwarding, retries, and cleanup remain owned by this script.
+if [[ -n "${ETTUN_TRANSPORT:-}" ]]; then
+  transport_path=$(resolve_command transport "$ETTUN_TRANSPORT") || exit 1
+else
+  et_path=$(resolve_command "ET client" "${ETTUN_ET:-et}") || exit 1
+fi
+
+client_identity=$(client_id) || exit 1
+tunnel_key="$client_identity-$local_port"
+port_seed=$((RANDOM + RANDOM + $$))
+
+umask 077
+# All cross-process coordination is private to this invocation. Preserve the
+# original stdin on fd 8 before FIFOs and job control rearrange other descriptors;
+# interactive adapters must still read directly from the user's controlling TTY.
+runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/ettun.XXXXXX") || {
+  printf 'ettun: could not create private runtime directory\n' >&2
+  exit 1
+}
+exec 8<&0
+trap cleanup_local EXIT
+install_stop_traps
+
+printf 'ettun: localhost:%s -> %s:%s via %s (ET; Ctrl-C to stop)\n' \
+  "$local_port" "$target_host" "$target_port" "$via_host"
+
+# A remote port can become busy between selection and listener bind. Each attempt
+# gets a distinct relay/control/stop tuple and token; retry only a token-matched
+# collision marker, never an arbitrary ET or adapter failure.
+for ((attempt = 0; attempt < MAX_RELAY_ATTEMPTS; attempt++)); do
+  relay_index=$(((port_seed + attempt * RELAY_PORT_STRIDE) % RELAY_PORT_SPAN))
+  relay_port=$((RELAY_PORT_MIN + relay_index))
+  control_remote_port=$((RELAY_PORT_MIN + (\
+    relay_index + CONTROL_PORT_OFFSET) % RELAY_PORT_SPAN))
+  stop_remote_port=$((RELAY_PORT_MIN + (\
+    relay_index + STOP_PORT_OFFSET) % RELAY_PORT_SPAN))
+  control_local_port=$(choose_local_control_port "$port_seed" "$attempt") || exit 1
+  stop_token=$(random_hex) || {
+    printf 'ettun: could not generate a stop token\n' >&2
+    exit 1
+  }
+  retry_marker="ETTUN_COLLISION:$stop_token:$relay_port"
+  tunnel_spec="$local_port:$relay_port,$control_local_port:$control_remote_port"
+  if ! bootstrap_payload=$(build_remote_payload \
+    "$relay_port" "$control_remote_port" "$stop_remote_port" \
+    "$stop_token" "$tunnel_key"); then
+    printf 'ettun: could not encode the remote supervisor payload\n' >&2
+    exit 1
+  fi
+  bootstrap_digest=$(sha256_text "$bootstrap_payload") || exit 1
+  bootstrap_size=${#bootstrap_payload}
+  if ! remote_command=$(build_remote_command \
+    "$control_remote_port" "$stop_token" "$retry_marker" \
+    "$bootstrap_digest" "$bootstrap_size"); then
+    printf 'ettun: could not encode a bounded remote bootstrap command\n' >&2
+    exit 1
+  fi
+
+  export ETTUN_RETRY_MARKER="$retry_marker"
+  ((signal_status == 0)) || exit "$signal_status"
+  run_transport "$tunnel_spec" "$remote_command" "$retry_marker"
+
+  # Status precedence is intentional: a local signal is the user's requested
+  # outcome; an authenticated remote fatal marker survives transports that mask
+  # remote exits; otherwise return the adapter status unless this exact attempt
+  # reported a retryable relay collision.
+  if ((signal_status != 0)); then
+    exit "$signal_status"
+  fi
+  if [[ -n "$fatal_status" ]]; then
+    exit "$fatal_status"
+  fi
+  if ((collision_seen == 0)); then
+    exit "$transport_status"
+  fi
+  if ((attempt + 1 < MAX_RELAY_ATTEMPTS)); then
+    printf 'ettun: remote relay port was busy; retrying (%s/%s)\n' \
+      "$((attempt + 2))" "$MAX_RELAY_ATTEMPTS" >&2
+  fi
+done
+
+printf 'ettun: could not reserve remote relay ports after %s attempts\n' \
+  "$MAX_RELAY_ATTEMPTS" >&2
+exit 75
