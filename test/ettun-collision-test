@@ -447,8 +447,18 @@ if [[ "$client_id" =~ ^[0-9a-f]{32}$ ]]; then
   _pass "client identity: creates a stable random id"
 else
   _fail "client identity: creates a stable random id (got '$client_id')"
+  printf '    ettun exit: %s\n' "$run_exit" >&2
+  if [[ -s "$stderr" ]]; then
+    sed 's/^/    ettun stderr: /' "$stderr" >&2
+  else
+    printf '    ettun stderr: <empty>\n' >&2
+  fi
 fi
-client_mode=$(stat -c '%a' "$client_id_file" 2>/dev/null || stat -f '%Lp' "$client_id_file")
+client_mode=""
+if [[ -e "$client_id_file" ]]; then
+  client_mode=$(stat -c '%a' "$client_id_file" 2>/dev/null ||
+    stat -f '%Lp' "$client_id_file")
+fi
 _assert_eq "client identity: protects the id file" "600" "$client_mode"
 
 echo ""
