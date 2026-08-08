@@ -395,7 +395,7 @@ _decode_remote_payload() {
 
   IFS=: read -r magic token payload <<<"$wire"
   [[ "$magic" == ETTUN_PAYLOAD && "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
-  if printf '%s' "$payload" | base64 --decode 2>/dev/null | gzip -dc 2>/dev/null; then
+  if printf '%s' "$payload" | base64 -d 2>/dev/null | gzip -dc 2>/dev/null; then
     return
   fi
   printf '%s' "$payload" | base64 -D 2>/dev/null | gzip -dc
