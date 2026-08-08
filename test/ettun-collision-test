@@ -460,6 +460,129 @@ if [[ -e "$client_id_file" ]]; then
     stat -f '%Lp' "$client_id_file")
 fi
 _assert_eq "client identity: protects the id file" "600" "$client_mode"
+first_client_id=$client_id
+ETTUN_TEST_CLIENT_ID='' \
+  _run_ettun gateway.example 10443 service.internal 443
+client_id=""
+[[ -r "$client_id_file" ]] && read -r client_id <"$client_id_file"
+if [[ "$first_client_id" =~ ^[0-9a-f]{32}$ &&
+  "$client_id" == "$first_client_id" ]]; then
+  _pass "client identity: remains stable across launches"
+else
+  _fail "client identity: remains stable across launches"
+fi
+
+# Android app storage rejects hard links. Reproduce that constraint while two
+# first launches compete, and hold the elected publisher at its final rename so
+# the other launch must observe the lock rather than merely reuse a finished ID.
+identity_race_home="$tmp/identity-race-home"
+identity_race_state="$identity_race_home/state/ettun"
+identity_ln_attempts="$tmp/identity-ln-attempts"
+identity_lock_attempts="$tmp/identity-lock-attempts"
+identity_mv_ready="$tmp/identity-mv-ready"
+identity_mv_release="$tmp/identity-mv-release"
+mkdir -p "$identity_race_home"
+: >"$identity_ln_attempts"
+: >"$identity_lock_attempts"
+_write_stub "$bin/ln" \
+  'printf "%s\n" "$PPID" >>"$ETTUN_TEST_IDENTITY_LN_ATTEMPTS"' \
+  'exit 1'
+_write_stub "$bin/mkdir" \
+  "real_mkdir=$real_mkdir_q" \
+  'for arg in "$@"; do' \
+  '  case "$arg" in' \
+  '    */client-id.lock)' \
+  '      printf "%s\n" "$PPID" >>"$ETTUN_TEST_IDENTITY_LOCK_ATTEMPTS"' \
+  '      ;;' \
+  '  esac' \
+  'done' \
+  'exec "$real_mkdir" "$@"'
+_write_stub "$bin/mv" \
+  "real_mv=$real_mv_q" \
+  'if [[ "${2:-}" == */client-id ]]; then' \
+  '  : >"$ETTUN_TEST_IDENTITY_MV_READY"' \
+  '  while [[ ! -e "$ETTUN_TEST_IDENTITY_MV_RELEASE" ]]; do sleep 0.01; done' \
+  'fi' \
+  'exec "$real_mv" "$@"'
+
+_run_identity_candidate() {
+  local name="$1" local_port="$2"
+
+  PATH="$bin:$test_system_path" \
+    HOME="$identity_race_home" \
+    XDG_STATE_HOME="$identity_race_home/state" \
+    ETTUN_CLIENT_ID='' \
+    ETTUN_TRANSPORT=true \
+    ETTUN_TEST_PYTHON="$test_python" \
+    ETTUN_TEST_PORT_PROBE_ERROR="$tmp/identity-$name-probe.error" \
+    ETTUN_TEST_IDENTITY_LN_ATTEMPTS="$identity_ln_attempts" \
+    ETTUN_TEST_IDENTITY_LOCK_ATTEMPTS="$identity_lock_attempts" \
+    ETTUN_TEST_IDENTITY_MV_READY="$identity_mv_ready" \
+    ETTUN_TEST_IDENTITY_MV_RELEASE="$identity_mv_release" \
+    bash "$SCRIPT" gateway.example "$local_port" service.internal 443 \
+    >"$tmp/identity-$name.stdout" 2>"$tmp/identity-$name.stderr"
+}
+
+_run_identity_candidate first 10461 &
+identity_first_pid=$!
+if _wait_for_marker "$identity_mv_ready"; then
+  _pass "client identity fallback: stages a complete elected candidate"
+else
+  _fail "client identity fallback: stages a complete elected candidate"
+fi
+_run_identity_candidate second 10462 &
+identity_second_pid=$!
+identity_lock_observed=0
+for _ in {1..80}; do
+  identity_lock_count=$(wc -l <"$identity_lock_attempts")
+  if ((identity_lock_count >= 2)); then
+    identity_lock_observed=1
+    break
+  fi
+  sleep 0.1
+done
+if ((identity_lock_observed == 1)); then
+  _pass "client identity fallback: serializes competing first launches"
+else
+  _fail "client identity fallback: serializes competing first launches"
+fi
+: >"$identity_mv_release"
+identity_first_exit=0
+wait "$identity_first_pid" || identity_first_exit=$?
+identity_second_exit=0
+wait "$identity_second_pid" || identity_second_exit=$?
+_assert_exit "client identity fallback: elected launch succeeds" \
+  0 "$identity_first_exit"
+_assert_exit "client identity fallback: waiting launch succeeds" \
+  0 "$identity_second_exit"
+
+identity_race_file="$identity_race_state/client-id"
+identity_race_value=""
+[[ -r "$identity_race_file" ]] && read -r identity_race_value <"$identity_race_file"
+if [[ "$identity_race_value" =~ ^[0-9a-f]{32}$ ]]; then
+  _pass "client identity fallback: publishes one valid identity"
+else
+  _fail "client identity fallback: publishes one valid identity"
+fi
+identity_race_mode=""
+if [[ -e "$identity_race_file" ]]; then
+  identity_race_mode=$(stat -c '%a' "$identity_race_file" 2>/dev/null ||
+    stat -f '%Lp' "$identity_race_file")
+fi
+_assert_eq "client identity fallback: protects the published identity" \
+  "600" "$identity_race_mode"
+if [[ ! -e "$identity_race_file.lock" ]]; then
+  _pass "client identity fallback: releases its publication lock"
+else
+  _fail "client identity fallback: releases its publication lock"
+fi
+identity_temp_count=0
+for identity_temp in "$identity_race_state"/client-id.tmp.*; do
+  [[ ! -e "$identity_temp" ]] || identity_temp_count=$((identity_temp_count + 1))
+done
+_assert_eq "client identity fallback: removes losing candidates" \
+  0 "$identity_temp_count"
+rm -f "$bin/ln" "$bin/mkdir" "$bin/mv"
 
 echo ""
 echo "=== ettun validation and errors ==="

@@ -268,7 +268,7 @@ sha256_text() {
 }
 
 client_id() {
-  local state_dir state_file tmp value
+  local state_dir state_file lock_dir lock_cleanup tmp value attempt publish_status
 
   if [[ -n "${ETTUN_CLIENT_ID:-}" ]]; then
     value="$ETTUN_CLIENT_ID"
@@ -302,8 +302,45 @@ client_id() {
       rm -f "$tmp"
       return 1
     fi
-    # The hard link makes concurrent first runs converge on one identity.
-    ln "$tmp" "$state_file" 2>/dev/null || true
+    # Prefer a hard link because it publishes an already-complete inode and
+    # makes concurrent first runs converge without an intermediate read state.
+    # Android app storage rejects hard links, however. An atomic lock-directory
+    # fallback elects one publisher, which renames the complete same-directory
+    # temporary file while contenders wait for that canonical file to appear.
+    if ! ln "$tmp" "$state_file" 2>/dev/null; then
+      lock_dir="${state_file}.lock"
+      publish_status=1
+      for attempt in {1..100}; do
+        if [[ -f "$state_file" ]]; then
+          publish_status=0
+          break
+        fi
+        if mkdir "$lock_dir" 2>/dev/null; then
+          # client_id runs in a command-substitution shell. Keep its EXIT trap
+          # scoped there so catchable termination cannot strand the empty lock;
+          # the deadline below still prevents a SIGKILL-stale lock from hanging
+          # every future invocation indefinitely.
+          printf -v lock_cleanup 'rmdir %q 2>/dev/null || true' "$lock_dir"
+          # Expand the quoted cleanup command now: lock_dir is local to this
+          # function and may be out of scope by the time an EXIT trap runs.
+          # shellcheck disable=SC2064
+          trap "$lock_cleanup" EXIT
+          publish_status=0
+          if [[ ! -f "$state_file" ]] && ! mv "$tmp" "$state_file"; then
+            publish_status=1
+          fi
+          rmdir "$lock_dir" 2>/dev/null || true
+          trap - EXIT
+          break
+        fi
+        sleep 0.1
+      done
+      if ((publish_status != 0)); then
+        rm -f "$tmp"
+        printf 'ettun: could not publish client identity: %s\n' "$state_file" >&2
+        return 1
+      fi
+    fi
     rm -f "$tmp"
   fi
 

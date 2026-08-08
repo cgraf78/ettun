@@ -39,6 +39,8 @@ case ":$test_extended_system_path:" in
 esac
 real_ps=$(command -v ps)
 printf -v real_ps_q '%q' "$real_ps"
+real_mkdir=$(command -v mkdir)
+printf -v real_mkdir_q '%q' "$real_mkdir"
 real_mv=$(command -v mv)
 printf -v real_mv_q '%q' "$real_mv"
 mkdir -p "$bin" "$test_home"
