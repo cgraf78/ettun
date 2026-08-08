@@ -432,6 +432,12 @@ else
   _fail "signal handling: TERM during setup launches no transport"
 fi
 
+# The delayed od stub above belongs to the setup-signal scenarios: its marker
+# proves those tests reached token generation before delivering a signal.
+# Remove it before testing persistent identity so that scenario exercises the
+# platform's real entropy tool without depending on the now-unset marker.
+rm -f "$bin/od"
+
 ETTUN_TEST_CLIENT_ID='' \
   _run_ettun gateway.example 10443 service.internal 443
 client_id_file="$test_home/state/ettun/client-id"
