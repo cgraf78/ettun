@@ -99,6 +99,11 @@ authentication. It inherits `ETTUN_RETRY_MARKER`, the exact per-attempt marker
 that makes a remote bind collision retryable. Arbitrary adapter errors are not
 retried, even when their text happens to mention a collision.
 
+[`examples/transport-et-wrapper`](examples/transport-et-wrapper) is a complete,
+tested ET-backed adapter. It is intentionally thin so authentication, signal
+handling, retry classification, and remote lifecycle ownership remain with ET
+and ettun instead of being reimplemented in the wrapper.
+
 ## Lifecycle and security model
 
 Each launch generates a random token and three distinct remote loopback ports:

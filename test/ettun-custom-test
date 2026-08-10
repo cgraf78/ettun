@@ -20,6 +20,46 @@ _assert_contains "custom transport: receives the bounded bootstrap third" \
   "et-bootstrap" "$commands"
 _assert_not_contains "custom transport: bypasses the default ET binary" $'\net\n' "$commands"
 
+# The checked-in adapter is documentation only if it is not exercised through
+# ettun's real custom-transport path. Use the fixture ET binary so the test can
+# prove argv forwarding without opening a network connection.
+example_adapter="$ETTUN_TEST_ROOT/examples/transport-et-wrapper"
+ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_ET="$bin/et" \
+  ETTUN_TEST_TRANSPORT="$example_adapter" \
+  _run_ettun relay.example 5903 desktop.example 5900
+unset ETTUN_TEST_TRANSPORT ETTUN_TEST_ET
+commands=$(cat "$log")
+_assert_exit "transport example: succeeds through the public adapter contract" \
+  0 "$run_exit"
+_assert_contains "transport example: invokes the selected ET executable" \
+  $'et\n<-N>\n<--keepalive>\n<5>\n<-t>\n<5903:' "$commands"
+_assert_contains "transport example: forwards the generated remote command" \
+  "<--command>" "$commands"
+
+# A wrapper must not consume authentication input or hide the transport's real
+# status. Exercise the example directly with a tiny ET-compatible test double.
+example_stdin="$tmp/example-stdin"
+example_args="$tmp/example-args"
+_write_stub "$bin/example-et" \
+  'printf "%s\n" "$@" >"$ETTUN_TEST_EXAMPLE_ARGS"' \
+  'IFS= read -r line || true' \
+  'printf "%s\n" "$line" >"$ETTUN_TEST_EXAMPLE_STDIN"' \
+  'exit 37'
+set +e
+printf 'interactive-auth\n' |
+  ETTUN_ET="$bin/example-et" \
+    ETTUN_TEST_EXAMPLE_ARGS="$example_args" \
+    ETTUN_TEST_EXAMPLE_STDIN="$example_stdin" \
+    "$example_adapter" gateway.example '5903:45000,45001:45002' 'remote command'
+example_exit=$?
+set -e
+_assert_exit "transport example: preserves the ET exit status" 37 "$example_exit"
+_assert_eq "transport example: leaves standard input attached" \
+  "interactive-auth" "$(<"$example_stdin")"
+_assert_eq "transport example: passes the complete ET invocation" \
+  $'-N\n--keepalive\n5\n-t\n5903:45000,45001:45002\n--command\nremote command\ngateway.example' \
+  "$(<"$example_args")"
+
 ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_TRANSPORT="$bin/test-transport" \
   _run_ettun __ettun_transport_worker 5902 desktop.internal 5900
 unset ETTUN_TEST_TRANSPORT
