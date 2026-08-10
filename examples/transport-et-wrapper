@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Minimal ET-backed implementation of ETTUN_TRANSPORT's three-argument API.
+
+set -u
+
+if (($# != 3)); then
+  printf 'usage: transport-et-wrapper VIA TUNNEL_SPEC REMOTE_COMMAND\n' >&2
+  exit 2
+fi
+
+via_host=$1
+tunnel_spec=$2
+remote_command=$3
+et_name=${ETTUN_ET:-et}
+
+# Resolve one executable instead of evaluating a command string. An adapter is
+# trusted code and receives the generated bootstrap command, but it should not
+# turn that trust into an extra shell-evaluation boundary of its own.
+if ! et_path=$(command -v "$et_name" 2>/dev/null); then
+  printf "transport-et-wrapper: ET client '%s' was not found\n" "$et_name" >&2
+  exit 127
+fi
+
+# Stay in the foreground, retain the caller's standard input for interactive
+# authentication, and let exec preserve ET's signals and exit status exactly.
+# ETTUN_RETRY_MARKER remains in the environment; retry classification still
+# belongs to ettun and depends on the tokenized remote diagnostic on stderr.
+exec "$et_path" -N --keepalive 5 -t "$tunnel_spec" \
+  --command "$remote_command" "$via_host"

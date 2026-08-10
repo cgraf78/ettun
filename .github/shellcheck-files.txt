@@ -1,6 +1,7 @@
 # type<TAB>repository-relative path
 # `fixture` records are discovered but intentionally excluded from ShellCheck.
 program	bin/ettun
+program	examples/transport-et-wrapper
 program	install.sh
 program	test/run
 program	test/lib/test.sh
