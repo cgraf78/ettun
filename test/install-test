@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# shellcheck source=lib/test.sh
+. "$ROOT/test/lib/test.sh"
+
+printf '=== ettun installation ===\n'
+
+prefix=$(_tmpdir)
+PREFIX="$prefix" "$ROOT/install.sh" >/dev/null
+_assert_eq "installation: publishes the checkout command" \
+  "$ROOT/bin/ettun" "$(readlink "$prefix/bin/ettun")"
+
+PREFIX="$prefix" "$ROOT/install.sh" >/dev/null
+_assert_eq "installation: reinstall is idempotent" \
+  "$ROOT/bin/ettun" "$(readlink "$prefix/bin/ettun")"
+
+custom_bin=$(_tmpdir)/commands
+BIN_DIR="$custom_bin" "$ROOT/install.sh" >/dev/null
+_assert_eq "installation: honors BIN_DIR" \
+  "$ROOT/bin/ettun" "$(readlink "$custom_bin/ettun")"
+
+blocked_bin=$(_tmpdir)/commands
+mkdir -p "$blocked_bin"
+printf 'owned elsewhere\n' >"$blocked_bin/ettun"
+blocked_status=0
+blocked_output=$(BIN_DIR="$blocked_bin" "$ROOT/install.sh" 2>&1) ||
+  blocked_status=$?
+_assert_exit "installation: refuses a non-symlink destination" 1 \
+  "$blocked_status"
+_assert_file_content "installation: preserves a non-symlink destination" \
+  "owned elsewhere" "$blocked_bin/ettun"
+_assert_contains "installation: destination refusal is actionable" \
+  "refusing to replace non-symlink" "$blocked_output"
+
+missing_root=$(_tmpdir)
+missing_prefix=$(_tmpdir)
+cp "$ROOT/install.sh" "$missing_root/install.sh"
+missing_status=0
+missing_output=$(PREFIX="$missing_prefix" "$missing_root/install.sh" 2>&1) ||
+  missing_status=$?
+_assert_exit "installation: missing command source fails" 1 "$missing_status"
+if [[ ! -e "$missing_prefix/bin/ettun" &&
+  ! -L "$missing_prefix/bin/ettun" ]]; then
+  _pass "installation: missing source publishes no command"
+else
+  _fail "installation: missing source publishes no command"
+fi
+_assert_contains "installation: missing source is actionable" \
+  "command source is not executable" "$missing_output"
+
+_test_summary

@@ -30,6 +30,7 @@ fi
 # pseudo-terminals, and loopback listeners whose timing signal is weakened when
 # multiple suites compete on one runner.
 for suite in \
+  "$ROOT/test/install-test" \
   "$ROOT/test/ettun-collision-test" \
   "$ROOT/test/ettun-custom-test" \
   "$ROOT/test/ettun-default-test"; do

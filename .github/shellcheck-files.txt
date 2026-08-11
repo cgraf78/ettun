@@ -5,6 +5,7 @@ program	examples/transport-et-wrapper
 program	install.sh
 program	test/run
 program	test/lib/test.sh
+program	test/install-test
 program	test/ettun-fixture.sh
 program	test/ettun-collision-test
 program	test/ettun-custom-test
