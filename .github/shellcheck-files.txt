@@ -3,6 +3,8 @@
 program	bin/ettun
 program	examples/transport-et-wrapper
 program	install.sh
+program	scripts/checkout-installer.conf
+program	support/install-checkout.sh
 program	test/run
 program	test/lib/test.sh
 program	test/install-test
