@@ -21,17 +21,34 @@ does not need to run ET; it only needs to be reachable from `gateway.example`.
 
 ## Installation
 
-Clone the repository and install a PATH-visible symlink:
+Install with a checkout-backed curl bootstrap:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cgraf78/ettun/main/install.sh | bash
+```
+
+This keeps a durable managed checkout under `$XDG_DATA_HOME` when that path is
+absolute, or under `$HOME/.local/share` otherwise, and publishes a link to its
+`ettun` command. It does not use a release asset or copy a second runtime tree.
+Git and Bash 3.2 or newer are required.
+
+To choose and manage the checkout yourself instead:
 
 ```bash
 git clone https://github.com/cgraf78/ettun.git
 cd ettun
-./install.sh
+bash install.sh
 ```
 
+Keep that checkout in place: the installer publishes a symlink to `bin/ettun`,
+so updating the checkout updates the installed command without creating a
+second program copy. Rerunning the curl command safely fast-forwards its clean
+managed checkout before republishing the same link.
+
 `PREFIX` defaults to `$HOME/.local`; set `BIN_DIR` to override only the binary
-directory. Dependency managers can instead expose `bin/ettun` directly. For
-example, a shdeps registry entry is:
+directory. The installer retargets an existing symlink but refuses to replace a
+real file or directory. Dependency managers can instead expose `bin/ettun`
+directly. For example, a shdeps registry entry is:
 
 ```text
 cgraf78/ettun  github
