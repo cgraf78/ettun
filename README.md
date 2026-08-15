@@ -58,11 +58,18 @@ cgraf78/ettun  github
 
 ```text
 ettun VIA LOCAL_PORT TARGET TARGET_PORT
+ettun VIA [--local LOCAL_PORT TARGET TARGET_PORT]
+               [--reverse REMOTE_PORT TARGET TARGET_PORT]
 ```
 
 - `VIA` is an ET host or SSH-config-style name accepted by the ET client.
-- `LOCAL_PORT` is the client-side loopback port to expose.
-- `TARGET` and `TARGET_PORT` identify the endpoint reachable from `VIA`.
+- A local route exposes an endpoint reachable from `VIA` on the client's
+  loopback `LOCAL_PORT`. The original four-argument form remains equivalent to
+  one `--local` route.
+- A reverse route exposes an endpoint reachable from the client on
+  `VIA`'s loopback `REMOTE_PORT`.
+- The explicit form accepts one local route, one reverse route, or both. Both
+  routes share one ET connection and one foreground lifecycle.
 
 Press `Ctrl-C` to request authenticated remote cleanup and stop the tunnel. If
 ET is disconnected and graceful cleanup is waiting for it to reconnect, press
@@ -93,6 +100,8 @@ should use `socat`.
 | `ETTUN_ET` | ET client executable name or path. Defaults to `et`. |
 | `ETTUN_TRANSPORT` | Executable adapter used instead of invoking `et` directly. |
 | `ETTUN_CLIENT_ID` | Stable 32-character lowercase hexadecimal client identity. Normally generated automatically. |
+| `ETTUN_REMOTE_PORT_SLOT_V1` | Provider-assigned integer from 0 through 818 that selects one disjoint generated-port palette. |
+| `ETTUN_TRANSPORT_SINGLE_INVOCATION_V1` | Prevalidated provider assertion that the selected adapter must not be reinvoked. The only accepted value is `1`. |
 
 Without `ETTUN_CLIENT_ID`, ettun creates a private identity at
 `${XDG_STATE_HOME:-$HOME/.local/state}/ettun/client-id`. The identity is not an
@@ -103,11 +112,25 @@ port without interfering with another client.
 ### Transport adapter contract
 
 `ETTUN_TRANSPORT` is one executable name or path, not a shell command string.
-It is resolved before launch and receives exactly three positional arguments:
+The original local-only form preserves the legacy three-argument invocation:
 
 1. the `VIA` value;
 2. the complete comma-separated ET tunnel specification; and
 3. the bounded remote bootstrap command.
+
+Before using a custom adapter for a reverse route, ettun invokes
+`ADAPTER --ettun-capabilities` with standard input closed. The query must be
+noninteractive and print one lowercase capability token per line. An adapter
+which prints `connect-v2` is invoked as:
+
+```text
+ADAPTER --ettun-connect-v2 VIA TUNNEL_SPEC REVERSE_SPEC REMOTE_COMMAND
+```
+
+`TUNNEL_SPEC` contains the ordinary ET mappings, including ettun's private
+control mapping. `REVERSE_SPEC` contains the explicit reverse ET mapping. A
+legacy adapter remains supported for local-only routes, but reverse routes fail
+before connection unless `connect-v2` is declared.
 
 The adapter must provide ET-compatible forwarding and remote-command behavior,
 remain in the foreground for the connection's lifetime, preserve its exit
@@ -116,6 +139,18 @@ authentication. It inherits `ETTUN_RETRY_MARKER`, the exact per-attempt marker
 that makes a remote bind collision retryable. Arbitrary adapter errors are not
 retried, even when their text happens to mention a collision.
 
+A `connect-v2` adapter which cannot safely be invoked again without repeating
+authentication or rebuilding private session state should also print
+`single-invocation-v1`. If that adapter reports an authenticated random relay
+collision, ettun exits with status 75 and asks the operator to restart instead
+of invoking it a second time. Stock ET and adapters which omit this capability
+retain the bounded five-attempt collision retry.
+
+An orchestrator which has already authenticated that capability may pass
+`ETTUN_TRANSPORT_SINGLE_INVOCATION_V1=1`, including for a local-only route whose
+legacy adapter cannot safely receive a capability probe. The assertion only
+narrows retry behavior; ettun removes it before invoking the adapter.
+
 [`examples/transport-et-wrapper`](examples/transport-et-wrapper) is a complete,
 tested ET-backed adapter. It is intentionally thin so authentication, signal
 handling, retry classification, and remote lifecycle ownership remain with ET
@@ -123,13 +158,27 @@ and ettun instead of being reimplemented in the wrapper.
 
 ## Lifecycle and security model
 
-Each launch generates a random token and three distinct remote loopback ports:
-one for data, one for the held control stream, and one for authenticated
-pre-attachment cleanup. The remote POSIX-shell supervisor records its private
-state beneath `${XDG_CACHE_HOME:-$HOME/.cache}/ettun`, serializes replacement
-with `flock`, and removes only state whose token and process ownership match.
-Remote bind collisions retry with a fresh token and port set, up to five
-attempts.
+Each launch generates a random token and distinct remote loopback ports for
+data, the held control stream, and authenticated pre-attachment cleanup. A
+reverse route adds a random ET transport port; the remote supervisor owns the
+stable requested loopback listener and proxies it into that random transport
+port. This lets authenticated replacement reclaim the stable listener without
+depending on a stale ET session reconnecting first.
+
+Standalone launches seed generated ports from the operating system random
+source. A provider managing concurrent legs can assign each one a distinct
+`ETTUN_REMOTE_PORT_SLOT_V1`; the 819 version-one slots partition all generated
+data, control, stop, reverse-transport, and local-control candidates across the
+five attempts. The value is consumed by the engine and is not inherited by a
+transport adapter. Collisions with unrelated processes remain authenticated
+and fail or retry under the same adapter policy.
+
+The supervisor records private state beneath
+`${XDG_CACHE_HOME:-$HOME/.cache}/ettun`, serializes replacement with `flock`,
+and removes only state whose token and process ownership match. Random relay
+bind collisions retry with a fresh token and port set, up to five attempts,
+except for an adapter declaring `single-invocation-v1` as described above. A
+collision on the requested fixed reverse port fails immediately and actionably.
 
 The full supervisor is never placed directly in ET's command argument. A small
 bootstrap listener accepts a size-bounded payload over the private control

@@ -20,6 +20,33 @@ _assert_contains "custom transport: receives the bounded bootstrap third" \
   "et-bootstrap" "$commands"
 _assert_not_contains "custom transport: bypasses the default ET binary" $'\net\n' "$commands"
 
+ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_TRANSPORT="$bin/test-transport" \
+  _run_ettun relay.example --reverse 22022 127.0.0.1 22
+unset ETTUN_TEST_TRANSPORT
+commands=$(cat "$log")
+_assert_exit "reverse adapter: legacy contract is rejected before connect" \
+  1 "$run_exit"
+_assert_not_contains "reverse adapter: unsupported adapter opens no connection" \
+  '<--ettun-connect-v2>' "$commands"
+
+ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_TRANSPORT="$bin/v2-transport" \
+  _run_ettun relay.example \
+  --local 5904 desktop.internal 5900 \
+  --reverse 22023 127.0.0.1 22
+unset ETTUN_TEST_TRANSPORT
+commands=$(cat "$log")
+_assert_exit "v2 adapter: mixed routes succeed" 0 "$run_exit"
+_assert_contains "v2 adapter: capability is checked before connect" \
+  'capability-query' "$commands"
+_assert_contains "v2 adapter: selects the versioned operation" \
+  $'transport-v2\n<--ettun-connect-v2>\n<relay.example>' "$commands"
+_assert_contains "v2 adapter: receives local mappings separately" \
+  $'<relay.example>\n<5904:' "$commands"
+_assert_contains "v2 adapter: receives the reverse mapping separately" \
+  $'<127.0.0.1:' "$commands"
+_assert_contains "v2 adapter: reverse target remains an argv field" \
+  ':127.0.0.1:22>' "$commands"
+
 # The checked-in adapter is documentation only if it is not exercised through
 # ettun's real custom-transport path. Use the fixture ET binary so the test can
 # prove argv forwarding without opening a network connection.
@@ -35,6 +62,20 @@ _assert_contains "transport example: invokes the selected ET executable" \
   $'et\n<-N>\n<--keepalive>\n<5>\n<-t>\n<5903:' "$commands"
 _assert_contains "transport example: forwards the generated remote command" \
   "<--command>" "$commands"
+
+example_capabilities=$("$example_adapter" --ettun-capabilities)
+_assert_eq "transport example: declares the versioned connect contract" \
+  connect-v2 "$example_capabilities"
+ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_ET="$bin/et" \
+  ETTUN_TEST_TRANSPORT="$example_adapter" \
+  _run_ettun relay.example \
+  --local 5905 desktop.example 5900 \
+  --reverse 22024 127.0.0.1 22
+unset ETTUN_TEST_TRANSPORT ETTUN_TEST_ET
+commands=$(cat "$log")
+_assert_exit "transport example: supports a mixed route" 0 "$run_exit"
+_assert_contains "transport example: forwards the reverse mapping" \
+  $'<-r>\n<127.0.0.1:' "$commands"
 
 # A wrapper must not consume authentication input or hide the transport's real
 # status. Exercise the example directly with a tiny ET-compatible test double.
@@ -60,6 +101,24 @@ _assert_eq "transport example: passes the complete ET invocation" \
   $'-N\n--keepalive\n5\n-t\n5903:45000,45001:45002\n--command\nremote command\ngateway.example' \
   "$(<"$example_args")"
 
+set +e
+printf 'interactive-auth-v2\n' |
+  ETTUN_ET="$bin/example-et" \
+    ETTUN_TEST_EXAMPLE_ARGS="$example_args" \
+    ETTUN_TEST_EXAMPLE_STDIN="$example_stdin" \
+    "$example_adapter" --ettun-connect-v2 gateway.example \
+    '5905:45003,45004:45005' '127.0.0.1:45006:127.0.0.1:22' \
+    'remote command v2'
+example_exit=$?
+set -e
+_assert_exit "transport example v2: preserves the ET exit status" 37 \
+  "$example_exit"
+_assert_eq "transport example v2: leaves standard input attached" \
+  "interactive-auth-v2" "$(<"$example_stdin")"
+_assert_eq "transport example v2: passes both ET mappings" \
+  $'-N\n--keepalive\n5\n-t\n5905:45003,45004:45005\n-r\n127.0.0.1:45006:127.0.0.1:22\n--command\nremote command v2\ngateway.example' \
+  "$(<"$example_args")"
+
 ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_TRANSPORT="$bin/test-transport" \
   _run_ettun __ettun_transport_worker 5902 desktop.internal 5900
 unset ETTUN_TEST_TRANSPORT
@@ -79,7 +138,7 @@ PATH="$bin:$test_extended_system_path" \
   ETTUN_TEST_WORKER_PGRPS="$worker_pgrps" \
   "$BASH" "$SCRIPT" --ettun-transport-worker \
   "$worker_runtime" 0 "$bin/worker-pgrp-transport" "" \
-  gateway.example 5902:5900 true "$$" || worker_exit=$?
+  gateway.example 5902:5900 "" true "$$" || worker_exit=$?
 _assert_exit "transport worker: succeeds with inherited monitor mode" 0 "$worker_exit"
 if [[ -r "$worker_pgrps" ]]; then
   read -r worker_pgid adapter_pgid <"$worker_pgrps"
@@ -112,6 +171,7 @@ completed = subprocess.run(
         "",
         "gateway.example",
         "5902:5900",
+        "",
         "true",
         str(os.getpid()),
     ],
@@ -162,6 +222,7 @@ worker = subprocess.Popen(
         "",
         "gateway.example",
         "5902:5900",
+        "",
         "true",
         str(os.getpid()),
     ],

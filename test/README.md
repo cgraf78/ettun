@@ -9,14 +9,17 @@ load measurements.
 ## Suite scope
 
 - `ettun-collision-test` covers retry classification, transport failures,
-  client identity, validation, signal forwarding, parent death, and process-tree
-  cleanup.
-- `ettun-custom-test` covers the three-argument adapter contract, worker status
-  publication, pseudo-terminal authentication, Ctrl-C/Ctrl-Z behavior, and the
-  foreground handoff between launcher and adapter.
+  provider-assigned port palettes, single-invocation adapters, client identity,
+  validation, signal forwarding, parent death, and process-tree cleanup.
+- `ettun-custom-test` covers the legacy and capability-negotiated adapter
+  contracts, worker status publication, pseudo-terminal authentication,
+  Ctrl-C/Ctrl-Z behavior, and the foreground handoff between launcher and
+  adapter.
 - `ettun-default-test` characterizes the ET argv contract, generated bootstrap
   and remote supervisor, private remote state, authenticated attachment and
-  stop flows, stale-owner recovery, relay cleanup, and local port probing.
+  stop flows, stale-owner recovery, local/reverse relay cleanup, fixed reverse
+  listener failures, coordinated local/remote port separation, and local port
+  probing.
 - `ettun-fixture.sh` creates isolated command stubs and shared transport
   fixtures. It is sourced by the suites and is not an independent entrypoint.
 - `lib/test.sh` owns the small assertion vocabulary and a guarded per-suite
