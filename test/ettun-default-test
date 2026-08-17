@@ -291,6 +291,145 @@ _assert_contains "default launch: reports foreground stop behavior" "Ctrl-C to s
 _assert_contains "default launch: documents the forced cleanup escape" \
   "press Ctrl-C again to force" "$(bash "$SCRIPT" --help 2>&1)"
 
+# The explicit route form can keep a local and reverse mapping in one ET
+# lifetime. This is intentionally one process: callers can use the local
+# route's point-in-time health check without splitting the reverse listener
+# into an independently reported lifecycle.
+_run_ettun gateway.example \
+  --local 10444 service.internal 443 \
+  --reverse 22022 127.0.0.1 22
+mixed_commands=$(cat "$log")
+mixed_output=$(cat "$stdout")
+_assert_exit "mixed routes: launch succeeds" 0 "$run_exit"
+_assert_contains "mixed routes: keeps the local ET mapping" \
+  $'<-t>\n<10444:' "$mixed_commands"
+_assert_contains "mixed routes: adds a separate reverse ET mapping" \
+  $'<-r>\n<127.0.0.1:' "$mixed_commands"
+_assert_contains "mixed routes: reverse target remains explicit" \
+  ':127.0.0.1:22>' "$mixed_commands"
+if [[ -s $bootstrap_payload_file ]]; then
+  mixed_remote=$(_decode_remote_payload "$(<"$bootstrap_payload_file")")
+  _assert_contains "mixed routes: supervisor owns the requested listener" \
+    'ettun_reverse_port=22022' "$mixed_remote"
+  _assert_contains "mixed routes: supervisor tracks its reverse relay child" \
+    'reverse_pid=' "$mixed_remote"
+  _assert_contains "mixed routes: fixed listener feeds the random ET endpoint" \
+    'ettun_reverse_transport_port=' "$mixed_remote"
+  mixed_dynamic_ports=$(
+    sed -n \
+      -e 's/^ettun_relay_port=//p' \
+      -e 's/^ettun_control_port=//p' \
+      -e 's/^ettun_stop_port=//p' \
+      -e 's/^ettun_reverse_transport_port=//p' <<<"$mixed_remote"
+  )
+  if [[ $'\n'"$mixed_dynamic_ports"$'\n' != *$'\n22022\n'* ]]; then
+    _pass "mixed routes: fixed listener differs from every generated port"
+  else
+    _fail "mixed routes: fixed listener differs from every generated port"
+  fi
+else
+  _fail "mixed routes: publishes an authenticated remote supervisor"
+fi
+_assert_contains "mixed routes: reports the local route" \
+  'localhost:10444 -> service.internal:443' "$mixed_output"
+_assert_contains "mixed routes: reports the reverse route" \
+  'localhost:22022 -> 127.0.0.1:22' "$mixed_output"
+
+_run_ettun gateway.example --reverse 22023 127.0.0.1 22
+reverse_only_commands=$(cat "$log")
+reverse_only_output=$(cat "$stdout")
+reverse_only_remote=$(_decode_remote_payload "$(<"$bootstrap_payload_file")")
+_assert_exit "reverse-only route: launch succeeds" 0 "$run_exit"
+_assert_contains "reverse-only route: keeps the private control mapping" \
+  $'<-t>\n<' "$reverse_only_commands"
+_assert_contains "reverse-only route: adds the reverse ET mapping" \
+  $'<-r>\n<127.0.0.1:' "$reverse_only_commands"
+_assert_contains "reverse-only route: reports the requested listener" \
+  'localhost:22023 -> 127.0.0.1:22' "$reverse_only_output"
+
+ETTUN_TEST_LSOF_EXIT=1 _run_ettun localhost \
+  --local 10454 127.0.0.1 443
+unset ETTUN_TEST_LSOF_EXIT
+standalone_mapping=$(sed -n '/^<-t>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
+standalone_ports=$(sed -n \
+  's/^10454:\([0-9][0-9]*\),\([0-9][0-9]*\):[0-9][0-9]*$/\1 \2/p' \
+  <<<"$standalone_mapping")
+read -r standalone_relay_port standalone_control_port <<<"$standalone_ports"
+_assert_exit "standalone same-host route: launch succeeds" 0 "$run_exit"
+if [[ $standalone_relay_port =~ ^[0-9]+$ &&
+  $standalone_control_port =~ ^[0-9]+$ &&
+  $standalone_relay_port != "$standalone_control_port" ]]; then
+  _pass "standalone same-host route: local control avoids the remote tuple"
+else
+  _fail "standalone same-host route: local control avoids the remote tuple"
+fi
+
+export ETTUN_TEST_LSOF_EXIT=1
+ETTUN_REMOTE_PORT_SLOT_V1=0 _run_ettun gateway.example \
+  --local 10455 service.internal 443 \
+  --reverse 22024 127.0.0.1 22
+unset ETTUN_REMOTE_PORT_SLOT_V1
+slot_zero_commands=$(<"$log")
+_assert_exit "remote port slot v1: first coordinated route succeeds" 0 "$run_exit"
+_assert_contains "remote port slot v1: first palette owns the relay port" \
+  $'<-t>\n<10455:49152,' "$slot_zero_commands"
+_assert_contains "remote port slot v1: first palette owns the control port" \
+  ':49971>' "$slot_zero_commands"
+_assert_contains "remote port slot v1: local control avoids the remote tuple" \
+  '<10455:49152,52428:49971>' "$slot_zero_commands"
+_assert_contains "remote port slot v1: first palette owns the reverse port" \
+  $'<-r>\n<127.0.0.1:51609:127.0.0.1:22>' "$slot_zero_commands"
+
+ETTUN_REMOTE_PORT_SLOT_V1=0 _run_ettun gateway.example \
+  --reverse 22025 127.0.0.1 52428
+unset ETTUN_REMOTE_PORT_SLOT_V1
+slot_target_commands=$(<"$log")
+_assert_exit "remote port slot v1: delayed reverse target succeeds" 0 \
+  "$run_exit"
+_assert_contains \
+  "remote port slot v1: local control avoids the reverse target port" \
+  $'<-t>\n<53247:49971>' "$slot_target_commands"
+_assert_contains "remote port slot v1: delayed reverse target remains explicit" \
+  $'<-r>\n<127.0.0.1:51609:127.0.0.1:52428>' "$slot_target_commands"
+
+ETTUN_REMOTE_PORT_SLOT_V1=0 _run_ettun gateway.example \
+  --local 49152 service.internal 443
+unset ETTUN_REMOTE_PORT_SLOT_V1
+slot_local_commands=$(<"$log")
+_assert_exit "remote port slot v1: colliding local endpoint succeeds" 0 \
+  "$run_exit"
+_assert_contains \
+  "remote port slot v1: generated tuple avoids the local endpoint" \
+  $'<-t>\n<49152:52428,55704:53247>' "$slot_local_commands"
+
+ETTUN_REMOTE_PORT_SLOT_V1=0 _run_ettun gateway.example \
+  --local 10456 127.0.0.1 49971
+unset ETTUN_REMOTE_PORT_SLOT_V1
+slot_destination_commands=$(<"$log")
+_assert_exit "remote port slot v1: colliding destination endpoint succeeds" 0 \
+  "$run_exit"
+_assert_contains \
+  "remote port slot v1: generated tuple avoids the destination endpoint" \
+  $'<-t>\n<10456:52428,55704:53247>' "$slot_destination_commands"
+
+ETTUN_REMOTE_PORT_SLOT_V1=1 _run_ettun gateway.example 10456 service.internal 443
+unset ETTUN_REMOTE_PORT_SLOT_V1
+slot_one_commands=$(<"$log")
+_assert_exit "remote port slot v1: second coordinated route succeeds" 0 "$run_exit"
+_assert_contains "remote port slot v1: adjacent palettes do not overlap" \
+  $'<-t>\n<10456:49153,' "$slot_one_commands"
+_assert_contains "remote port slot v1: second palette owns its control port" \
+  ':49972>' "$slot_one_commands"
+
+ETTUN_REMOTE_PORT_SLOT_V1=819 _run_ettun gateway.example \
+  10457 service.internal 443
+unset ETTUN_REMOTE_PORT_SLOT_V1
+_assert_exit "remote port slot v1: out-of-range value is rejected" 2 "$run_exit"
+_assert_contains "remote port slot v1: invalid value is actionable" \
+  'invalid remote port slot' "$(<"$stderr")"
+_assert_file_content "remote port slot v1: invalid value opens no transport" "" "$log"
+unset ETTUN_TEST_LSOF_EXIT
+
 echo ""
 echo "=== ettun remote supervisor ==="
 
@@ -301,7 +440,9 @@ remote_log="$tmp/remote.log"
 remote_stop_race_arm="$tmp/remote-stop-race.arm"
 remote_stop_race_used="$tmp/remote-stop-race.used"
 remote_stop_race_ready="$tmp/remote-stop-race.ready"
+remote_data_dir="$tmp/remote-data"
 mkdir -p "$remote_bin" "$remote_cache" "$remote_fifos"
+mkdir -p "$remote_data_dir"
 real_flock=$(command -v flock 2>/dev/null || true)
 _write_stub "$remote_bin/flock" \
   'if [[ -n "${ETTUN_REMOTE_REAL_FLOCK:-}" ]]; then' \
@@ -372,9 +513,18 @@ _write_stub "$remote_bin/relay-action" \
   'case "$action" in' \
   '  data)' \
   '    printf "%s\n" "$$" >"$ETTUN_REMOTE_DATA_PID"' \
+  '    if [[ -n "${ETTUN_REMOTE_DATA_DIR:-}" ]]; then' \
+  '      printf "%s\n" "$$" >"$ETTUN_REMOTE_DATA_DIR/$port.pid"' \
+  '    fi' \
+  '    if [[ -n "${ETTUN_REMOTE_FAIL_DATA_PORT:-}" && "$port" == "$ETTUN_REMOTE_FAIL_DATA_PORT" ]]; then' \
+  '      exit 98' \
+  '    fi' \
   '    sleep 300 &' \
   '    data_child=$!' \
   '    printf "%s\n" "$data_child" >"$ETTUN_REMOTE_DATA_CHILD_PID"' \
+  '    if [[ -n "${ETTUN_REMOTE_DATA_DIR:-}" ]]; then' \
+  '      printf "%s\n" "$data_child" >"$ETTUN_REMOTE_DATA_DIR/$port.child.pid"' \
+  '    fi' \
   '    wait "$data_child"' \
   '    ;;' \
   '  control)' \
@@ -442,6 +592,8 @@ _start_remote_supervisor() {
     ETTUN_REMOTE_FIFO_DIR="$remote_fifos" \
     ETTUN_REMOTE_DATA_PID="$tmp/remote-data.pid" \
     ETTUN_REMOTE_DATA_CHILD_PID="$tmp/remote-data-child.pid" \
+    ETTUN_REMOTE_DATA_DIR="$remote_data_dir" \
+    ETTUN_REMOTE_FAIL_DATA_PORT="${ETTUN_REMOTE_FAIL_DATA_PORT:-}" \
     ETTUN_REMOTE_CONTROL_PID="$tmp/remote-control.pid" \
     ETTUN_REMOTE_STOP_PID="$tmp/remote-stop.pid" \
     ETTUN_REMOTE_STOP_FILE="$remote_state/stop" \
@@ -516,6 +668,160 @@ _wait_for_owner_control() {
   done
   return 1
 }
+
+# A mixed route is the parity-critical shape: one supervisor must own both
+# listener trees, publish both identities, and tear both down on one
+# authenticated stop.
+mixed_control=$(sed -n 's/^ettun_control_port=//p' <<<"$mixed_remote")
+mixed_stop=$(sed -n 's/^ettun_stop_port=//p' <<<"$mixed_remote")
+mixed_key=$(sed -n 's/^ettun_key=//p' <<<"$mixed_remote")
+mixed_token=$(sed -n 's/^ettun_token=//p' <<<"$mixed_remote")
+mixed_relay_port=$(sed -n 's/^ettun_relay_port=//p' <<<"$mixed_remote")
+mixed_reverse_port=$(sed -n 's/^ettun_reverse_port=//p' <<<"$mixed_remote")
+remote_state="$remote_cache/ettun/$mixed_key"
+remote_owner="$remote_state/owner"
+rm -f "$remote_data_dir"/*
+_start_remote_supervisor "$mixed_remote" "$mixed_control" "$mixed_stop"
+mixed_supervisor_pid=$remote_pid
+_wait_for_file "$remote_owner" ||
+  _fail "mixed supervisor: publishes its owner record"
+for mixed_data_port in "$mixed_relay_port" "$mixed_reverse_port"; do
+  _wait_for_file "$remote_data_dir/$mixed_data_port.pid" ||
+    _fail "mixed supervisor: starts listener $mixed_data_port"
+  _wait_for_file "$remote_data_dir/$mixed_data_port.child.pid" ||
+    _fail "mixed supervisor: starts listener descendant $mixed_data_port"
+done
+read -r mixed_local_pid <"$remote_data_dir/$mixed_relay_port.pid"
+read -r mixed_local_child_pid <"$remote_data_dir/$mixed_relay_port.child.pid"
+read -r mixed_reverse_pid <"$remote_data_dir/$mixed_reverse_port.pid"
+read -r mixed_reverse_child_pid \
+  <"$remote_data_dir/$mixed_reverse_port.child.pid"
+read -r -a mixed_owner_fields <"$remote_owner"
+_assert_eq "mixed supervisor: records the local listener identity" \
+  "$mixed_local_pid" "${mixed_owner_fields[3]:-missing}"
+_assert_eq "mixed supervisor: records the reverse listener identity" \
+  "$mixed_reverse_pid" "${mixed_owner_fields[8]:-missing}"
+_write_remote_fifo "$remote_fifos/$mixed_stop" "$mixed_token" ||
+  _fail "mixed supervisor: stop listener accepts its token"
+if ! _wait_for_processes_stopped "$mixed_supervisor_pid"; then
+  _fail "mixed supervisor: stop completes within deadline"
+  _report_remote_timeout "mixed stop" "$mixed_supervisor_pid"
+  kill -KILL "$mixed_supervisor_pid" 2>/dev/null || true
+fi
+mixed_exit=0
+wait "$mixed_supervisor_pid" || mixed_exit=$?
+_assert_exit "mixed supervisor: authenticated stop succeeds" 0 "$mixed_exit"
+if _wait_for_processes_stopped "$mixed_local_pid" "$mixed_local_child_pid" \
+  "$mixed_reverse_pid" "$mixed_reverse_child_pid"; then
+  _pass "mixed supervisor: reaps both listener trees"
+else
+  _fail "mixed supervisor: reaps both listener trees"
+  kill -KILL "$mixed_local_pid" "$mixed_local_child_pid" \
+    "$mixed_reverse_pid" "$mixed_reverse_child_pid" 2>/dev/null || true
+fi
+if [[ ! -e $remote_state ]]; then
+  _pass "mixed supervisor: removes owned state"
+else
+  _fail "mixed supervisor: removes owned state"
+fi
+rm -f "$remote_fifos/$mixed_control" "$remote_fifos/$mixed_stop"
+
+# A fixed reverse port cannot be retried under a different number. Prove that
+# its bind failure is fatal and that the already-started local relay is still
+# reclaimed.
+rm -f "$remote_data_dir"/*
+ETTUN_REMOTE_FAIL_DATA_PORT=$mixed_reverse_port \
+  _start_remote_supervisor "$mixed_remote" "$mixed_control" "$mixed_stop"
+mixed_collision_pid=$remote_pid
+_wait_for_file "$remote_data_dir/$mixed_relay_port.pid" ||
+  _fail "mixed reverse collision: local relay starts before detection"
+read -r mixed_collision_local_pid \
+  <"$remote_data_dir/$mixed_relay_port.pid"
+mixed_collision_exit=0
+if ! _wait_for_processes_stopped "$mixed_collision_pid"; then
+  _fail "mixed reverse collision: supervisor exits within deadline"
+  _report_remote_timeout "mixed reverse collision" "$mixed_collision_pid"
+  kill -KILL "$mixed_collision_pid" 2>/dev/null || true
+fi
+wait "$mixed_collision_pid" || mixed_collision_exit=$?
+_assert_exit "mixed reverse collision: fixed listener failure is fatal" \
+  73 "$mixed_collision_exit"
+_assert_contains "mixed reverse collision: failure is tokenized" \
+  "ETTUN_FATAL:$mixed_token:73:reverse-listener" \
+  "$(<"$tmp/remote.stderr")"
+if _wait_for_processes_stopped "$mixed_collision_local_pid"; then
+  _pass "mixed reverse collision: reclaims the local relay"
+else
+  _fail "mixed reverse collision: reclaims the local relay"
+  kill -KILL "$mixed_collision_local_pid" 2>/dev/null || true
+fi
+if [[ ! -e $remote_state ]]; then
+  _pass "mixed reverse collision: removes owned state"
+else
+  _fail "mixed reverse collision: removes owned state"
+fi
+rm -f "$remote_fifos/$mixed_control" "$remote_fifos/$mixed_stop"
+
+# Execute the reverse-only supervisor, not just its generated text. This catches
+# ownership-record and cleanup bugs that are hidden when a local relay PID is
+# always present.
+reverse_only_control=$(sed -n 's/^ettun_control_port=//p' \
+  <<<"$reverse_only_remote")
+reverse_only_stop=$(sed -n 's/^ettun_stop_port=//p' \
+  <<<"$reverse_only_remote")
+reverse_only_key=$(sed -n 's/^ettun_key=//p' <<<"$reverse_only_remote")
+reverse_only_token=$(sed -n 's/^ettun_token=//p' <<<"$reverse_only_remote")
+remote_state="$remote_cache/ettun/$reverse_only_key"
+remote_owner="$remote_state/owner"
+rm -f "$remote_data_dir"/*
+_start_remote_supervisor "$reverse_only_remote" \
+  "$reverse_only_control" "$reverse_only_stop"
+reverse_only_pid=$remote_pid
+_wait_for_file "$remote_owner" ||
+  _fail "reverse-only supervisor: publishes its owner record"
+_wait_for_file "$remote_data_dir/22023.pid" ||
+  _fail "reverse-only supervisor: starts the fixed listener"
+_wait_for_file "$remote_data_dir/22023.child.pid" ||
+  _fail "reverse-only supervisor: starts the listener descendant"
+reverse_owner_record=$(<"$remote_owner")
+read -r -a reverse_owner_fields <<<"$reverse_owner_record"
+_assert_eq "reverse-only supervisor: owner record retains all ten fields" \
+  10 "${#reverse_owner_fields[@]}"
+_assert_eq "reverse-only supervisor: records an absent local relay as zero" \
+  0 "${reverse_owner_fields[3]:-missing}"
+read -r reverse_listener_pid <"$remote_data_dir/22023.pid"
+read -r reverse_listener_child_pid <"$remote_data_dir/22023.child.pid"
+_assert_eq "reverse-only supervisor: records the reverse listener identity" \
+  "$reverse_listener_pid" "${reverse_owner_fields[8]:-missing}"
+_assert_eq "reverse-only supervisor: records the fixed reverse port" \
+  22023 "${reverse_owner_fields[9]:-missing}"
+_write_remote_fifo "$remote_fifos/$reverse_only_stop" \
+  "$reverse_only_token" ||
+  _fail "reverse-only supervisor: stop listener accepts its token"
+if ! _wait_for_processes_stopped "$reverse_only_pid"; then
+  _fail "reverse-only supervisor: stop completes within deadline"
+  _report_remote_timeout "reverse-only stop" "$reverse_only_pid"
+  kill -KILL "$reverse_only_pid" 2>/dev/null || true
+fi
+reverse_only_exit=0
+wait "$reverse_only_pid" || reverse_only_exit=$?
+_assert_exit "reverse-only supervisor: authenticated stop succeeds" \
+  0 "$reverse_only_exit"
+if [[ ! -e $remote_state ]]; then
+  _pass "reverse-only supervisor: removes owned state"
+else
+  _fail "reverse-only supervisor: removes owned state"
+fi
+if _wait_for_processes_stopped \
+  "$reverse_listener_pid" "$reverse_listener_child_pid"; then
+  _pass "reverse-only supervisor: reaps its listener tree"
+else
+  _fail "reverse-only supervisor: reaps its listener tree"
+  kill -KILL "$reverse_listener_pid" "$reverse_listener_child_pid" \
+    2>/dev/null || true
+fi
+rm -f "$remote_fifos/$reverse_only_control" \
+  "$remote_fifos/$reverse_only_stop"
 
 _activate_captured_remote_launch
 case "$remote_transport_command" in

@@ -1,17 +1,33 @@
 #!/usr/bin/env bash
-# Minimal ET-backed implementation of ETTUN_TRANSPORT's three-argument API.
+# Minimal ET-backed implementation of ETTUN_TRANSPORT's legacy and v2 APIs.
 
 set -u
 
-if (($# != 3)); then
-  printf 'usage: transport-et-wrapper VIA TUNNEL_SPEC REMOTE_COMMAND\n' >&2
-  exit 2
+if [[ ${1:-} == --ettun-capabilities ]]; then
+  (($# == 1)) || exit 2
+  printf '%s\n' connect-v2
+  exit 0
 fi
 
-via_host=$1
-tunnel_spec=$2
-remote_command=$3
+reverse_tunnel_spec=
+if (($# == 3)); then
+  via_host=$1
+  tunnel_spec=$2
+  remote_command=$3
+elif (($# == 5)) && [[ $1 == --ettun-connect-v2 ]]; then
+  via_host=$2
+  tunnel_spec=$3
+  reverse_tunnel_spec=$4
+  remote_command=$5
+else
+  printf '%s\n' \
+    'usage: transport-et-wrapper VIA TUNNEL_SPEC REMOTE_COMMAND' \
+    '       transport-et-wrapper --ettun-connect-v2 VIA TUNNEL_SPEC REVERSE_SPEC REMOTE_COMMAND' \
+    >&2
+  exit 2
+fi
 et_name=${ETTUN_ET:-et}
+et_argv=(-N --keepalive 5)
 
 # Resolve one executable instead of evaluating a command string. An adapter is
 # trusted code and receives the generated bootstrap command, but it should not
@@ -21,9 +37,16 @@ if ! et_path=$(command -v "$et_name" 2>/dev/null); then
   exit 127
 fi
 
+# Build each ET option as a distinct argv element. An empty mapping is omitted;
+# ettun's v2 invocation always supplies its private control mapping in the
+# ordinary tunnel specification, while the reverse specification is optional.
+[[ -z $tunnel_spec ]] || et_argv+=(-t "$tunnel_spec")
+[[ -z $reverse_tunnel_spec ]] ||
+  et_argv+=(-r "$reverse_tunnel_spec")
+et_argv+=(--command "$remote_command" "$via_host")
+
 # Stay in the foreground, retain the caller's standard input for interactive
 # authentication, and let exec preserve ET's signals and exit status exactly.
 # ETTUN_RETRY_MARKER remains in the environment; retry classification still
 # belongs to ettun and depends on the tokenized remote diagnostic on stderr.
-exec "$et_path" -N --keepalive 5 -t "$tunnel_spec" \
-  --command "$remote_command" "$via_host"
+exec "$et_path" "${et_argv[@]}"

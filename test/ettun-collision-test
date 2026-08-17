@@ -47,6 +47,59 @@ _assert_eq "relay collision: selects a distinct mapping per attempt" "3" "$uniqu
 _assert_contains "relay collision: preserves collision diagnostics" \
   "ETTUN_COLLISION:" "$(cat "$stderr")"
 
+ETTUN_REMOTE_PORT_SLOT_V1=7 ETTUN_TEST_COLLISIONS=2 \
+  _run_ettun gateway.example 10458 service.internal 443
+unset ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TEST_COLLISIONS
+slot_mappings=$(sed -n '/^<-t>$/{n;p;}' "$log")
+_assert_exit "coordinated collision: retries to success" 0 "$run_exit"
+_assert_contains "coordinated collision: first attempt stays in its palette" \
+  '<10458:49159,' "$slot_mappings"
+_assert_contains "coordinated collision: second attempt stays in its palette" \
+  '<10458:52435,' "$slot_mappings"
+_assert_contains "coordinated collision: third attempt stays in its palette" \
+  '<10458:55711,' "$slot_mappings"
+
+ETTUN_TEST_LSOF_EXIT=1 \
+  ETTUN_TEST_TRANSPORT="$bin/single-invocation-transport" \
+  _run_ettun gateway.example \
+  --local 10452 service.internal 443 \
+  --reverse 22052 127.0.0.1 22
+unset ETTUN_TEST_TRANSPORT
+single_invocation_attempts=$(grep -c '^single-invocation$' "$log")
+_assert_exit "single-invocation collision: preserves retryable status" \
+  75 "$run_exit"
+_assert_eq "single-invocation collision: adapter is not reinvoked" \
+  1 "$single_invocation_attempts"
+_assert_contains "single-invocation collision: diagnostic names adapter invocation" \
+  "transport adapter permits one invocation" "$(cat "$stderr")"
+_assert_contains "single-invocation collision: restart guidance names the owning command" \
+  "rerun the command that owns this tunnel" "$(cat "$stderr")"
+
+ETTUN_TEST_LSOF_EXIT=1 \
+  ETTUN_TEST_TRANSPORT="$bin/single-invocation-transport" \
+  ETTUN_TRANSPORT_SINGLE_INVOCATION_V1=1 \
+  _run_ettun gateway.example 10453 service.internal 443
+unset ETTUN_TEST_TRANSPORT ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
+single_local_attempts=$(grep -c '^single-invocation$' "$log")
+_assert_exit "local single-invocation collision: preserves retryable status" \
+  75 "$run_exit"
+_assert_eq "local single-invocation collision: adapter is not reinvoked" \
+  1 "$single_local_attempts"
+
+ETTUN_REMOTE_PORT_SLOT_V1=not-a-number \
+  _run_ettun gateway.example 10459 service.internal 443
+unset ETTUN_REMOTE_PORT_SLOT_V1
+_assert_exit "remote port slot v1: nonnumeric value is rejected" 2 "$run_exit"
+_assert_file_content "remote port slot v1: nonnumeric value opens no transport" \
+  "" "$log"
+
+ETTUN_REMOTE_PORT_SLOT_V1=-1 \
+  _run_ettun gateway.example 10460 service.internal 443
+unset ETTUN_REMOTE_PORT_SLOT_V1
+_assert_exit "remote port slot v1: negative value is rejected" 2 "$run_exit"
+_assert_file_content "remote port slot v1: negative value opens no transport" \
+  "" "$log"
+
 ETTUN_TEST_EXIT=23 \
   _run_ettun gateway.example 10443 service.internal 443
 unset ETTUN_TEST_EXIT

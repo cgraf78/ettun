@@ -10,6 +10,8 @@ The stable command surface is:
 
 ```text
 ettun VIA LOCAL_PORT TARGET TARGET_PORT
+ettun VIA [--local LOCAL_PORT TARGET TARGET_PORT]
+               [--reverse REMOTE_PORT TARGET TARGET_PORT]
 ```
 
 The supported configuration variables and custom-adapter contract are

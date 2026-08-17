@@ -175,6 +175,24 @@ _write_stub "$bin/test-transport" \
   'for arg in "$@"; do printf "<%s>\n" "$arg" >>"$ETTUN_TEST_LOG"; done' \
   'printf "%s\n" "$3" >"$ETTUN_TEST_REMOTE_COMMAND"' \
   'printf "%s\n" "--" >>"$ETTUN_TEST_LOG"'
+_write_stub "$bin/v2-transport" \
+  'if [[ ${1:-} == --ettun-capabilities ]]; then' \
+  '  printf "capability-query\n" >>"$ETTUN_TEST_LOG"' \
+  '  printf "connect-v2\n"' \
+  '  exit 0' \
+  'fi' \
+  'printf "transport-v2\n" >>"$ETTUN_TEST_LOG"' \
+  'for arg in "$@"; do printf "<%s>\n" "$arg" >>"$ETTUN_TEST_LOG"; done' \
+  'printf "%s\n" "$5" >"$ETTUN_TEST_REMOTE_COMMAND"' \
+  'printf "%s\n" "--" >>"$ETTUN_TEST_LOG"'
+_write_stub "$bin/single-invocation-transport" \
+  'if [[ ${1:-} == --ettun-capabilities ]]; then' \
+  '  printf "%s\n" connect-v2 single-invocation-v1' \
+  '  exit 0' \
+  'fi' \
+  'printf "single-invocation\n" >>"$ETTUN_TEST_LOG"' \
+  'printf "%s\n" "$ETTUN_RETRY_MARKER" >&2' \
+  'exit 75'
 _write_stub "$bin/blocking-transport" \
   'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
   'sleep 300 &' \

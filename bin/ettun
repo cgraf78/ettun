@@ -25,7 +25,11 @@ RELAY_PORT_SPAN=16384
 RELAY_PORT_STRIDE=7919
 CONTROL_PORT_OFFSET=8192
 STOP_PORT_OFFSET=4096
+REVERSE_PORT_OFFSET=2048
 MAX_RELAY_ATTEMPTS=5
+REMOTE_PORT_ROLE_COUNT=4
+REMOTE_PORT_SLOT_COUNT=$((RELAY_PORT_SPAN / (\
+  MAX_RELAY_ATTEMPTS * REMOTE_PORT_ROLE_COUNT)))
 MAX_HANDOFF_RESUMES=8
 FOREGROUND_GATE_TIMEOUT=10
 REMOTE_COMMAND_MAX_BYTES=3072
@@ -36,12 +40,14 @@ REMOTE_COMMAND_MAX_BYTES=3072
 run_transport_worker() {
   local worker_runtime_dir="$1" worker_terminal_handoff="$2"
   local worker_transport_path="$3" worker_et_path="$4"
-  local worker_via_host="$5" worker_tunnel_spec="$6" worker_remote_command="$7"
-  local worker_launcher_pid="$8" child_pid child_status=0 retry_status=0
+  local worker_via_host="$5" worker_tunnel_spec="$6"
+  local worker_reverse_tunnel_spec="$7" worker_remote_command="$8"
+  local worker_launcher_pid="$9" child_pid child_status=0 retry_status=0
   local worker_status_file="$worker_runtime_dir/transport.status"
   local worker_status_tmp="$worker_status_file.tmp"
   local recorded_status=""
   local gate_deadline=$((SECONDS + FOREGROUND_GATE_TIMEOUT + 2))
+  local -a et_argv=()
 
   # An adapter may restore SIGTSTP to its default while asking for credentials,
   # stopping this entire process group even though the launcher ignores Ctrl-Z.
@@ -102,11 +108,23 @@ run_transport_worker() {
     trap - TSTP
     set +e
     if [[ -n "$worker_transport_path" ]]; then
-      "$worker_transport_path" "$worker_via_host" \
-        "$worker_tunnel_spec" "$worker_remote_command" || adapter_status=$?
+      if [[ -n "$worker_reverse_tunnel_spec" ]]; then
+        "$worker_transport_path" --ettun-connect-v2 "$worker_via_host" \
+          "$worker_tunnel_spec" "$worker_reverse_tunnel_spec" \
+          "$worker_remote_command" || adapter_status=$?
+      else
+        # Preserve the original three-argument adapter contract byte for byte
+        # when no reverse route is selected.
+        "$worker_transport_path" "$worker_via_host" \
+          "$worker_tunnel_spec" "$worker_remote_command" || adapter_status=$?
+      fi
     else
-      "$worker_et_path" -N --keepalive 5 -t "$worker_tunnel_spec" \
-        --command "$worker_remote_command" "$worker_via_host" || adapter_status=$?
+      et_argv=(-N --keepalive 5 -t "$worker_tunnel_spec")
+      if [[ -n "$worker_reverse_tunnel_spec" ]]; then
+        et_argv+=(-r "$worker_reverse_tunnel_spec")
+      fi
+      et_argv+=(--command "$worker_remote_command" "$worker_via_host")
+      "$worker_et_path" "${et_argv[@]}" || adapter_status=$?
     fi
     if printf '%s\n' "$adapter_status" >"$worker_status_tmp"; then
       mv -f "$worker_status_tmp" "$worker_status_file" || rm -f "$worker_status_tmp"
@@ -149,7 +167,7 @@ run_transport_worker() {
 
 # Keep the worker entry point ahead of public argument parsing. Its fixed arity
 # and sentinel cannot collide with a valid four-argument public invocation.
-if [[ $# -eq 9 && "${1:-}" == --ettun-transport-worker ]]; then
+if [[ $# -eq 10 && "${1:-}" == --ettun-transport-worker ]]; then
   shift
   run_transport_worker "$@"
   exit $?
@@ -159,8 +177,13 @@ fi
 usage() {
   cat >&2 <<'EOF'
 Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT
+       ettun VIA [--local LOCAL_PORT TARGET TARGET_PORT]
+                      [--reverse REMOTE_PORT TARGET TARGET_PORT]
 
 Expose TARGET:TARGET_PORT at localhost:LOCAL_PORT through the ET server VIA.
+The explicit form accepts one local route, one reverse route, or both. A
+reverse route exposes TARGET:TARGET_PORT from this client at
+localhost:REMOTE_PORT on VIA.
 The command stays in the foreground; press Ctrl-C to stop it. If cleanup is
 waiting for ET to reconnect, press Ctrl-C again to force a local stop.
 Ctrl-Z is ignored for the tunnel's lifetime.
@@ -171,6 +194,14 @@ openssl). VIA also needs /bin/sh, etserver, flock, and either socat (preferred)
 or ncat. Set ETTUN_TRANSPORT to an executable adapter when the connection
 must be established by something other than et. The adapter must remain in the
 foreground for the lifetime of its ET connection.
+
+Orchestrators may set ETTUN_REMOTE_PORT_SLOT_V1 to an integer from 0 through
+818. Distinct remote-port-slot-v1 values select disjoint generated port
+palettes across all five connection attempts. A caller which has already
+authenticated an adapter's capabilities may set
+ETTUN_TRANSPORT_SINGLE_INVOCATION_V1=1 to disable adapter reinvocation.
+
+Provider contract: remote-port-slot-v1
 EOF
 }
 
@@ -209,6 +240,30 @@ resolve_command() {
   return 1
 }
 
+transport_query_capabilities() {
+  local path="$1" output line prior count=0 found=0 single_invocation=0
+  local -a capabilities=()
+
+  # Capability discovery is intentionally a separate, noninteractive
+  # operation. A legacy adapter remains valid for the original local-only
+  # contract, but must never receive a reverse route it cannot represent.
+  output=$("$path" --ettun-capabilities </dev/null 2>/dev/null) || return 1
+  ((${#output} <= 4096)) || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[a-z][a-z0-9-]{0,63}$ ]] || return 1
+    count=$((count + 1))
+    ((count <= 32)) || return 1
+    for prior in "${capabilities[@]+"${capabilities[@]}"}"; do
+      [[ $prior != "$line" ]] || return 1
+    done
+    capabilities+=("$line")
+    [[ $line != connect-v2 ]] || found=1
+    [[ $line != single-invocation-v1 ]] || single_invocation=1
+  done <<<"$output"
+  transport_connect_v2=$found
+  ((single_invocation == 0)) || transport_single_invocation=1
+}
+
 local_port_in_use() {
   local port="$1" endpoint
 
@@ -244,6 +299,13 @@ random_hex() {
   value=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
   [[ "$value" =~ ^[0-9a-f]{32}$ ]] || return 1
   printf '%s\n' "$value"
+}
+
+random_port_seed() {
+  local value
+
+  value=$(random_hex) || return 1
+  printf '%s\n' "$((16#${value:0:4} % RELAY_PORT_SPAN))"
 }
 
 sha256_text() {
@@ -355,15 +417,44 @@ client_id() {
 }
 
 choose_local_control_port() {
-  local seed="$1" attempt="$2" probe candidate
+  local seed="$1" attempt="$2" slot=${3:-} probe candidate palette_index
+
+  if [[ -n $slot ]]; then
+    # A provider-assigned slot owns one value from each of twenty spread
+    # palettes. Stay inside that slot locally as well, so concurrent legs
+    # cannot race before either control listener has bound.
+    for ((probe = 0; probe < MAX_RELAY_ATTEMPTS * REMOTE_PORT_ROLE_COUNT; probe++)); do
+      palette_index=$(((attempt * REMOTE_PORT_ROLE_COUNT + probe) % (\
+        MAX_RELAY_ATTEMPTS * REMOTE_PORT_ROLE_COUNT)))
+      candidate=$((RELAY_PORT_MIN + palette_index * REMOTE_PORT_SLOT_COUNT + \
+        slot))
+      if ((candidate != local_port && candidate != target_port && \
+        candidate != reverse_port && candidate != reverse_target_port && \
+        candidate != relay_port && candidate != control_remote_port && \
+        candidate != stop_remote_port && \
+        candidate != reverse_transport_port)) &&
+          ! local_port_in_use "$candidate"; then
+        printf '%s\n' "$candidate"
+        return
+      fi
+    done
+
+    printf 'ettun: could not find a free local control port in remote port slot\n' >&2
+    return 1
+  fi
 
   # ET needs a second local forward for its control protocol. Probe a
-  # deterministic-but-spread sequence and exclude the user-facing local port;
-  # the remote collision retry changes the sequence again on each attempt.
+  # deterministic-but-spread sequence while excluding every fixed endpoint
+  # and current remote role; a collision retry changes the sequence again.
   for ((probe = 0; probe < 64; probe++)); do
     candidate=$((RELAY_PORT_MIN + (\
       seed + attempt * RELAY_PORT_STRIDE + probe * 3571) % RELAY_PORT_SPAN))
-    if ((candidate != local_port)) && ! local_port_in_use "$candidate"; then
+    if ((candidate != local_port && candidate != target_port && \
+      candidate != reverse_port && candidate != reverse_target_port && \
+      candidate != relay_port && candidate != control_remote_port && \
+      candidate != stop_remote_port && \
+      candidate != reverse_transport_port)) &&
+        ! local_port_in_use "$candidate"; then
       printf '%s\n' "$candidate"
       return
     fi
@@ -376,6 +467,8 @@ choose_local_control_port() {
 # Remote supervisor and bounded bootstrap generation.
 build_remote_script() {
   local relay_port="$1" control_port="$2" stop_port="$3" token="$4" key="$5"
+  local local_enabled="$6" reverse_enabled="$7" reverse_port="$8"
+  local reverse_transport_port="$9"
 
   # This here-document becomes a standalone /bin/sh supervisor on VIA. It must
   # stay POSIX-shell compatible because personal servers need only etserver and
@@ -389,6 +482,10 @@ ettun_token=$token
 ettun_relay_port=$relay_port
 ettun_control_port=$control_port
 ettun_stop_port=$stop_port
+ettun_local_enabled=$local_enabled
+ettun_reverse_enabled=$reverse_enabled
+ettun_reverse_port=$reverse_port
+ettun_reverse_transport_port=$reverse_transport_port
 ettun_marker=ETTUN_COLLISION:\$ettun_token:\$ettun_relay_port
 ettun_attached_marker=ETTUN_ATTACHED:\$ettun_token
 ettun_control_marker=ETTUN_CONTROL
@@ -545,10 +642,13 @@ if [ -d "\$ettun_state" ]; then
     current_control_port=
     current_stop_pid=
     current_control_pid=
+    current_reverse_pid=
+    current_reverse_port=
     if [ -r "\$ettun_owner" ]; then
       IFS=' ' read -r current_token current_stop_port current_pid \
         current_relay_pid current_relay_port current_control_port \
-        current_stop_pid current_control_pid <"\$ettun_owner" || :
+        current_stop_pid current_control_pid current_reverse_pid \
+        current_reverse_port <"\$ettun_owner" || :
     fi
     if [ -n "\$old_token" ] && [ -n "\$current_token" ] && [ "\$current_token" != "\$old_token" ]; then
       fatal 73 concurrent-owner
@@ -567,7 +667,7 @@ if [ -d "\$ettun_state" ]; then
         fatal 73 concurrent-owner
       fi
       case "\$current_relay_pid:\$current_relay_port" in
-        *[!0-9:]*|:|*:)
+        *[!0-9:]*|:|*:|0:*)
           ;;
         *)
           relay_command=\$(ps -ww -o command= -p "\$current_relay_pid" 2>/dev/null || :)
@@ -580,6 +680,7 @@ if [ -d "\$ettun_state" ]; then
       esac
       kill_recorded_listener "\$current_stop_pid" "\$current_stop_port"
       kill_recorded_listener "\$current_control_pid" "\$current_control_port"
+      kill_recorded_listener "\$current_reverse_pid" "\$current_reverse_port"
       rm -f "\$ettun_owner" "\$ettun_owner_tmp" \
         "\$ettun_control_file" "\$ettun_control_gate" \
         "\$ettun_control_handler" \
@@ -597,15 +698,17 @@ if ! mkdir "\$ettun_state" 2>/dev/null; then
 fi
 owns_state=1
 relay_pid=
+reverse_pid=
 control_pid=
 stop_pid=
 # Publish all cleanup-relevant PIDs atomically. A replacement reads this record
 # only while holding the same-key startup lock.
 publish_owner() {
-  printf '%s %s %s %s %s %s %s %s\\n' \
+  printf '%s %s %s %s %s %s %s %s %s %s\\n' \
     "\$ettun_token" "\$ettun_stop_port" "\$supervisor_pid" \
-    "\$relay_pid" "\$ettun_relay_port" "\$ettun_control_port" \
-    "\${stop_pid:-0}" "\${control_pid:-0}" >"\$ettun_owner_tmp" || \
+    "\${relay_pid:-0}" "\$ettun_relay_port" "\$ettun_control_port" \
+    "\${stop_pid:-0}" "\${control_pid:-0}" "\${reverse_pid:-0}" \
+    "\$ettun_reverse_port" >"\$ettun_owner_tmp" || \
     fatal 74 owner-write
   mv "\$ettun_owner_tmp" "\$ettun_owner" || fatal 74 owner-write
 }
@@ -627,6 +730,11 @@ cleanup() {
     kill_tree "\$relay_pid"
     wait "\$relay_pid" 2>/dev/null || :
     relay_pid=
+  fi
+  if [ -n "\$reverse_pid" ]; then
+    kill_tree "\$reverse_pid"
+    wait "\$reverse_pid" 2>/dev/null || :
+    reverse_pid=
   fi
   owner_token=
   if [ -r "\$ettun_owner" ]; then
@@ -708,27 +816,61 @@ export ETTUN_STOPPED_MARKER="\$ettun_stopped_marker"
 supervisor_pid=\$\$
 pending_remote_signal=0
 defer_remote_signals
-if [ "\$ettun_relay" = ncat ]; then
-  (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec ncat --listen --keep-open --sh-exec 'exec ncat -- $target_host $target_port' 127.0.0.1 "\$ettun_relay_port") &
-else
-  (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec socat "TCP-LISTEN:\$ettun_relay_port,bind=127.0.0.1,reuseaddr,fork" "TCP:$target_host:$target_port") &
+if [ "\$ettun_local_enabled" -eq 1 ]; then
+  if [ "\$ettun_relay" = ncat ]; then
+    (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec ncat --listen --keep-open --sh-exec 'exec ncat -- $target_host $target_port' 127.0.0.1 "\$ettun_relay_port") &
+  else
+    (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec socat "TCP-LISTEN:\$ettun_relay_port,bind=127.0.0.1,reuseaddr,fork" "TCP:$target_host:$target_port") &
+  fi
+  relay_pid=\$!
 fi
-relay_pid=\$!
+if [ "\$ettun_reverse_enabled" -eq 1 ]; then
+  # ET owns only the random reverse transport port. The authenticated
+  # supervisor owns the stable requested listener, so replacement and cleanup
+  # do not depend on reconnecting an abandoned ET terminal first.
+  if [ "\$ettun_relay" = ncat ]; then
+    (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec ncat --listen --keep-open --sh-exec 'exec ncat -- 127.0.0.1 $reverse_transport_port' 127.0.0.1 "\$ettun_reverse_port") &
+  else
+    (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec socat "TCP-LISTEN:\$ettun_reverse_port,bind=127.0.0.1,reuseaddr,fork" "TCP:127.0.0.1:\$ettun_reverse_transport_port") &
+  fi
+  reverse_pid=\$!
+fi
 install_remote_signal_traps
 if [ "\$pending_remote_signal" -ne 0 ]; then
   exit "\$pending_remote_signal"
 fi
 publish_owner
 : >"\$ettun_relay_gate" || fatal 74 relay-gate
-# Give the listener one scheduling interval to bind. Early death means this
-# candidate collided; the tokenized marker lets only its launcher retry.
+# Give each listener one scheduling interval to bind. A random local-relay
+# collision is retryable; the requested reverse port is fixed, so an unowned
+# occupant is an actionable failure rather than a reason to choose a new port.
 sleep 1
-if ! process_is_running "\$relay_pid"; then
-  wait "\$relay_pid" 2>/dev/null || :
-  relay_pid=
-  printf '%s\\n' "\$ettun_marker" >&2
-  exit 75
-fi
+data_relays_running() {
+  if [ "\$ettun_local_enabled" -eq 1 ]; then
+    process_is_running "\$relay_pid" || return 1
+  fi
+  if [ "\$ettun_reverse_enabled" -eq 1 ]; then
+    process_is_running "\$reverse_pid" || return 1
+  fi
+  return 0
+}
+fail_stopped_data_relay() {
+  if [ "\$ettun_local_enabled" -eq 1 ] &&
+    ! process_is_running "\$relay_pid"; then
+    wait "\$relay_pid" 2>/dev/null || :
+    relay_pid=
+    printf '%s\\n' "\$ettun_marker" >&2
+    exit 75
+  fi
+  if [ "\$ettun_reverse_enabled" -eq 1 ] &&
+    ! process_is_running "\$reverse_pid"; then
+    wait "\$reverse_pid" 2>/dev/null || :
+    reverse_pid=
+    printf 'ettun: requested reverse listener is unavailable\\n' >&2
+    fatal 73 reverse-listener
+  fi
+}
+data_relays_running || fail_stopped_data_relay
 # Listener output is file-backed because ncat and socat expose different process
 # models. Read only complete lines and treat unauthenticated content as disposable.
 read_control_line() {
@@ -798,7 +940,7 @@ start_stop_listener
 # Recreate the main control listener after invalid tokens. Once an authenticated
 # attachment is confirmed, keep that connection open; its EOF is the reliable
 # signal that ET disconnected and the supervisor may exit normally.
-while process_is_running "\$relay_pid"; do
+while data_relays_running; do
   : >"\$ettun_control_file" || fatal 74 control-file
   rm -f "\$ettun_control_gate"
   pending_remote_signal=0
@@ -828,7 +970,7 @@ while process_is_running "\$relay_pid"; do
   release_startup_lock
   control_attached=0
   control_invalid=0
-  while process_is_running "\$relay_pid" && process_is_running "\$control_pid"; do
+  while data_relays_running && process_is_running "\$control_pid"; do
     check_stop_listener
     if read_control_line "\$ettun_control_file"; then
       if [ "\$received_token" = "\$ettun_token" ]; then
@@ -847,29 +989,23 @@ while process_is_running "\$relay_pid"; do
     [ "\$received_token" = "\$ettun_token" ]; then
     control_attached=1
   fi
-  if ! process_is_running "\$relay_pid"; then
-    wait "\$relay_pid" 2>/dev/null || :
-    relay_pid=
+  if ! data_relays_running; then
     if process_is_running "\$control_pid"; then kill_tree "\$control_pid"; fi
     wait "\$control_pid" 2>/dev/null || :
     control_pid=
-    printf '%s\\n' "\$ettun_marker" >&2
-    exit 75
+    fail_stopped_data_relay
   fi
   if [ "\$control_attached" -eq 1 ]; then
-    while process_is_running "\$relay_pid" && process_is_running "\$control_pid"; do
+    while data_relays_running && process_is_running "\$control_pid"; do
       check_stop_listener
       sleep 1
     done
     check_stop_listener
-    if ! process_is_running "\$relay_pid"; then
-      wait "\$relay_pid" 2>/dev/null || :
-      relay_pid=
+    if ! data_relays_running; then
       if process_is_running "\$control_pid"; then kill_tree "\$control_pid"; fi
       wait "\$control_pid" 2>/dev/null || :
       control_pid=
-      printf '%s\\n' "\$ettun_marker" >&2
-      exit 75
+      fail_stopped_data_relay
     fi
   fi
   control_status=0
@@ -891,7 +1027,7 @@ while process_is_running "\$relay_pid"; do
     exit 75
   fi
 done
-printf '%s\\n' "\$ettun_marker" >&2
+fail_stopped_data_relay
 exit 75
 EOF
 }
@@ -1265,7 +1401,8 @@ control_handoff_helper() {
 }
 
 run_transport() {
-  local tunnel_spec="$1" remote_command="$2" marker="$3"
+  local tunnel_spec="$1" reverse_tunnel_spec="$2" remote_command="$3"
+  local marker="$4"
   local stdout_log="$runtime_dir/stdout" stderr_log="$runtime_dir/stderr"
   local stdout_fifo="$runtime_dir/stdout.fifo" stderr_fifo="$runtime_dir/stderr.fifo"
   local foreground_status=0 handoff_resume_count=0 pre_attach_resume_count=0
@@ -1310,7 +1447,7 @@ run_transport() {
   trap ':' TSTP
   "$BASH" "${BASH_SOURCE[0]}" --ettun-transport-worker \
     "$runtime_dir" "$use_terminal_handoff" "$transport_path" "$et_path" \
-    "$via_host" "$tunnel_spec" "$remote_command" "$$" \
+    "$via_host" "$tunnel_spec" "$reverse_tunnel_spec" "$remote_command" "$$" \
     <&8 >"$stdout_fifo" 2>"$stderr_fifo" &
   transport_pid=$!
   trap '' TSTP
@@ -1540,43 +1677,141 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
 fi
-[[ $# -eq 4 ]] || die_usage "expected four arguments"
+[[ $# -ge 1 ]] || die_usage "expected a via host and at least one route"
 
 via_host="$1"
-local_port="$2"
-target_host="$3"
-target_port="$4"
+shift
+local_enabled=0
+reverse_enabled=0
+local_port=0
+target_host=''
+target_port=0
+reverse_port=0
+reverse_target_host=''
+reverse_target_port=0
+
+# Keep the original compact invocation as the local-only compatibility form.
+# The explicit grammar is deliberately regular: each route consumes exactly
+# one option and three values, with no shell-style combined option strings.
+if (($# > 0)) && [[ ${1:-} != --* ]]; then
+  [[ $# -eq 3 ]] || die_usage "compact form expected four arguments"
+  local_enabled=1
+  local_port="$1"
+  target_host="$2"
+  target_port="$3"
+  shift 3
+else
+  while (($# > 0)); do
+    case $1 in
+      --local)
+        [[ $local_enabled -eq 0 ]] || die_usage "expected at most one local route"
+        [[ $# -ge 4 ]] || die_usage "local route requires PORT TARGET TARGET_PORT"
+        local_enabled=1
+        local_port="$2"
+        target_host="$3"
+        target_port="$4"
+        shift 4
+        ;;
+      --reverse)
+        [[ $reverse_enabled -eq 0 ]] || die_usage "expected at most one reverse route"
+        [[ $# -ge 4 ]] || die_usage "reverse route requires PORT TARGET TARGET_PORT"
+        reverse_enabled=1
+        reverse_port="$2"
+        reverse_target_host="$3"
+        reverse_target_port="$4"
+        shift 4
+        ;;
+      *) die_usage "unknown route option: $1" ;;
+    esac
+  done
+fi
+((local_enabled == 1 || reverse_enabled == 1)) ||
+  die_usage "expected at least one local or reverse route"
 
 # These values become ET argv and generated shell literals. The deliberately
 # narrow grammars make that interpolation safe without shell evaluation or a
 # second quoting language.
 valid_via_host "$via_host" || die_usage "invalid via host: $via_host"
-valid_port "$local_port" || die_usage "invalid local port: $local_port"
-valid_target_host "$target_host" || die_usage "invalid target host: $target_host"
-valid_port "$target_port" || die_usage "invalid target port: $target_port"
+if ((local_enabled == 1)); then
+  valid_port "$local_port" || die_usage "invalid local port: $local_port"
+  valid_target_host "$target_host" || die_usage "invalid target host: $target_host"
+  valid_port "$target_port" || die_usage "invalid target port: $target_port"
+  local_port=$((10#$local_port))
+  target_port=$((10#$target_port))
+fi
+if ((reverse_enabled == 1)); then
+  valid_port "$reverse_port" || die_usage "invalid reverse port: $reverse_port"
+  valid_target_host "$reverse_target_host" ||
+    die_usage "invalid reverse target host: $reverse_target_host"
+  valid_port "$reverse_target_port" ||
+    die_usage "invalid reverse target port: $reverse_target_port"
+  reverse_port=$((10#$reverse_port))
+  reverse_target_port=$((10#$reverse_target_port))
+fi
 
-local_port=$((10#$local_port))
-target_port=$((10#$target_port))
+remote_port_slot=''
+if [[ ${ETTUN_REMOTE_PORT_SLOT_V1+x} == x ]]; then
+  remote_port_slot=$ETTUN_REMOTE_PORT_SLOT_V1
+  [[ $remote_port_slot =~ ^(0|[1-9][0-9]{0,2})$ ]] ||
+    die_usage "invalid remote port slot: $remote_port_slot"
+  ((10#$remote_port_slot < REMOTE_PORT_SLOT_COUNT)) ||
+    die_usage "invalid remote port slot: $remote_port_slot"
+  remote_port_slot=$((10#$remote_port_slot))
+fi
+transport_single_invocation_hint=0
+if [[ ${ETTUN_TRANSPORT_SINGLE_INVOCATION_V1+x} == x ]]; then
+  [[ $ETTUN_TRANSPORT_SINGLE_INVOCATION_V1 == 1 ]] ||
+    die_usage "invalid single-invocation transport assertion"
+  transport_single_invocation_hint=1
+fi
+# The slot belongs to the engine. A selected transport adapter receives only
+# its documented argv and cannot silently reinterpret provider coordination.
+unset ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
 
-if local_port_in_use "$local_port"; then
+if ((local_enabled == 1)) && local_port_in_use "$local_port"; then
   printf 'ettun: localhost:%s is already in use; this tunnel may already be running.\n' \
     "$local_port" >&2
   exit 1
 fi
 
 transport_path=""
+transport_connect_v2=0
+transport_single_invocation=$transport_single_invocation_hint
 et_path=""
 # A custom adapter changes only how the ET connection is established. Bootstrap,
 # authentication, forwarding, retries, and cleanup remain owned by this script.
 if [[ -n "${ETTUN_TRANSPORT:-}" ]]; then
   transport_path=$(resolve_command transport "$ETTUN_TRANSPORT") || exit 1
+  if ((reverse_enabled == 1)); then
+    capability_status=0
+    transport_query_capabilities "$transport_path" || capability_status=$?
+    if ((capability_status != 0 || transport_connect_v2 != 1)); then
+      printf 'ettun: transport does not support reverse routes: %s\n' \
+        "$ETTUN_TRANSPORT" >&2
+      exit 1
+    fi
+  fi
 else
   et_path=$(resolve_command "ET client" "${ETTUN_ET:-et}") || exit 1
 fi
 
 client_identity=$(client_id) || exit 1
-tunnel_key="$client_identity-$local_port"
-port_seed=$((RANDOM + RANDOM + $$))
+if ((local_enabled == 1 && reverse_enabled == 0)); then
+  # Preserve the established remote ownership key for local-only upgrades.
+  tunnel_key="$client_identity-$local_port"
+elif ((local_enabled == 0)); then
+  tunnel_key="$client_identity-r$reverse_port"
+else
+  tunnel_key="$client_identity-l$local_port-r$reverse_port"
+fi
+if [[ -n $remote_port_slot ]]; then
+  port_seed=0
+else
+  port_seed=$(random_port_seed) || {
+    printf 'ettun: could not generate a remote port seed\n' >&2
+    exit 1
+  }
+fi
 
 umask 077
 # All cross-process coordination is private to this invocation. Preserve the
@@ -1590,29 +1825,77 @@ exec 8<&0
 trap cleanup_local EXIT
 install_stop_traps
 
-printf 'ettun: localhost:%s -> %s:%s via %s (ET; Ctrl-C to stop)\n' \
-  "$local_port" "$target_host" "$target_port" "$via_host"
+if ((local_enabled == 1)); then
+  printf 'ettun: localhost:%s -> %s:%s via %s (ET; Ctrl-C to stop)\n' \
+    "$local_port" "$target_host" "$target_port" "$via_host"
+fi
+if ((reverse_enabled == 1)); then
+  printf 'ettun: localhost:%s -> %s:%s via %s (reverse ET; Ctrl-C to stop)\n' \
+    "$reverse_port" "$reverse_target_host" "$reverse_target_port" "$via_host"
+fi
 
 # A remote port can become busy between selection and listener bind. Each attempt
 # gets a distinct relay/control/stop tuple and token; retry only a token-matched
 # collision marker, never an arbitrary ET or adapter failure.
 for ((attempt = 0; attempt < MAX_RELAY_ATTEMPTS; attempt++)); do
-  relay_index=$(((port_seed + attempt * RELAY_PORT_STRIDE) % RELAY_PORT_SPAN))
-  relay_port=$((RELAY_PORT_MIN + relay_index))
-  control_remote_port=$((RELAY_PORT_MIN + (\
-    relay_index + CONTROL_PORT_OFFSET) % RELAY_PORT_SPAN))
-  stop_remote_port=$((RELAY_PORT_MIN + (\
-    relay_index + STOP_PORT_OFFSET) % RELAY_PORT_SPAN))
-  control_local_port=$(choose_local_control_port "$port_seed" "$attempt") || exit 1
+  if [[ -n $remote_port_slot ]]; then
+    palette_index=$((attempt * REMOTE_PORT_ROLE_COUNT))
+    relay_port=$((RELAY_PORT_MIN + \
+      palette_index * REMOTE_PORT_SLOT_COUNT + remote_port_slot))
+    control_remote_port=$((RELAY_PORT_MIN + (\
+      palette_index + 1) * REMOTE_PORT_SLOT_COUNT + remote_port_slot))
+    stop_remote_port=$((RELAY_PORT_MIN + (\
+      palette_index + 2) * REMOTE_PORT_SLOT_COUNT + remote_port_slot))
+    reverse_transport_port=$((RELAY_PORT_MIN + (\
+      palette_index + 3) * REMOTE_PORT_SLOT_COUNT + remote_port_slot))
+  else
+    relay_index=$(((port_seed + attempt * RELAY_PORT_STRIDE) % RELAY_PORT_SPAN))
+    relay_port=$((RELAY_PORT_MIN + relay_index))
+    control_remote_port=$((RELAY_PORT_MIN + (\
+      relay_index + CONTROL_PORT_OFFSET) % RELAY_PORT_SPAN))
+    stop_remote_port=$((RELAY_PORT_MIN + (\
+      relay_index + STOP_PORT_OFFSET) % RELAY_PORT_SPAN))
+    reverse_transport_port=$((RELAY_PORT_MIN + (\
+      relay_index + REVERSE_PORT_OFFSET) % RELAY_PORT_SPAN))
+  fi
+  # Generated listeners exist in both endpoint namespaces. Avoid every fixed
+  # route endpoint even when a service is not listening yet, so a tunnel cannot
+  # preempt it and make a later service start fail.
+  if ((local_enabled == 1 && (\
+    local_port == relay_port || local_port == control_remote_port || \
+    local_port == stop_remote_port || local_port == reverse_transport_port || \
+    target_port == relay_port || target_port == control_remote_port || \
+    target_port == stop_remote_port || \
+    target_port == reverse_transport_port))) ||
+      ((reverse_enabled == 1 && (\
+      reverse_port == relay_port || reverse_port == control_remote_port || \
+      reverse_port == stop_remote_port || \
+      reverse_port == reverse_transport_port || \
+      reverse_target_port == relay_port || \
+      reverse_target_port == control_remote_port || \
+      reverse_target_port == stop_remote_port || \
+      reverse_target_port == reverse_transport_port))); then
+    continue
+  fi
+  control_local_port=$(choose_local_control_port \
+    "$port_seed" "$attempt" "$remote_port_slot") || exit 1
   stop_token=$(random_hex) || {
     printf 'ettun: could not generate a stop token\n' >&2
     exit 1
   }
   retry_marker="ETTUN_COLLISION:$stop_token:$relay_port"
-  tunnel_spec="$local_port:$relay_port,$control_local_port:$control_remote_port"
+  tunnel_spec="$control_local_port:$control_remote_port"
+  if ((local_enabled == 1)); then
+    tunnel_spec="$local_port:$relay_port,$tunnel_spec"
+  fi
+  reverse_tunnel_spec=''
+  if ((reverse_enabled == 1)); then
+    reverse_tunnel_spec="127.0.0.1:$reverse_transport_port:$reverse_target_host:$reverse_target_port"
+  fi
   if ! bootstrap_payload=$(build_remote_payload \
     "$relay_port" "$control_remote_port" "$stop_remote_port" \
-    "$stop_token" "$tunnel_key"); then
+    "$stop_token" "$tunnel_key" "$local_enabled" "$reverse_enabled" \
+    "$reverse_port" "$reverse_transport_port"); then
     printf 'ettun: could not encode the remote supervisor payload\n' >&2
     exit 1
   fi
@@ -1627,7 +1910,8 @@ for ((attempt = 0; attempt < MAX_RELAY_ATTEMPTS; attempt++)); do
 
   export ETTUN_RETRY_MARKER="$retry_marker"
   ((signal_status == 0)) || exit "$signal_status"
-  run_transport "$tunnel_spec" "$remote_command" "$retry_marker"
+  run_transport "$tunnel_spec" "$reverse_tunnel_spec" "$remote_command" \
+    "$retry_marker"
 
   # Status precedence is intentional: a local signal is the user's requested
   # outcome; an authenticated remote fatal marker survives transports that mask
@@ -1641,6 +1925,11 @@ for ((attempt = 0; attempt < MAX_RELAY_ATTEMPTS; attempt++)); do
   fi
   if ((collision_seen == 0)); then
     exit "$transport_status"
+  fi
+  if ((transport_single_invocation == 1)); then
+    printf 'ettun: transport adapter permits one invocation; rerun the command that owns this tunnel after the remote relay collision\n' \
+      >&2
+    exit 75
   fi
   if ((attempt + 1 < MAX_RELAY_ATTEMPTS)); then
     printf 'ettun: remote relay port was busy; retrying (%s/%s)\n' \
