@@ -306,6 +306,8 @@ terminal_control_token_file="$tmp/terminal-control.token"
 terminal_control_ready_file="$tmp/terminal-control.ready"
 terminal_control_attached_file="$tmp/terminal-control.attached"
 terminal_control_eof_file="$tmp/terminal-control.eof"
+terminal_group_ready_file="$tmp/terminal-group.ready"
+terminal_exec_gate_file="$tmp/terminal-exec.gate"
 PATH="$bin:$test_extended_system_path" \
   HOME="$test_home" \
   XDG_STATE_HOME="$test_home/state" \
@@ -316,33 +318,75 @@ PATH="$bin:$test_extended_system_path" \
   ETTUN_TEST_CONTROL_ATTACHED="$terminal_control_attached_file" \
   ETTUN_TEST_CONTROL_EOF="$terminal_control_eof_file" \
   ETTUN_TRANSPORT="$bin/delayed-control-transport" \
-  "$test_python" - "$BASH" "$SCRIPT" gateway.example 10446 service.internal 443 \
+  "$test_python" - "$terminal_group_ready_file" "$terminal_exec_gate_file" \
+  "$BASH" "$SCRIPT" gateway.example 10446 service.internal 443 \
   >"$tmp/terminal.stdout" 2>"$tmp/terminal.stderr" <<'PY' &
 import os
 import signal
 import sys
+import time
 
 os.setsid()
 signal.signal(signal.SIGINT, signal.SIG_DFL)
-bash, *command = sys.argv[1:]
+group_ready, exec_gate = sys.argv[1:3]
+bash, *command = sys.argv[3:]
+with open(group_ready, "w", encoding="utf-8") as output:
+    output.write(f"{os.getpgrp()}\n")
+deadline = time.monotonic() + 8
+while not os.path.exists(exec_gate):
+    if time.monotonic() >= deadline:
+        raise TimeoutError("terminal-interrupt exec gate was not released")
+    time.sleep(0.05)
 os.execv(bash, ["bash", *command])
 PY
 terminal_tunnel_pid=$!
-_wait_for_file "$terminal_transport_pid_file" ||
-  _fail "signal handling: terminal-interrupt transport starts"
-_wait_for_marker "$terminal_control_ready_file" ||
+terminal_transport_pid=
+terminal_pgid=
+terminal_ready=1
+if _wait_for_file "$terminal_group_ready_file"; then
+  read -r terminal_pgid <"$terminal_group_ready_file"
+  if [[ "$terminal_pgid" =~ ^[0-9]+$ ]]; then
+    _pass "signal handling: terminal-interrupt process group starts"
+  else
+    _fail "signal handling: terminal-interrupt process group publishes a PID"
+    terminal_ready=0
+  fi
+else
+  _fail "signal handling: terminal-interrupt process group starts"
+  terminal_ready=0
+fi
+: >"$terminal_exec_gate_file"
+if ((terminal_ready == 1)); then
+  if _wait_for_file "$terminal_transport_pid_file"; then
+    read -r terminal_transport_pid <"$terminal_transport_pid_file"
+  else
+    _fail "signal handling: terminal-interrupt transport starts"
+    terminal_ready=0
+  fi
+fi
+if ((terminal_ready == 1)) &&
+  ! _wait_for_marker "$terminal_control_ready_file"; then
   _fail "signal handling: terminal-interrupt control channel starts"
-_wait_for_file "$terminal_control_token_file" ||
+  terminal_ready=0
+fi
+if ((terminal_ready == 1)) &&
+  ! _wait_for_file "$terminal_control_token_file"; then
   _fail "signal handling: terminal-interrupt control handoff starts"
-_wait_for_marker "$terminal_control_attached_file" ||
+  terminal_ready=0
+fi
+if ((terminal_ready == 1)) &&
+  ! _wait_for_marker "$terminal_control_attached_file"; then
   _fail "signal handling: terminal-interrupt control handoff is acknowledged"
-read -r terminal_transport_pid <"$terminal_transport_pid_file"
-terminal_pgid=$(ps -o pgid= -p "$terminal_tunnel_pid" | tr -d ' ')
-kill -INT -- "-$terminal_pgid"
-terminal_exit=0
-wait "$terminal_tunnel_pid" || terminal_exit=$?
-_assert_exit "signal handling: terminal Ctrl-C preserves INT status" 130 "$terminal_exit"
-if _wait_for_file "$terminal_control_token_file"; then
+  terminal_ready=0
+fi
+if ((terminal_ready == 1)); then
+  kill -INT -- "-$terminal_pgid"
+  terminal_exit=0
+  wait "$terminal_tunnel_pid" || terminal_exit=$?
+  _assert_exit "signal handling: terminal Ctrl-C preserves INT status" 130 "$terminal_exit"
+fi
+if ((terminal_ready == 1)) &&
+  _wait_for_file "$terminal_control_token_file"; then
   terminal_control_token=$(tr -d '\r\n' <"$terminal_control_token_file")
   if [[ "$terminal_control_token" =~ ^[0-9a-f]{32}$ ]] &&
     _wait_for_marker "$terminal_control_eof_file"; then
@@ -352,12 +396,25 @@ if _wait_for_file "$terminal_control_token_file"; then
   else
     _fail "signal handling: terminal Ctrl-C closes the acknowledged control stream"
   fi
-else
+elif ((terminal_ready == 1)); then
   _fail "signal handling: terminal Ctrl-C keeps control forwarding alive for cleanup"
 fi
-if _wait_for_processes_stopped "$terminal_transport_pid"; then
+if ((terminal_ready == 0)); then
+  printf '%s\n' 'terminal-interrupt fixture stderr:' >&2
+  tail -n 20 "$tmp/terminal.stderr" >&2 || true
+  if [[ "$terminal_pgid" =~ ^[0-9]+$ ]]; then
+    kill -TERM -- "-$terminal_pgid" 2>/dev/null || true
+  else
+    kill -TERM "$terminal_tunnel_pid" 2>/dev/null || true
+  fi
+  _wait_for_processes_stopped "$terminal_tunnel_pid" ||
+    kill -KILL "$terminal_tunnel_pid" 2>/dev/null || true
+  wait "$terminal_tunnel_pid" 2>/dev/null || true
+fi
+if [[ -n "$terminal_transport_pid" ]] &&
+  _wait_for_processes_stopped "$terminal_transport_pid"; then
   _pass "signal handling: terminates the terminal-interrupt transport"
-else
+elif [[ -n "$terminal_transport_pid" ]]; then
   _fail "signal handling: terminates the terminal-interrupt transport"
   kill -KILL "$terminal_transport_pid" 2>/dev/null || true
 fi

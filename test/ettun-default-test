@@ -517,6 +517,18 @@ _write_stub "$remote_bin/relay-action" \
   '      printf "%s\n" "$$" >"$ETTUN_REMOTE_DATA_DIR/$port.pid"' \
   '    fi' \
   '    if [[ -n "${ETTUN_REMOTE_FAIL_DATA_PORT:-}" && "$port" == "$ETTUN_REMOTE_FAIL_DATA_PORT" ]]; then' \
+  '      if [[ -n "${ETTUN_REMOTE_FAIL_DATA_WAIT_FOR:-}" ]]; then' \
+  '        wait_ready=0' \
+  '        for _ in {1..80}; do' \
+  '          if [[ -r "$ETTUN_REMOTE_FAIL_DATA_WAIT_FOR" ]]; then wait_ready=1; break; fi' \
+  '          sleep 0.1' \
+  '        done' \
+  '        if ((wait_ready == 0)); then' \
+  '          printf "relay fixture: timed out waiting for peer listener\n" >&2' \
+  '          exit 97' \
+  '        fi' \
+  '      fi' \
+  '      [[ -z "${ETTUN_REMOTE_FAIL_DATA_READY:-}" ]] || : >"$ETTUN_REMOTE_FAIL_DATA_READY"' \
   '      exit 98' \
   '    fi' \
   '    sleep 300 &' \
@@ -594,6 +606,8 @@ _start_remote_supervisor() {
     ETTUN_REMOTE_DATA_CHILD_PID="$tmp/remote-data-child.pid" \
     ETTUN_REMOTE_DATA_DIR="$remote_data_dir" \
     ETTUN_REMOTE_FAIL_DATA_PORT="${ETTUN_REMOTE_FAIL_DATA_PORT:-}" \
+    ETTUN_REMOTE_FAIL_DATA_WAIT_FOR="${ETTUN_REMOTE_FAIL_DATA_WAIT_FOR:-}" \
+    ETTUN_REMOTE_FAIL_DATA_READY="${ETTUN_REMOTE_FAIL_DATA_READY:-}" \
     ETTUN_REMOTE_CONTROL_PID="$tmp/remote-control.pid" \
     ETTUN_REMOTE_STOP_PID="$tmp/remote-stop.pid" \
     ETTUN_REMOTE_STOP_FILE="$remote_state/stop" \
@@ -730,13 +744,25 @@ rm -f "$remote_fifos/$mixed_control" "$remote_fifos/$mixed_stop"
 # its bind failure is fatal and that the already-started local relay is still
 # reclaimed.
 rm -f "$remote_data_dir"/*
-ETTUN_REMOTE_FAIL_DATA_PORT=$mixed_reverse_port \
+mixed_collision_local_ready="$tmp/mixed-collision-local-ready"
+mixed_collision_local_pid=
+rm -f "$mixed_collision_local_ready"
+ETTUN_REMOTE_FAIL_DATA_WAIT_FOR="$remote_data_dir/$mixed_relay_port.pid" \
+  ETTUN_REMOTE_FAIL_DATA_READY="$mixed_collision_local_ready" \
+  ETTUN_REMOTE_FAIL_DATA_PORT=$mixed_reverse_port \
   _start_remote_supervisor "$mixed_remote" "$mixed_control" "$mixed_stop"
 mixed_collision_pid=$remote_pid
+if _wait_for_marker "$mixed_collision_local_ready"; then
+  _pass "mixed reverse collision: observes the local relay before detection"
+else
+  _fail "mixed reverse collision: observes the local relay before detection"
+fi
 _wait_for_file "$remote_data_dir/$mixed_relay_port.pid" ||
   _fail "mixed reverse collision: local relay starts before detection"
-read -r mixed_collision_local_pid \
-  <"$remote_data_dir/$mixed_relay_port.pid"
+if [[ -r "$remote_data_dir/$mixed_relay_port.pid" ]]; then
+  read -r mixed_collision_local_pid \
+    <"$remote_data_dir/$mixed_relay_port.pid"
+fi
 mixed_collision_exit=0
 if ! _wait_for_processes_stopped "$mixed_collision_pid"; then
   _fail "mixed reverse collision: supervisor exits within deadline"
@@ -749,11 +775,13 @@ _assert_exit "mixed reverse collision: fixed listener failure is fatal" \
 _assert_contains "mixed reverse collision: failure is tokenized" \
   "ETTUN_FATAL:$mixed_token:73:reverse-listener" \
   "$(<"$tmp/remote.stderr")"
-if _wait_for_processes_stopped "$mixed_collision_local_pid"; then
+if [[ -n "$mixed_collision_local_pid" ]] &&
+  _wait_for_processes_stopped "$mixed_collision_local_pid"; then
   _pass "mixed reverse collision: reclaims the local relay"
 else
   _fail "mixed reverse collision: reclaims the local relay"
-  kill -KILL "$mixed_collision_local_pid" 2>/dev/null || true
+  [[ -z "$mixed_collision_local_pid" ]] ||
+    kill -KILL "$mixed_collision_local_pid" 2>/dev/null || true
 fi
 if [[ ! -e $remote_state ]]; then
   _pass "mixed reverse collision: removes owned state"
