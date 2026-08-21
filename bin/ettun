@@ -40,9 +40,9 @@ REMOTE_COMMAND_MAX_BYTES=3072
 run_transport_worker() {
   local worker_runtime_dir="$1" worker_terminal_handoff="$2"
   local worker_transport_path="$3" worker_et_path="$4"
-  local worker_via_host="$5" worker_tunnel_spec="$6"
-  local worker_reverse_tunnel_spec="$7" worker_remote_command="$8"
-  local worker_launcher_pid="$9" child_pid child_status=0 retry_status=0
+  local worker_jump_host="$5" worker_via_host="$6" worker_tunnel_spec="$7"
+  local worker_reverse_tunnel_spec="$8" worker_remote_command="$9"
+  local worker_launcher_pid="${10}" child_pid child_status=0 retry_status=0
   local worker_status_file="$worker_runtime_dir/transport.status"
   local worker_status_tmp="$worker_status_file.tmp"
   local recorded_status=""
@@ -119,7 +119,11 @@ run_transport_worker() {
           "$worker_tunnel_spec" "$worker_remote_command" || adapter_status=$?
       fi
     else
-      et_argv=(-N --keepalive 5 -t "$worker_tunnel_spec")
+      et_argv=()
+      if [[ -n "$worker_jump_host" ]]; then
+        et_argv+=(--jumphost "$worker_jump_host")
+      fi
+      et_argv+=(-N --keepalive 5 -t "$worker_tunnel_spec")
       if [[ -n "$worker_reverse_tunnel_spec" ]]; then
         et_argv+=(-r "$worker_reverse_tunnel_spec")
       fi
@@ -167,7 +171,7 @@ run_transport_worker() {
 
 # Keep the worker entry point ahead of public argument parsing. Its fixed arity
 # and sentinel cannot collide with a valid four-argument public invocation.
-if [[ $# -eq 10 && "${1:-}" == --ettun-transport-worker ]]; then
+if [[ $# -eq 11 && "${1:-}" == --ettun-transport-worker ]]; then
   shift
   run_transport_worker "$@"
   exit $?
@@ -177,7 +181,8 @@ fi
 usage() {
   cat >&2 <<'EOF'
 Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT
-       ettun VIA [--local LOCAL_PORT TARGET TARGET_PORT]
+       ettun VIA [--jump-host JUMP_HOST]
+                      [--local LOCAL_PORT TARGET TARGET_PORT]
                       [--reverse REMOTE_PORT TARGET TARGET_PORT]
 
 Expose TARGET:TARGET_PORT at localhost:LOCAL_PORT through the ET server VIA.
@@ -189,11 +194,12 @@ waiting for ET to reconnect, press Ctrl-C again to force a local stop.
 Ctrl-Z is ignored for the tunnel's lifetime.
 
 VIA must be an ET host or SSH-config name. TARGET must be a hostname or IPv4
-literal. Both ends need base64, gzip, and a SHA-256 tool (sha256sum, shasum, or
-openssl). VIA also needs /bin/sh, etserver, flock, and either socat (preferred)
-or ncat. Set ETTUN_TRANSPORT to an executable adapter when the connection
-must be established by something other than et. The adapter must remain in the
-foreground for the lifetime of its ET connection.
+literal. JUMP_HOST selects ET's native single-hop jump mode and is available
+only with stock ET. Both ends need base64, gzip, and a SHA-256 tool (sha256sum,
+shasum, or openssl). VIA also needs /bin/sh, etserver, flock, and either socat
+(preferred) or ncat. Set ETTUN_TRANSPORT to an executable adapter when the
+connection must be established by something other than et. The adapter must
+remain in the foreground for the lifetime of its ET connection.
 
 Orchestrators may set ETTUN_REMOTE_PORT_SLOT_V1 to an integer from 0 through
 818. Distinct remote-port-slot-v1 values select disjoint generated port
@@ -1447,7 +1453,8 @@ run_transport() {
   trap ':' TSTP
   "$BASH" "${BASH_SOURCE[0]}" --ettun-transport-worker \
     "$runtime_dir" "$use_terminal_handoff" "$transport_path" "$et_path" \
-    "$via_host" "$tunnel_spec" "$reverse_tunnel_spec" "$remote_command" "$$" \
+    "$jump_host" "$via_host" "$tunnel_spec" "$reverse_tunnel_spec" \
+    "$remote_command" "$$" \
     <&8 >"$stdout_fifo" 2>"$stderr_fifo" &
   transport_pid=$!
   trap '' TSTP
@@ -1681,6 +1688,8 @@ fi
 
 via_host="$1"
 shift
+jump_host=''
+jump_host_set=0
 local_enabled=0
 reverse_enabled=0
 local_port=0
@@ -1703,6 +1712,13 @@ if (($# > 0)) && [[ ${1:-} != --* ]]; then
 else
   while (($# > 0)); do
     case $1 in
+      --jump-host)
+        [[ $jump_host_set -eq 0 ]] || die_usage "expected at most one jump host"
+        [[ $# -ge 2 ]] || die_usage "jump host requires HOST"
+        jump_host_set=1
+        jump_host="$2"
+        shift 2
+        ;;
       --local)
         [[ $local_enabled -eq 0 ]] || die_usage "expected at most one local route"
         [[ $# -ge 4 ]] || die_usage "local route requires PORT TARGET TARGET_PORT"
@@ -1732,6 +1748,9 @@ fi
 # narrow grammars make that interpolation safe without shell evaluation or a
 # second quoting language.
 valid_via_host "$via_host" || die_usage "invalid via host: $via_host"
+if ((jump_host_set == 1)); then
+  valid_via_host "$jump_host" || die_usage "invalid jump host: $jump_host"
+fi
 if ((local_enabled == 1)); then
   valid_port "$local_port" || die_usage "invalid local port: $local_port"
   valid_target_host "$target_host" || die_usage "invalid target host: $target_host"
@@ -1768,6 +1787,9 @@ fi
 # its documented argv and cannot silently reinterpret provider coordination.
 unset ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
 
+if [[ -n "${ETTUN_TRANSPORT:-}" && $jump_host_set -eq 1 ]]; then
+  die_usage "--jump-host requires stock ET"
+fi
 if ((local_enabled == 1)) && local_port_in_use "$local_port"; then
   printf 'ettun: localhost:%s is already in use; this tunnel may already be running.\n' \
     "$local_port" >&2

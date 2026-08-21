@@ -58,11 +58,14 @@ cgraf78/ettun  github
 
 ```text
 ettun VIA LOCAL_PORT TARGET TARGET_PORT
-ettun VIA [--local LOCAL_PORT TARGET TARGET_PORT]
+ettun VIA [--jump-host JUMP_HOST]
+               [--local LOCAL_PORT TARGET TARGET_PORT]
                [--reverse REMOTE_PORT TARGET TARGET_PORT]
 ```
 
 - `VIA` is an ET host or SSH-config-style name accepted by the ET client.
+- `--jump-host` selects ET's native single-hop jump mode. It is available only
+  with stock ET, not with a custom `ETTUN_TRANSPORT` adapter.
 - A local route exposes an endpoint reachable from `VIA` on the client's
   loopback `LOCAL_PORT`. The original four-argument form remains equivalent to
   one `--local` route.
@@ -70,6 +73,13 @@ ettun VIA [--local LOCAL_PORT TARGET TARGET_PORT]
   `VIA`'s loopback `REMOTE_PORT`.
 - The explicit form accepts one local route, one reverse route, or both. Both
   routes share one ET connection and one foreground lifecycle.
+
+For a relay whose ET connection must cross one SSH jump host:
+
+```bash
+ettun relay.example --jump-host jump.example \
+  --local 10443 database.internal 443
+```
 
 Press `Ctrl-C` to request authenticated remote cleanup and stop the tunnel. If
 ET is disconnected and graceful cleanup is waiting for it to reconnect, press

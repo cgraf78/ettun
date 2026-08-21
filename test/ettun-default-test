@@ -22,6 +22,30 @@ _assert_contains "occupied established local port: suggests an existing tunnel" 
   "may already be running" "$(cat "$stderr")"
 _assert_file_content "occupied established local port: rejected before transport" "" "$log"
 
+ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example --jump-host jump.example \
+  --local 10455 service.internal 443
+unset ETTUN_TEST_EXIT
+_assert_exit "jump host: reaches stock ET" 23 "$run_exit"
+_assert_contains "jump host: selects ET native jump mode" \
+  $'<--jumphost>\n<jump.example>' "$(cat "$log")"
+_assert_contains "jump host: preserves the relay destination" \
+  '<gateway.example>' "$(cat "$log")"
+
+_run_ettun gateway.example --jump-host 'jump,other' \
+  --local 10456 service.internal 443
+_assert_exit "jump host: unsafe selector is rejected" 2 "$run_exit"
+_assert_contains "jump host: unsafe selector is actionable" \
+  'invalid jump host' "$(cat "$stderr")"
+_assert_file_content "jump host: unsafe selector launches no ET" "" "$log"
+
+_run_ettun gateway.example --jump-host jump.example \
+  --jump-host other.example --local 10457 service.internal 443
+_assert_exit "jump host: duplicate selector is rejected" 2 "$run_exit"
+_assert_contains "jump host: duplicate selector is actionable" \
+  'expected at most one jump host' "$(cat "$stderr")"
+_assert_file_content "jump host: duplicate selector launches no ET" "" "$log"
+
 ETTUN_TEST_LSOF_REMOTE_PORT=10453 \
   ETTUN_TEST_EXIT=23 \
   _run_ettun gateway.example 10453 service.internal 443
