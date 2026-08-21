@@ -7,6 +7,15 @@
 
 echo "=== ettun custom transport ==="
 
+ETTUN_TEST_TRANSPORT="$bin/test-transport" \
+  _run_ettun relay.example --jump-host jump.example \
+  --local 10442 service.internal 443
+unset ETTUN_TEST_TRANSPORT
+_assert_exit "custom transport jump host: rejected" 2 "$run_exit"
+_assert_contains "custom transport jump host: names the stock ET boundary" \
+  '--jump-host requires stock ET' "$(cat "$stderr")"
+_assert_file_content "custom transport jump host: invokes no adapter" "" "$log"
+
 ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_TRANSPORT="$bin/test-transport" \
   _run_ettun relay.example 5901 desktop.internal 5900
 unset ETTUN_TEST_TRANSPORT
@@ -138,7 +147,7 @@ PATH="$bin:$test_extended_system_path" \
   ETTUN_TEST_WORKER_PGRPS="$worker_pgrps" \
   "$BASH" "$SCRIPT" --ettun-transport-worker \
   "$worker_runtime" 0 "$bin/worker-pgrp-transport" "" \
-  gateway.example 5902:5900 "" true "$$" || worker_exit=$?
+  "" gateway.example 5902:5900 "" true "$$" || worker_exit=$?
 _assert_exit "transport worker: succeeds with inherited monitor mode" 0 "$worker_exit"
 if [[ -r "$worker_pgrps" ]]; then
   read -r worker_pgid adapter_pgid <"$worker_pgrps"
@@ -168,6 +177,7 @@ completed = subprocess.run(
         runtime,
         "0",
         transport,
+        "",
         "",
         "gateway.example",
         "5902:5900",
@@ -219,6 +229,7 @@ worker = subprocess.Popen(
         runtime,
         "0",
         transport,
+        "",
         "",
         "gateway.example",
         "5902:5900",

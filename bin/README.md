@@ -10,7 +10,8 @@ The stable command surface is:
 
 ```text
 ettun VIA LOCAL_PORT TARGET TARGET_PORT
-ettun VIA [--local LOCAL_PORT TARGET TARGET_PORT]
+ettun VIA [--jump-host JUMP_HOST]
+               [--local LOCAL_PORT TARGET TARGET_PORT]
                [--reverse REMOTE_PORT TARGET TARGET_PORT]
 ```
 
