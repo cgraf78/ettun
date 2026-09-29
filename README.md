@@ -94,7 +94,7 @@ The client needs:
 - the `et` client, unless a custom transport adapter is configured;
 - `base64`, `gzip`, and one of `sha256sum`, `shasum`, or `openssl`;
 - standard Unix tools including `awk`, `od`, `ps`, `sed`, and `tee`; and
-- `lsof` or `ss` for early detection of an occupied local port.
+- `ss` (preferred) or `lsof` for early detection of an occupied local port.
 
 The `VIA` host needs `/bin/sh`, `etserver`, `flock`, `base64`, `gzip`, a
 SHA-256 implementation, and either `socat` or Nmap's `ncat`. `socat` is

@@ -271,7 +271,27 @@ transport_query_capabilities() {
 }
 
 local_port_in_use() {
-  local port="$1" endpoint
+  local port="$1" endpoint connections
+
+  # ss answers from the kernel socket table in milliseconds, while lsof walks
+  # every readable process fd and takes seconds on a busy host; a start probes
+  # several ports. A failing ss (missing, or old iproute2 without -H) means
+  # "unavailable" rather than "free", so the lsof path below still runs.
+  if command -v ss >/dev/null 2>&1 &&
+    connections=$(LC_ALL=C ss -H -atn exclude time-wait \
+      "sport = :$port" 2>/dev/null); then
+    # Include every owned TCP state, not only LISTEN: an established
+    # connection may already own the candidate as its local ephemeral source
+    # port. TIME-WAIT sockets belong to no process and do not block a new
+    # listener, so counting them would reject restarting a just-stopped tunnel.
+    [[ -z $connections ]] || return 0
+    # With netlink denied (Android), ss falls back to /proc/net and can exit 0
+    # with a restricted view, so an empty answer is not proof. A bounded
+    # loopback probe still catches a listener ss could not see.
+    command -v nc >/dev/null 2>&1 &&
+      nc -z -w 1 127.0.0.1 "$port" >/dev/null 2>&1
+    return
+  fi
 
   if command -v lsof >/dev/null 2>&1; then
     # lsof -iTCP:PORT matches PORT on either endpoint. Inspect only the local
@@ -288,13 +308,6 @@ local_port_in_use() {
       esac
     done < <(lsof -nP -iTCP:"$port" -Fn 2>/dev/null)
     return 1
-  fi
-
-  if command -v ss >/dev/null 2>&1; then
-    # Include every TCP state, not only LISTEN: an established connection may
-    # already own the candidate as its local ephemeral source port.
-    [[ -n "$(ss -H -atn "sport = :$port" 2>/dev/null)" ]]
-    return
   fi
 
   return 1
