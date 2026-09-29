@@ -129,9 +129,12 @@ The original local-only form preserves the legacy three-argument invocation:
 3. the bounded remote bootstrap command.
 
 Before using a custom adapter for a reverse route, ettun invokes
-`ADAPTER --ettun-capabilities` with standard input closed. The query must be
-noninteractive and print one lowercase capability token per line. An adapter
-which prints `connect-v2` is invoked as:
+`ADAPTER --ettun-capabilities` with standard input redirected from `/dev/null`
+and standard error discarded. The query must be noninteractive, exit zero, and
+print at most 4096 bytes: one to 32 distinct capability tokens, one per line,
+each matching `^[a-z][a-z0-9-]{0,63}$`. Any other output fails discovery, and
+the reverse route is refused. An adapter which prints `connect-v2` is invoked
+as:
 
 ```text
 ADAPTER --ettun-connect-v2 VIA TUNNEL_SPEC REVERSE_SPEC REMOTE_COMMAND
