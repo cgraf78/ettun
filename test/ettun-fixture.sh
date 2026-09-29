@@ -347,10 +347,6 @@ _write_stub "$bin/tstp-exit-transport" \
   'exit 127'
 _write_stub "$bin/exit-127-transport" \
   'exit 127'
-# Model a control listener that is still starting: bind at once but delay
-# listen(), so control connects are refused for a second. Binding first keeps
-# the chosen port reserved; an unbound delay let a host client connect() claim
-# it as an ephemeral source port and made the later bind fail with EADDRINUSE.
 _write_stub "$bin/delayed-control-transport" \
   'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
   'mapping=$2' \
@@ -358,17 +354,16 @@ _write_stub "$bin/delayed-control-transport" \
   'control_port=${control_mapping%%:*}' \
   'token=${ETTUN_RETRY_MARKER#ETTUN_COLLISION:}' \
   'token=${token%%:*}' \
+  'sleep 1' \
   'python3 - "$control_port" "$ETTUN_TEST_CONTROL_TOKEN" "${ETTUN_TEST_CONTROL_READY:-}" "$token" "${ETTUN_TEST_CONTROL_ATTACHED:-}" "${ETTUN_TEST_CONTROL_EOF:-}" <<PY' \
   'import socket' \
   'import signal' \
   'import sys' \
-  'import time' \
   'signal.signal(signal.SIGINT, lambda _signum, _frame: sys.exit(130))' \
   'signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})' \
   'server = socket.socket()' \
   'server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
   'server.bind(("127.0.0.1", int(sys.argv[1])))' \
-  'time.sleep(1)' \
   'server.listen(1)' \
   'if sys.argv[3]:' \
   '    open(sys.argv[3], "wb").close()' \
