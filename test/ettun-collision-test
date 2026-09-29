@@ -33,6 +33,50 @@ _assert_exit "temporary directory: out-of-root result is rejected" 1 \
 _assert_contains "temporary directory: out-of-root result is actionable" \
   "unsafe suite temporary directory" "$tmpdir_escape_output"
 
+# Scenarios that launch ettun directly omit ETTUN_TEST_PYTHON. The fixture's
+# port probe must still see an occupied generated port, or ettun can choose a
+# control port that a host client already owns and the fixture's later bind
+# fails with EADDRINUSE.
+held_port_file="$tmp/held-port"
+"$test_python" - "$held_port_file" <<'PY' &
+import random
+import socket
+import sys
+import time
+
+holder = socket.socket()
+for _ in range(200):
+    port = random.randint(49152, 65535)
+    try:
+        holder.bind(("127.0.0.1", port))
+        break
+    except OSError:
+        continue
+else:
+    sys.exit(1)
+holder.listen(1)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(f"{port}\n")
+time.sleep(30)
+PY
+held_port_pid=$!
+if _wait_for_file "$held_port_file"; then
+  read -r held_port <"$held_port_file"
+  held_probe_exit=0
+  held_probe_output=$(
+    env -u ETTUN_TEST_PYTHON -u ETTUN_TEST_PORT_PROBE_ERROR \
+      PATH="$bin:$test_system_path" lsof -nP -iTCP:"$held_port" -Fn 2>&1
+  ) || held_probe_exit=$?
+  _assert_exit "port probe: runs without ETTUN_TEST_PYTHON" 0 \
+    "$held_probe_exit"
+  _assert_contains "port probe: reports an occupied generated port" \
+    "n127.0.0.1:$held_port" "$held_probe_output"
+else
+  _fail "port probe: holder binds a generated port"
+fi
+kill "$held_port_pid" 2>/dev/null || true
+wait "$held_port_pid" 2>/dev/null || true
+
 echo "=== ettun collision handling ==="
 
 ETTUN_TEST_COLLISIONS=2 \
