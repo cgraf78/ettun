@@ -8,6 +8,9 @@ load measurements.
 
 ## Suite scope
 
+- `install-test` covers the generated checkout installer: the direct wrapper
+  and piped curl bootstrap, idempotent reinstall, `BIN_DIR` placement, refusal
+  to replace a non-symlink destination, and a working published command.
 - `ettun-collision-test` covers retry classification, transport failures,
   provider-assigned port palettes, single-invocation adapters, client identity,
   validation, signal forwarding, parent death, and process-tree cleanup.
@@ -44,10 +47,13 @@ split locally:
 
 ```bash
 ETTUN_SKIP_SHELLCHECK=1 test/run
-shellcheck -x -P SCRIPTDIR bin/ettun install.sh test/run test/lib/test.sh \
-  test/ettun-fixture.sh test/ettun-collision-test test/ettun-custom-test \
-  test/ettun-default-test
+awk -F '\t' '$1 == "program" { print $2 }' .github/shellcheck-files.txt |
+  xargs shellcheck -x -P SCRIPTDIR
 ```
+
+Both CI and `test/run` lint the `program` records in
+`.github/shellcheck-files.txt`, so the inventory is the single list of shell
+programs to update when adding one.
 
 Keep fixtures generic and public. Tests should use reserved example names such
 as `gateway.example` and `service.internal`, synthetic tokens, and temporary
