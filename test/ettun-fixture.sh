@@ -108,13 +108,24 @@ _write_stub "$bin/lsof" \
   '  exit $?' \
   'fi' \
   'exit 1'
+# ettun prefers ss and falls back to lsof only when ss fails. A failing ss
+# keeps the lsof-driven fixtures above on that path wherever a real ss would
+# otherwise be visible (Ubuntu installs it in /usr/bin).
+_write_stub "$bin/ss" 'exit 1'
 ss_bin="$tmp/ss-bin"
 mkdir -p "$ss_bin"
 ln -s "$real_bash" "$ss_bin/bash"
 _write_stub "$ss_bin/ss" \
   'if [[ " $* " == *" -atn "* && " $* " == *" sport = :$ETTUN_TEST_SS_LISTENER_PORT "* ]]; then' \
   '  printf "LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\\n" "$ETTUN_TEST_SS_LISTENER_PORT"' \
+  'fi' \
+  'if [[ " $* " != *" exclude time-wait "* && " $* " == *" sport = :$ETTUN_TEST_SS_TIME_WAIT_PORT "* ]]; then' \
+  '  printf "TIME-WAIT 0 0 127.0.0.1:%s 127.0.0.1:40000\\n" "$ETTUN_TEST_SS_TIME_WAIT_PORT"' \
   'fi'
+# A loopback probe stub for ss's empty-answer path.
+nc_bin="$tmp/nc-bin"
+mkdir -p "$nc_bin"
+_write_stub "$nc_bin/nc" 'exit "${ETTUN_TEST_NC_EXIT:-1}"'
 _write_stub "$bin/et" \
   'printf "et\n" >>"$ETTUN_TEST_LOG"' \
   'previous= tunnel_spec=' \

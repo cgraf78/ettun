@@ -58,10 +58,44 @@ ETTUN_TEST_PATH="$ss_bin" \
   ETTUN_TEST_EXIT=23 \
   _run_ettun gateway.example 10454 service.internal 443
 unset ETTUN_TEST_PATH ETTUN_TEST_SS_LISTENER_PORT ETTUN_TEST_EXIT
-_assert_exit "ss fallback listener: rejected" 1 "$run_exit"
-_assert_contains "ss fallback listener: suggests an existing tunnel" \
+_assert_exit "ss listener: rejected" 1 "$run_exit"
+_assert_contains "ss listener: suggests an existing tunnel" \
   "may already be running" "$(cat "$stderr")"
-_assert_file_content "ss fallback listener: rejected before transport" "" "$log"
+_assert_file_content "ss listener: rejected before transport" "" "$log"
+
+# The fixture lsof reports this port free, so only an ss-first check rejects it.
+ETTUN_TEST_PATH="$ss_bin:$bin:$test_system_path" \
+  ETTUN_TEST_SS_LISTENER_PORT=10458 \
+  ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example 10458 service.internal 443
+unset ETTUN_TEST_PATH ETTUN_TEST_SS_LISTENER_PORT ETTUN_TEST_EXIT
+_assert_exit "ss preference: ss listener wins over lsof" 1 "$run_exit"
+_assert_file_content "ss preference: rejected before transport" "" "$log"
+
+ETTUN_TEST_PATH="$ss_bin:$nc_bin:$bin:$test_system_path" \
+  ETTUN_TEST_NC_EXIT=0 \
+  ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example 10459 service.internal 443
+unset ETTUN_TEST_PATH ETTUN_TEST_NC_EXIT ETTUN_TEST_EXIT
+_assert_exit "ss empty answer: hidden loopback listener rejected" 1 "$run_exit"
+_assert_file_content "ss empty answer: hidden listener rejected before transport" \
+  "" "$log"
+
+ETTUN_TEST_PATH="$ss_bin:$nc_bin:$bin:$test_system_path" \
+  ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example 10460 service.internal 443
+unset ETTUN_TEST_PATH ETTUN_TEST_EXIT
+_assert_exit "ss empty answer: free port reaches the transport" 23 "$run_exit"
+
+# A just-stopped tunnel leaves unowned TIME-WAIT sockets on its local port;
+# they must not block restarting it.
+ETTUN_TEST_PATH="$ss_bin:$nc_bin:$bin:$test_system_path" \
+  ETTUN_TEST_SS_TIME_WAIT_PORT=10461 \
+  ETTUN_TEST_EXIT=23 \
+  _run_ettun gateway.example 10461 service.internal 443
+unset ETTUN_TEST_PATH ETTUN_TEST_SS_TIME_WAIT_PORT ETTUN_TEST_EXIT
+_assert_exit "ss TIME-WAIT only: restarted tunnel reaches the transport" 23 \
+  "$run_exit"
 
 _local_port_available() {
   "$test_python" - "$1" <<'PY'
