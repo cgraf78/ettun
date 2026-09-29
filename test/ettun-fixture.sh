@@ -43,6 +43,7 @@ real_mkdir=$(command -v mkdir)
 printf -v real_mkdir_q '%q' "$real_mkdir"
 real_mv=$(command -v mv)
 printf -v real_mv_q '%q' "$real_mv"
+printf -v test_python_q '%q' "$test_python"
 mkdir -p "$bin" "$test_home"
 
 _write_stub() {
@@ -55,6 +56,13 @@ _write_stub() {
   chmod +x "$path"
 }
 
+# Generated control ports (49152+) overlap the kernel's ephemeral range, where
+# any client connection on the host can already own the port a fixture will
+# later bind. The default path therefore performs the same bind the fixtures
+# will, so ettun skips any candidate that bind would reject. Bake in the suite
+# interpreter: most scenarios that launch ettun directly rather than through
+# _run_ettun do not pass ETTUN_TEST_PYTHON, and an empty interpreter name used
+# to report every candidate as free.
 _write_stub "$bin/lsof" \
   'if [[ -n "${ETTUN_TEST_LSOF_ESTABLISHED_PORT:-}" ]]; then' \
   '  for arg in "$@"; do' \
@@ -80,10 +88,11 @@ _write_stub "$bin/lsof" \
   '  fi' \
   '  exit "$ETTUN_TEST_LSOF_EXIT"' \
   'fi' \
+  "test_python=$test_python_q" \
   'probe_port=' \
   'for arg in "$@"; do [[ "$arg" == -iTCP:* ]] && probe_port=${arg#-iTCP:}; done' \
   'if [[ "$probe_port" =~ ^[0-9]+$ ]] && ((probe_port >= 49152)); then' \
-  '  "$ETTUN_TEST_PYTHON" - "$probe_port" <<PY' \
+  '  "${ETTUN_TEST_PYTHON:-$test_python}" - "$probe_port" <<PY' \
   'import errno' \
   'import os' \
   'import socket' \
@@ -97,8 +106,13 @@ _write_stub "$bin/lsof" \
   '    if error.errno == errno.EADDRINUSE:' \
   '        print(f"p1\\nn127.0.0.1:{sys.argv[1]}")' \
   '        sys.exit(0)' \
-  '    with open(os.environ["ETTUN_TEST_PORT_PROBE_ERROR"], "a", encoding="utf-8") as output:' \
-  '        output.write(f"port {sys.argv[1]}: {error}\\n")' \
+  '    message = f"port {sys.argv[1]}: {error}\\n"' \
+  '    error_log = os.environ.get("ETTUN_TEST_PORT_PROBE_ERROR")' \
+  '    if error_log:' \
+  '        with open(error_log, "a", encoding="utf-8") as output:' \
+  '            output.write(message)' \
+  '    else:' \
+  '        sys.stderr.write(message)' \
   '    sys.exit(2)' \
   'finally:' \
   '    if probe is not None:' \
@@ -333,6 +347,10 @@ _write_stub "$bin/tstp-exit-transport" \
   'exit 127'
 _write_stub "$bin/exit-127-transport" \
   'exit 127'
+# Model a control listener that is still starting: bind at once but delay
+# listen(), so control connects are refused for a second. Binding first keeps
+# the chosen port reserved; an unbound delay let a host client connect() claim
+# it as an ephemeral source port and made the later bind fail with EADDRINUSE.
 _write_stub "$bin/delayed-control-transport" \
   'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
   'mapping=$2' \
@@ -340,16 +358,17 @@ _write_stub "$bin/delayed-control-transport" \
   'control_port=${control_mapping%%:*}' \
   'token=${ETTUN_RETRY_MARKER#ETTUN_COLLISION:}' \
   'token=${token%%:*}' \
-  'sleep 1' \
   'python3 - "$control_port" "$ETTUN_TEST_CONTROL_TOKEN" "${ETTUN_TEST_CONTROL_READY:-}" "$token" "${ETTUN_TEST_CONTROL_ATTACHED:-}" "${ETTUN_TEST_CONTROL_EOF:-}" <<PY' \
   'import socket' \
   'import signal' \
   'import sys' \
+  'import time' \
   'signal.signal(signal.SIGINT, lambda _signum, _frame: sys.exit(130))' \
   'signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})' \
   'server = socket.socket()' \
   'server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
   'server.bind(("127.0.0.1", int(sys.argv[1])))' \
+  'time.sleep(1)' \
   'server.listen(1)' \
   'if sys.argv[3]:' \
   '    open(sys.argv[3], "wb").close()' \
