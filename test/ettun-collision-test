@@ -7,6 +7,84 @@
 
 echo "=== test harness safety ==="
 
+# The fixture restores default signal dispositions when a caller started the
+# suite with SIGINT and SIGQUIT ignored (`suite &` in a script); terminal
+# cases depend on it. The re-exec must not leave Python's ignored SIGPIPE.
+signal_dispositions=$("$test_python" -c '
+import signal
+print(signal.getsignal(signal.SIGINT) == signal.SIG_IGN,
+      signal.getsignal(signal.SIGQUIT) == signal.SIG_IGN)
+')
+_assert_eq "signal dispositions: SIGINT and SIGQUIT are not ignored" \
+  "False False" "$signal_dispositions"
+yes 2>/dev/null | head -n 1 >/dev/null
+pipe_status=${PIPESTATUS[0]}
+_assert_eq "signal dispositions: SIGPIPE terminates a writer" 141 "$pipe_status"
+
+# Every time bound in the test tree must come from ETTUN_TEST_WAIT_SECONDS or
+# ETTUN_TEST_TIME_SCALE (see ettun-fixture.sh); a literal deadline is how a
+# contention flake creeps back in. Sub-0.5s poll intervals are not bounds.
+_timing_lint() {
+  "$test_python" - "$1" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+always = [
+    # A literal multiplier of a shared bound (3 * WAIT) is allowed.
+    re.compile(r"monotonic\(\)\s*\+\s*[0-9.]+(?![0-9.]|\s*\*)"),
+    re.compile(r"\btimeout\s*=\s*[0-9.]+(?![0-9.]|\s*\*)"),
+    re.compile(r"\btimeout\s+-?[0-9]"),
+    re.compile(r"\bread\b[^#\n]*\s-t\s*[0-9]"),
+    re.compile(r"\b(reap_child|wait_process_gone)\([^,()]+,\s*[0-9]"),
+    re.compile(r"\bSECONDS\s*\+\s*[0-9]+(?![0-9]|\s*\*)"),
+]
+polls = [
+    re.compile(r"settimeout\(\s*([0-9.]+)\s*\)"),
+    re.compile(r"select\.select\([^)]*,\s*([0-9.]+)\s*\)"),
+    re.compile(r"time\.sleep\(\s*([0-9.]+)\s*\)"),
+]
+for directory, _, names in os.walk(root):
+    for name in sorted(names):
+        path = os.path.join(directory, name)
+        try:
+            with open(path, encoding="utf-8") as source:
+                lines = source.read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for number, line in enumerate(lines, 1):
+            hit = any(pattern.search(line) for pattern in always)
+            for pattern in polls:
+                for match in pattern.finditer(line):
+                    hit = hit or float(match.group(1)) >= 0.5
+            if hit:
+                print(f"{os.path.relpath(path, root)}:{number}: {line.strip()}")
+PY
+}
+timing_lint_sample="$tmp/timing-lint-sample"
+mkdir -p "$timing_lint_sample"
+# Assemble the sample at run time so this source line stays lint-clean.
+printf '%s\n' "deadline = time.monotonic() + $((4 + 4))" \
+  "IFS= read -r -t $((2 + 3)) _" "end=\$((SECONDS + $((2 + 3))))" \
+  "time.sleep($((10 + 20)))" "server.settimeout(0.05)" \
+  "deadline = time.monotonic() + 3 * WAIT" >"$timing_lint_sample/stub"
+_assert_eq "timing lint: flags literal deadlines but not polls or scaled waits" 4 \
+  "$(_timing_lint "$timing_lint_sample" | wc -l | tr -d ' ')"
+_assert_eq "timing lint: no literal deadline outside the shared bounds" "" \
+  "$(_timing_lint "$ETTUN_TEST_ROOT/test")"
+
+# The suite-end leak check must recognize this suite's workers by argv.
+# The trailing ':' stops Bash from exec'ing sleep and dropping this argv.
+bash -c 'sleep 30; :' --ettun-transport-worker "$tmp/fake-runtime" &
+fake_worker_pid=$!
+_assert_contains "suite cleanup: recognizes a surviving worker of this suite" \
+  "$fake_worker_pid" "$(_leaked_workers)"
+kill -KILL "$fake_worker_pid" 2>/dev/null || true
+wait "$fake_worker_pid" 2>/dev/null || true
+_assert_not_contains "suite cleanup: forgets a reaped worker" \
+  "$fake_worker_pid" "$(_leaked_workers)"
+
 tmpdir_failure_exit=0
 tmpdir_failure_output=$(
   # _tmpdir resolves this subshell-local fault injector by command name;
@@ -39,6 +117,7 @@ _assert_contains "temporary directory: out-of-root result is actionable" \
 # fails with EADDRINUSE.
 held_port_file="$tmp/held-port"
 "$test_python" - "$held_port_file" <<'PY' &
+import os
 import random
 import socket
 import sys
@@ -57,7 +136,8 @@ else:
 holder.listen(1)
 with open(sys.argv[1], "w", encoding="utf-8") as output:
     output.write(f"{port}\n")
-time.sleep(30)
+# Killed below; the backstop only bounds an aborted run.
+time.sleep(3 * float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
 PY
 held_port_pid=$!
 if _wait_for_file "$held_port_file"; then
@@ -185,7 +265,8 @@ _wait_for_file "$signal_child_pid_file" || _fail "signal handling: adapter child
 read -r signal_transport_pid <"$signal_transport_pid_file"
 read -r signal_child_pid <"$signal_child_pid_file"
 signal_runtime_dir=""
-for _ in {1..50}; do
+wait_deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+while ((SECONDS < wait_deadline)); do
   for candidate in "$signal_runtime_root"/ettun.*; do
     if [[ -d "$candidate" ]]; then
       signal_runtime_dir="$candidate"
@@ -204,7 +285,8 @@ else
   _fail "signal handling: creates private runtime state"
 fi
 kill -TERM "$signal_tunnel_pid"
-for _ in {1..50}; do
+wait_deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+while ((SECONDS < wait_deadline)); do
   signal_state=$(ps -o stat= -p "$signal_tunnel_pid" 2>/dev/null || true)
   [[ -z "$signal_state" || "$signal_state" == *Z* ]] && break
   sleep 0.1
@@ -245,7 +327,8 @@ kill -KILL "$sigkill_tunnel_pid"
 sigkill_exit=0
 wait "$sigkill_tunnel_pid" 2>/dev/null || sigkill_exit=$?
 _assert_exit "parent death: launcher reports SIGKILL" 137 "$sigkill_exit"
-for _ in {1..50}; do
+wait_deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+while ((SECONDS < wait_deadline)); do
   sigkill_transport_state=$(ps -o stat= -p "$sigkill_transport_pid" 2>/dev/null || true)
   sigkill_child_state=$(ps -o stat= -p "$sigkill_child_pid" 2>/dev/null || true)
   if [[ -z "$sigkill_transport_state" || "$sigkill_transport_state" == *Z* ]] &&
@@ -376,7 +459,7 @@ group_ready, exec_gate = sys.argv[1:3]
 bash, *command = sys.argv[3:]
 with open(group_ready, "w", encoding="utf-8") as output:
     output.write(f"{os.getpgrp()}\n")
-deadline = time.monotonic() + 8
+deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 while not os.path.exists(exec_gate):
     if time.monotonic() >= deadline:
         raise TimeoutError("terminal-interrupt exec gate was not released")
@@ -498,14 +581,14 @@ if child == 0:
     )
 
 status = None
-ready_deadline = time.monotonic() + 5
+ready_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 while not os.path.exists(ready_file) and time.monotonic() < ready_deadline:
     time.sleep(0.01)
 
 progress = False
 if os.path.exists(ready_file):
     os.killpg(child, signal.SIGTSTP)
-    progress_deadline = time.monotonic() + 5
+    progress_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while time.monotonic() < progress_deadline:
         try:
             progress = os.path.getsize(transport_log) > 0
@@ -516,7 +599,7 @@ if os.path.exists(ready_file):
         time.sleep(0.01)
 
 if progress:
-    exit_deadline = time.monotonic() + 5
+    exit_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while time.monotonic() < exit_deadline:
         waited, candidate = os.waitpid(child, os.WNOHANG)
         if waited:
@@ -530,7 +613,7 @@ if status is None:
         os.killpg(child, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    exit_deadline = time.monotonic() + 2
+    exit_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while time.monotonic() < exit_deadline:
         try:
             waited, candidate = os.waitpid(child, os.WNOHANG)
@@ -687,7 +770,8 @@ fi
 _run_identity_candidate second 10462 &
 identity_second_pid=$!
 identity_lock_observed=0
-for _ in {1..80}; do
+wait_deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+while ((SECONDS < wait_deadline)); do
   identity_lock_count=$(wc -l <"$identity_lock_attempts")
   if ((identity_lock_count >= 2)); then
     identity_lock_observed=1
@@ -803,4 +887,5 @@ _assert_contains "transport string: is never shell-evaluated" \
   "transport 'test-transport --unsafe' was not found" "$(cat "$stderr")"
 _assert_file_content "transport string: launches no command" "" "$log"
 
+_assert_no_leaked_workers
 _test_summary

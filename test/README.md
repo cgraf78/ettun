@@ -21,10 +21,24 @@ load measurements.
 - `ettun-default-test` characterizes the ET argv contract, generated bootstrap
   and remote supervisor, private remote state, authenticated attachment and
   stop flows, stale-owner recovery, local/reverse relay cleanup, fixed reverse
-  listener failures, coordinated local/remote port separation, and local port
-  probing.
+  listener failures, coordinated local/remote port separation, local port
+  probing, and recovery when a local port is lost before the transport binds
+  it. Its bind-probe cases use real loopback listeners and TIME-WAIT sockets
+  and compare ettun's answer with an actual bind on the host. They run once
+  with perl when it is installed and once on a PATH that mirrors the system
+  directories without perl, so the python3 fallback is covered wherever
+  ettun uses it (everywhere but macOS).
+  Cases that run real listeners on generated ports retry with a fresh launch
+  when the supervisor's own collision marker shows host traffic took a port,
+  and the losing-transport cases retry with fresh ports when the stub reports
+  that host traffic already held a port the scenario needed.
 - `ettun-fixture.sh` creates isolated command stubs and shared transport
   fixtures. It is sourced by the suites and is not an independent entrypoint.
+  Its `perl` stub keeps most cases on the stubbed socket-table checks so
+  fixed fixture ports do not depend on the host's real sockets. When a
+  caller starts a suite with SIGINT and SIGQUIT ignored, as a script's
+  `suite &` does, the fixture re-executes it with default dispositions so
+  the terminal Ctrl-C cases stay meaningful.
 - `lib/test.sh` owns the small assertion vocabulary and a guarded per-suite
   temporary root.
 
@@ -39,6 +53,20 @@ Run everything with:
 ```bash
 test/run
 ```
+
+Every time bound in the suites derives from `ETTUN_TEST_WAIT_SECONDS`, the
+shared bound for "wait until it happens" polls (20 seconds), or from
+`ETTUN_TEST_TIME_SCALE`, a positive integer that multiplies every bound,
+including that shared one. On a slow or heavily loaded host, raise it:
+
+```bash
+ETTUN_TEST_TIME_SCALE=3 test/run
+```
+
+A static check in `ettun-collision-test` fails on literal deadlines in the
+test tree (`monotonic() + N`, `timeout=N`, `read -t N`, `SECONDS + N`, and
+sleeps or socket timeouts of half a second or more), so new waits must use
+those values too.
 
 Local runs invoke ShellCheck when it is installed. Shared CI sets
 `ETTUN_SKIP_SHELLCHECK=1` for the behavioral matrix because its separate
