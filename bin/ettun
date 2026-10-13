@@ -336,8 +336,7 @@ port_has_owner() {
     # With netlink denied (Android), ss falls back to /proc/net and can exit 0
     # with a restricted view, so an empty answer is not proof. A bounded
     # loopback probe still catches a listener ss could not see.
-    command -v nc >/dev/null 2>&1 &&
-      nc -z -w 1 127.0.0.1 "$port" >/dev/null 2>&1
+    port_accepts "$port"
     return
   fi
 
@@ -361,12 +360,52 @@ port_has_owner() {
   return 1
 }
 
+# Report whether a loopback connect to the port is accepted: 0 yes, 1
+# refused (perl only; nc cannot tell refusal from other failures), 2 unknown
+# (no tool, or no answer within the bound). The bound must
+# not depend on nc's -w: macOS nc applies it only to idle time, so a dropped
+# SYN (a full accept queue, or a socket bound without listening) stalled for
+# the system connect timeout, over a minute. Perl's IO::Socket::INET bounds
+# the connect itself; macOS nc needs -G for that.
+port_accepts() {
+  local port="$1" probe_status=0 nc_help
+
+  if command -v perl >/dev/null 2>&1; then
+    perl -MIO::Socket::INET -e '
+      my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1",
+        PeerPort => $ARGV[0], Proto => "tcp", Timeout => 1);
+      exit 0 if $s;
+      exit 4 if $!{ETIMEDOUT};
+      exit($!{ECONNREFUSED} ? 3 : 2);
+    ' "$port" </dev/null >/dev/null 2>&1 || probe_status=$?
+    # A timeout is the answer: nc would only wait another second on the same
+    # kernel. Anything else (a broken perl, a missing module) falls to nc.
+    case $probe_status in
+      0) return 0 ;;
+      3) return 1 ;;
+      4) return 2 ;;
+    esac
+  fi
+  command -v nc >/dev/null 2>&1 || return 2
+  probe_status=0
+  nc_help=$(nc -h </dev/null 2>&1)
+  if [[ $nc_help == *conntimeout* ]]; then
+    nc -z -G 1 -w 1 127.0.0.1 "$port" </dev/null >/dev/null 2>&1 ||
+      probe_status=$?
+  else
+    nc -z -w 1 127.0.0.1 "$port" </dev/null >/dev/null 2>&1 || probe_status=$?
+  fi
+  # nc reports refused, timed out, and unsupported flags alike as failure.
+  ((probe_status == 0)) && return 0
+  return 2
+}
+
 # Report whether a listener owns the port: 0 yes, 1 no, 2 unknown. A port
 # lost to a listener after a transport failed is more likely a forward the
 # transport left behind, such as one held by an SSH ControlMaster, than the
 # probe-to-bind race a retry exists for.
 port_has_listener() {
-  local port="$1" listeners endpoint nc_status
+  local port="$1" listeners endpoint
 
   if command -v ss >/dev/null 2>&1 &&
     listeners=$(LC_ALL=C ss -H -ltn "sport = :$port" 2>/dev/null) &&
@@ -380,16 +419,9 @@ port_has_listener() {
   fi
   # Non-root lsof and a restricted ss cannot show another user's listener,
   # which still refuses the bind. A bounded loopback connect finds it; only
-  # a successful connect counts as proof.
-  if command -v nc >/dev/null 2>&1; then
-    nc_status=0
-    nc -z -w 1 127.0.0.1 "$port" </dev/null >/dev/null 2>&1 || nc_status=$?
-    case $nc_status in
-      0) return 0 ;;
-      1) return 1 ;;
-    esac
-  fi
-  return 2
+  # a successful connect counts as proof, so a listener whose accept queue is
+  # full stays unknown (a documented limitation).
+  port_accepts "$port"
 }
 
 # A port is in use when a process owns a socket on it or the transport's bind

@@ -100,8 +100,10 @@ The client needs:
   Linux TIME-WAIT left by an outgoing connection; socket tables list TIME-WAIT
   but cannot show whether it blocks a listener. A requested local port that
   refuses the bind while no visible process owns it and nothing accepts on it
-  (checked with `nc -z` when available) fails with status 75 and a hint to
-  retry shortly.
+  (checked with a one-second loopback connect through perl or `nc`, when
+  either is available) fails with status 75 and a hint to retry shortly. A
+  listener whose accept queue is full drops that connect too, so it also
+  gets status 75: a known limitation.
 
 The `VIA` host needs `/bin/sh`, `etserver`, `flock`, `base64`, `gzip`, a
 SHA-256 implementation, and either `socat` or Nmap's `ncat`. `socat` is

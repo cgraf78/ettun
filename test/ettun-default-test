@@ -368,7 +368,8 @@ _bind_probe_cases() {
   local probe_path="$2" label="bind probe [$1]"
   local held_port_file held_port_pid held_port time_wait_port time_wait_bind
   local time_wait_expected free_port probe_slot first_control make_status
-  local hidden_expected
+  local hidden_expected full_queue_file full_queue_pid full_queue_port
+  local full_queue_ready full_queue_start full_queue_elapsed
   local probe_mapping probe_control lost_control lost_mappings
   local lost_retry_mapping
 
@@ -385,9 +386,9 @@ import time
 holder = socket.socket()
 holder.bind(("127.0.0.1", 0))
 # This holder never accepts, so every completed connection stays queued.
-# The case connects once to set its expectation and ettun connects again.
+# The case may connect once to set its expectation and ettun connects again.
 # On macOS a backlog of one was already full after the first, so ettun's
-# `nc -z` timed out and saw no listener; Linux admits one extra connection.
+# connect check saw no listener; Linux admits one extra connection.
 holder.listen(16)
 with open(sys.argv[1], "w", encoding="utf-8") as output:
     output.write(f"{holder.getsockname()[1]}\n")
@@ -400,11 +401,12 @@ PY
     # With the socket tables blind to it (as for another user's socket under
     # non-root lsof), the refused bind still stops the launch, and a
     # connection check identifies a lasting listener rather than a closing
-    # connection. Without a working `nc -z` only the temporary-failure
-    # answer is possible.
+    # connection. ettun connects with perl when it has it, else with nc;
+    # without either only the temporary-failure answer is possible.
     hidden_expected=75
-    if PATH="$probe_path" nc -z -w "$ETTUN_TEST_TIME_SCALE" 127.0.0.1 "$held_port" \
-      </dev/null >/dev/null 2>&1; then
+    if PATH="$probe_path" perl -MIO::Socket::INET -e 1 >/dev/null 2>&1 ||
+      PATH="$probe_path" nc -z -w "$ETTUN_TEST_TIME_SCALE" 127.0.0.1 "$held_port" \
+        </dev/null >/dev/null 2>&1; then
       hidden_expected=1
     fi
     ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
@@ -426,6 +428,69 @@ PY
   fi
   kill "$held_port_pid" 2>/dev/null || true
   wait "$held_port_pid" 2>/dev/null || true
+
+  # A listener whose accept queue is full drops new SYNs. ettun cannot tell
+  # it from a closing connection (a documented limitation, exit 75), but it
+  # must decide within its one-second connect bounds; macOS nc's -w once let
+  # this stall for over a minute.
+  full_queue_file="$tmp/probe-full-queue"
+  rm -f "$full_queue_file"
+  "$test_python" - "$full_queue_file" <<'PY' &
+import os
+import socket
+import sys
+import time
+
+scale = float(os.environ.get("ETTUN_TEST_TIME_SCALE", "1"))
+wait = float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
+holder = socket.socket()
+holder.bind(("127.0.0.1", 0))
+holder.listen(1)
+port = holder.getsockname()[1]
+clients = []
+full = 0
+for _ in range(16):
+    client = socket.socket()
+    client.settimeout(scale)
+    try:
+        client.connect(("127.0.0.1", port))
+    except socket.timeout:
+        # Dropped, not refused: the queue is full, the case under test.
+        client.close()
+        full = 1
+        break
+    except OSError:
+        client.close()
+        break
+    clients.append(client)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(f"{port} {full}\n")
+# Killed by the case; the backstop only bounds an aborted run.
+time.sleep(3 * wait)
+PY
+  full_queue_pid=$!
+  if _wait_for_file "$full_queue_file"; then
+    read -r full_queue_port full_queue_ready <"$full_queue_file"
+    if ((full_queue_ready == 1)); then
+      full_queue_start=$SECONDS
+      ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
+        _run_ettun gateway.example "$full_queue_port" service.internal 443
+      full_queue_elapsed=$((SECONDS - full_queue_start))
+      _assert_exit "$label: full-queue listener is a documented temporary failure" \
+        75 "$run_exit"
+      if ((full_queue_elapsed < WAIT_DEADLINE_SECONDS)); then
+        _pass "$label: full-queue listener check is bounded"
+      else
+        _fail "$label: full-queue listener check is bounded (took ${full_queue_elapsed}s)"
+      fi
+    else
+      printf '  SKIP: %s: could not fill a loopback accept queue\n' "$label"
+    fi
+  else
+    _fail "$label: holder fills a loopback accept queue"
+  fi
+  kill "$full_queue_pid" 2>/dev/null || true
+  wait "$full_queue_pid" 2>/dev/null || true
 
   # Linux rejects a SO_REUSEADDR bind over an outgoing TIME-WAIT that did not
   # set SO_REUSEADDR; BSD and macOS allow it. Compare with a real bind so the

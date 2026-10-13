@@ -368,12 +368,16 @@ def kill_session(session):
 
 def transport_worker_state():
     for entry in os.listdir(runtime_root):
+        if not entry.startswith("ettun."):
+            continue
         run_dir = os.path.join(runtime_root, entry)
         pid_path = os.path.join(run_dir, "transport.pid")
         try:
             with open(pid_path, "r", encoding="utf-8") as pid_input:
                 worker_pid = int(pid_input.read().strip())
-        except (FileNotFoundError, ValueError):
+        except (OSError, ValueError):
+            # TMPDIR is this root, so Bash's here-document temp files
+            # (sh-thd.*) can appear beside the run directories.
             pass
         else:
             return worker_pid, os.path.exists(os.path.join(run_dir, "transport.ready"))
