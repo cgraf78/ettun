@@ -101,7 +101,36 @@ real_mkdir=$(command -v mkdir)
 printf -v real_mkdir_q '%q' "$real_mkdir"
 real_mv=$(command -v mv)
 printf -v real_mv_q '%q' "$real_mv"
+real_sleep=$(command -v sleep)
+printf -v real_sleep_q '%q' "$real_sleep"
 printf -v test_python_q '%q' "$test_python"
+# Stubs publish pid, state, and result files that harnesses read while the stub
+# is still running. A plain redirection creates the file empty before it is
+# written, so a reader that polls for existence could see it torn. Stubs embed
+# this function to write a same-directory temporary file and rename it into
+# place, using the real mv because some suites shadow mv in $bin. Each content
+# argument becomes one line. Call it from the stub's own shell, not from a
+# background subshell, because $$ names the temporary file.
+# ETTUN_TEST_PUBLISH_DELAY pauses between creating the temporary file and
+# writing it, so an in-place regression inside this function fails visibly.
+publish_file_function=$(
+  cat <<EOF
+publish_file() {
+  local publish_target="\${1:-}" publish_tmp
+  # Like the redirection this replaces, an unset path fails just this write.
+  if [[ -z "\$publish_target" ]]; then
+    printf 'publish_file: missing path\\n' >&2
+    return 1
+  fi
+  shift
+  publish_tmp="\$publish_target.tmp.\$\$"
+  {
+    [[ -z "\${ETTUN_TEST_PUBLISH_DELAY:-}" ]] || $real_sleep_q "\$ETTUN_TEST_PUBLISH_DELAY"
+    printf '%s\\n' "\$@"
+  } >"\$publish_tmp" && $real_mv_q -f "\$publish_tmp" "\$publish_target"
+}
+EOF
+)
 mkdir -p "$bin" "$test_home"
 # ettun prefers local control ports of the parity Linux connect() avoids: the
 # opposite of ip_local_port_range's start, or odd where that is unknown.
@@ -431,6 +460,7 @@ printf -v losing_helper_q '%q' "$losing_helper"
 # Role "early-close" accepts ettun's first control connection on a listener
 # without SO_REUSEADDR, closes it first, and fails.
 _write_stub "$bin/losing-transport" \
+  "$publish_file_function" \
   "losing_helper=$losing_helper_q" \
   'printf "losing\n" >>"$ETTUN_TEST_LOG"' \
   'printf "<%s>\n" "$2" >>"$ETTUN_TEST_LOG"' \
@@ -463,8 +493,7 @@ _write_stub "$bin/losing-transport" \
   '      [[ $ETTUN_TEST_OCCUPY_ROLE != early-close ]] || exit 1' \
   '      ;;' \
   '  esac' \
-  '  printf "%s\n" "$port" >"$ETTUN_TEST_OCCUPY_REQUEST.tmp"' \
-  '  mv "$ETTUN_TEST_OCCUPY_REQUEST.tmp" "$ETTUN_TEST_OCCUPY_REQUEST"' \
+  '  publish_file "$ETTUN_TEST_OCCUPY_REQUEST" "$port"' \
   '  [[ $ETTUN_TEST_OCCUPY_ROLE != linger ]] || exit 1' \
   '  # Wait as long as the occupier waits for this request.' \
   '  ack_wait=$((SECONDS + 3 * ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
@@ -485,13 +514,15 @@ _write_stub "$bin/losing-transport" \
   'fi' \
   'exit "${ETTUN_TEST_EXIT:-0}"'
 _write_stub "$bin/blocking-transport" \
-  'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
+  "$publish_file_function" \
+  'publish_file "$ETTUN_TEST_TRANSPORT_PID" "$$"' \
   'sleep 300 &' \
   'child=$!' \
-  'printf "%s\n" "$child" >"$ETTUN_TEST_TRANSPORT_CHILD_PID"' \
+  'publish_file "$ETTUN_TEST_TRANSPORT_CHILD_PID" "$child"' \
   'wait "$child"'
 _write_stub "$bin/interactive-transport" \
-  'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
+  "$publish_file_function" \
+  'publish_file "$ETTUN_TEST_TRANSPORT_PID" "$$"' \
   'trap "" INT' \
   '[[ -z "${ETTUN_TEST_TRANSPORT_COUNT:-}" ]] || printf "1\n" >>"$ETTUN_TEST_TRANSPORT_COUNT"' \
   'if [[ -n "${ETTUN_TEST_RESUME_MARKER:-}" ]]; then' \
@@ -509,7 +540,7 @@ _write_stub "$bin/interactive-transport" \
   '    signal.pause()' \
   'PY' \
   '  resume_observer=$!' \
-  '  printf "%s\n" "$resume_observer" >"$resume_pid_file"' \
+  '  publish_file "$resume_pid_file" "$resume_observer"' \
   '  # Stay alive to avoid SIGCHLD during read; group cleanup is asserted by the test.' \
   '  resume_wait=$((SECONDS + ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
   '  while [[ ! -e "$resume_ready" ]] && ((SECONDS < resume_wait)); do sleep 0.1; done' \
@@ -519,20 +550,22 @@ _write_stub "$bin/interactive-transport" \
   '    exit 1' \
   '  fi' \
   'fi' \
-  'ps -o pid=,pgid=,tpgid=,stat= -p "$$" >"$ETTUN_TEST_AUTH_STATE"' \
+  '[[ -z "${ETTUN_TEST_AUTH_STATE:-}" ]] ||' \
+  '  publish_file "$ETTUN_TEST_AUTH_STATE" "$(ps -o pid=,pgid=,tpgid=,stat= -p "$$")"' \
   'printf "Passcode: "' \
   'IFS= read -r answer' \
-  'printf "%s\n" "$answer" >"$ETTUN_TEST_AUTH_RESULT"' \
+  'publish_file "$ETTUN_TEST_AUTH_RESULT" "$answer"' \
   'exec sleep 300'
 _write_stub "$bin/interactive-attached-transport" \
-  'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
+  "$publish_file_function" \
+  'publish_file "$ETTUN_TEST_TRANSPORT_PID" "$$"' \
   'printf "Passcode: "' \
   'if [[ -n "${ETTUN_TEST_PREAUTH_STOPPED:-}" ]]; then' \
   '  : >"$ETTUN_TEST_PREAUTH_STOPPED"' \
   '  kill -TTIN 0' \
   'fi' \
   'IFS= read -r answer' \
-  'printf "%s\n" "$answer" >"$ETTUN_TEST_AUTH_RESULT"' \
+  'publish_file "$ETTUN_TEST_AUTH_RESULT" "$answer"' \
   'mapping=$2' \
   'control_mapping=${mapping#*,}' \
   'control_port=${control_mapping%%:*}' \
@@ -623,7 +656,8 @@ _write_stub "$bin/tstp-exit-transport" \
 _write_stub "$bin/exit-127-transport" \
   'exit 127'
 _write_stub "$bin/delayed-control-transport" \
-  'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
+  "$publish_file_function" \
+  'publish_file "$ETTUN_TEST_TRANSPORT_PID" "$$"' \
   'mapping=$2' \
   'control_mapping=${mapping#*,}' \
   'control_port=${control_mapping%%:*}' \
@@ -696,7 +730,8 @@ _write_stub "$bin/delayed-control-transport" \
   'server.close()' \
   'PY'
 _write_stub "$bin/dropping-control-transport" \
-  'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
+  "$publish_file_function" \
+  'publish_file "$ETTUN_TEST_TRANSPORT_PID" "$$"' \
   'mapping=$2' \
   'control_mapping=${mapping#*,}' \
   'control_port=${control_mapping%%:*}' \
@@ -802,10 +837,15 @@ _run_ettun() {
   fi
 }
 
+# Wait for a complete record: every fixture record ends in a newline, and a
+# writer that does not publish atomically can leave a non-empty partial file.
 _wait_for_file() {
-  local path="$1" deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  local path="$1" deadline=$((SECONDS + WAIT_DEADLINE_SECONDS)) last
   while :; do
-    [[ -s "$path" ]] && return
+    if [[ -s "$path" ]] && last=$(tail -c 1 "$path" 2>/dev/null) &&
+      [[ -z "$last" ]]; then
+      return
+    fi
     ((SECONDS < deadline)) || return 1
     sleep 0.1
   done
