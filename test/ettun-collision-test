@@ -40,6 +40,38 @@ always = [
     re.compile(r"\b(reap_child|wait_process_gone)\([^,()]+,\s*[0-9]"),
     re.compile(r"\bSECONDS\s*\+\s*[0-9]+(?![0-9]|\s*\*)"),
 ]
+# A counted poll is a literal deadline in disguise: its bound is the count
+# times the sleep in its body. Shell loops end at "done"; Python loops end
+# where indentation returns, counting a stub line's leading quote as indent.
+shell_counted = [
+    re.compile(r"\bwhile\b.*\(\(\s*\w+\s*<=?\s*[0-9]+\s*\)\)"),
+    re.compile(r"\bfor\s+\w+\s+in\s+\{[0-9]+\.\.[0-9]+\}"),
+]
+shell_done = re.compile(r"(^|[\s;'])done\b")
+python_counted = re.compile(r"\bfor\s+\w+\s+in\s+range\(\s*[0-9]+\s*\)")
+sleeps = re.compile(r"(^|[^\w.])sleep\s+[0-9]|time\.sleep\(")
+
+
+def indent(text):
+    return len(re.match(r"\s*'?\s*", text).group(0))
+
+
+def loop_body(lines, index):
+    line = lines[index]
+    body = [line]
+    if python_counted.search(line):
+        for text in lines[index + 1 : index + 9]:
+            if not text.strip(" '\\") or indent(text) <= indent(line):
+                break
+            body.append(text)
+    elif not shell_done.search(line):
+        for text in lines[index + 1 : index + 9]:
+            body.append(text)
+            if shell_done.search(text):
+                break
+    return body
+
+
 polls = [
     re.compile(r"settimeout\(\s*([0-9.]+)\s*\)"),
     re.compile(r"select\.select\([^)]*,\s*([0-9.]+)\s*\)"),
@@ -55,6 +87,11 @@ for directory, _, names in os.walk(root):
             continue
         for number, line in enumerate(lines, 1):
             hit = any(pattern.search(line) for pattern in always)
+            if python_counted.search(line) or any(
+                pattern.search(line) for pattern in shell_counted
+            ):
+                body = loop_body(lines, number - 1)
+                hit = hit or any(sleeps.search(text) for text in body)
             for pattern in polls:
                 for match in pattern.finditer(line):
                     hit = hit or float(match.group(1)) >= 0.5
@@ -68,9 +105,19 @@ mkdir -p "$timing_lint_sample"
 printf '%s\n' "deadline = time.monotonic() + $((4 + 4))" \
   "IFS= read -r -t $((2 + 3)) _" "end=\$((SECONDS + $((2 + 3))))" \
   "time.sleep($((10 + 20)))" "server.settimeout(0.05)" \
-  "deadline = time.monotonic() + 3 * WAIT" >"$timing_lint_sample/stub"
-_assert_eq "timing lint: flags literal deadlines but not polls or scaled waits" 4 \
-  "$(_timing_lint "$timing_lint_sample" | wc -l | tr -d ' ')"
+  "deadline = time.monotonic() + 3 * WAIT" \
+  "while ((tries < $((2 + 3)))); do retry; done" \
+  "while [[ ! -e ready ]] && ((waited < $((300 + 300)))); do" "  sleep 0.05" \
+  "done" "for _ in range($((25 + 25))):" "    time.sleep(0.1)" \
+  "for _ in range($((25 + 25))):" "    poll()" "time.sleep(0.1)" \
+  "while ((tries < $((2 + 3)))); do" "  retry" "done" "sleep 0.1" \
+  "for _ in {1..$((25 + 25))}; do [[ -e ready ]] && break; sleep 0.1; done" \
+  >"$timing_lint_sample/stub"
+# Compare flagged line numbers, not a count, so a counted poll's body is
+# proven to end at "done" or a dedent rather than at a later sample's sleep.
+_assert_eq "timing lint: flags literal deadlines but not polls or scaled waits" \
+  "1 2 3 4 8 11 20" \
+  "$(_timing_lint "$timing_lint_sample" | sed 's/^stub:\([0-9]*\):.*/\1/' | tr '\n' ' ' | sed 's/ $//')"
 _assert_eq "timing lint: no literal deadline outside the shared bounds" "" \
   "$(_timing_lint "$ETTUN_TEST_ROOT/test")"
 
