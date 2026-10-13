@@ -187,7 +187,7 @@ completed = subprocess.run(
     ],
     check=False,
     start_new_session=True,
-    timeout=10,
+    timeout=float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")),
 )
 raise SystemExit(completed.returncode)
 PY
@@ -239,7 +239,7 @@ worker = subprocess.Popen(
     ],
     start_new_session=True,
 )
-deadline = time.monotonic() + 5
+deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 while not os.path.exists(marker) and time.monotonic() < deadline:
     time.sleep(0.01)
 marker_seen = os.path.exists(marker)
@@ -247,10 +247,10 @@ time.sleep(0.1)
 returned_before_release = worker.poll() is not None
 open(release, "wb").close()
 try:
-    returncode = worker.wait(timeout=5)
+    returncode = worker.wait(timeout=float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
 except subprocess.TimeoutExpired:
     os.killpg(worker.pid, signal.SIGKILL)
-    returncode = worker.wait(timeout=1)
+    returncode = worker.wait(timeout=float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
 
 publisher_gone = False
 try:
@@ -259,7 +259,7 @@ try:
 except (FileNotFoundError, ValueError):
     publisher_pid = None
 if publisher_pid is not None:
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while time.monotonic() < deadline:
         try:
             os.kill(publisher_pid, 0)
@@ -317,7 +317,7 @@ _write_stub "$gate_bash_env" \
   '      case "$ETTUN_TEST_WORKER_START_MODE" in' \
   '        block)' \
   '          : >"$ETTUN_TEST_WORKER_BLOCKED"' \
-  '          IFS= read -r _ <"$ETTUN_TEST_WORKER_GATE"' \
+  '          IFS= read -r -t $((${ETTUN_TEST_WAIT_SECONDS:-20} * 3 / 2)) _ <>"$ETTUN_TEST_WORKER_GATE" || exit 1' \
   '          ;;' \
   '        exit) exit 42 ;;' \
   '      esac' \
@@ -342,20 +342,42 @@ import os
 import pty
 import select
 import signal
+import subprocess
 import sys
 import termios
 import time
 
 bash, script, runtime_root, adapter_pid_file, results_file = sys.argv[1:]
 
+def kill_session(session):
+    """SIGKILL everything left in a case's session.
+
+    The launcher is the session leader, but its worker leads its own process
+    group in the same session, so killing the launcher's group can miss it.
+    """
+    listing = subprocess.run(
+        ["ps", "-axo", "pid="], check=False, capture_output=True, text=True
+    ).stdout.split()
+    for text in listing:
+        try:
+            pid = int(text)
+            if pid != os.getpid() and os.getsid(pid) == session:
+                os.kill(pid, signal.SIGKILL)
+        except (ValueError, OSError):
+            pass
+
 def transport_worker_state():
     for entry in os.listdir(runtime_root):
+        if not entry.startswith("ettun."):
+            continue
         run_dir = os.path.join(runtime_root, entry)
         pid_path = os.path.join(run_dir, "transport.pid")
         try:
             with open(pid_path, "r", encoding="utf-8") as pid_input:
                 worker_pid = int(pid_input.read().strip())
-        except (FileNotFoundError, ValueError):
+        except (OSError, ValueError):
+            # TMPDIR is this root, so Bash's here-document temp files
+            # (sh-thd.*) can appear beside the run directories.
             pass
         else:
             return worker_pid, os.path.exists(os.path.join(run_dir, "transport.ready"))
@@ -408,7 +430,7 @@ def run_case(port, cancel=False, startup_mode=""):
             # test bound so it cannot replace the cancellation outcome.
             environment.update(
                 {
-                    "ETTUN_TEST_GATE_TIMEOUT": "30",
+                    "ETTUN_TEST_GATE_TIMEOUT": str(int(1.5 * float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))),
                     "ETTUN_TEST_PROBE_HELD": probe_held,
                     "ETTUN_TEST_PROBE_RELEASE": probe_release,
                 }
@@ -430,7 +452,9 @@ def run_case(port, cancel=False, startup_mode=""):
     launcher_foreground = False
     worker_foreground = False
     worker_pid = None
-    deadline = time.monotonic() + (5 if startup_mode else 20)
+    # Stays below the cancel case's worker gate (ETTUN_TEST_GATE_TIMEOUT,
+    # one and a half shared bounds).
+    deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     try:
         while time.monotonic() < deadline:
             readable, _, _ = select.select([master], [], [], 0.05)
@@ -486,13 +510,14 @@ def run_case(port, cancel=False, startup_mode=""):
                 os.killpg(child, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            reaped, status = reap_child(child, 1)
+            reaped, status = reap_child(child, float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
             if not reaped:
                 try:
                     os.kill(child, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                reaped, status = reap_child(child, 1)
+                reaped, status = reap_child(child, float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
+        kill_session(child)
         os.close(master)
 
     exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
@@ -674,7 +699,7 @@ launcher_reaped = False
 status = None
 transport_pid = None
 observer_pid = None
-prompt_deadline = time.monotonic() + 20
+prompt_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 try:
     while time.monotonic() < prompt_deadline:
         readable, _, _ = select.select([master], [], [], 0.1)
@@ -686,7 +711,7 @@ try:
             os.write(master, b"\x1a")
             suspend_sent = True
             break
-    suspend_deadline = time.monotonic() + 20
+    suspend_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while suspend_sent and time.monotonic() < suspend_deadline:
         readable, _, _ = select.select([master], [], [], 0.1)
         if readable:
@@ -696,7 +721,7 @@ try:
         if b"^Z" in output:
             suspend_observed = True
             break
-    resume_deadline = time.monotonic() + 20
+    resume_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while suspend_observed and time.monotonic() < resume_deadline:
         readable, _, _ = select.select([master], [], [], 0.1)
         if readable:
@@ -729,7 +754,7 @@ try:
         # resumed its process group so the terminal cannot flush this input.
         os.write(master, b"test-passcode\n")
         sent = True
-    auth_deadline = time.monotonic() + 20
+    auth_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while sent and time.monotonic() < auth_deadline:
         readable, _, _ = select.select([master], [], [], 0.1)
         if readable:
@@ -750,7 +775,7 @@ try:
             break
     if authenticated:
         os.write(master, b"\x03")
-        cancel_deadline = time.monotonic() + 20
+        cancel_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
         while time.monotonic() < cancel_deadline:
             # Keep draining the PTY while Bash fg restores terminal attributes.
             # macOS uses a drain-waiting tcsetattr path here; if the test stops
@@ -778,9 +803,9 @@ try:
     except (FileNotFoundError, ValueError):
         pass
     if launcher_reaped and transport_pid is not None:
-        adapter_gone_before_cleanup = wait_process_gone(transport_pid, 5)
+        adapter_gone_before_cleanup = wait_process_gone(transport_pid, float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
     if launcher_reaped and observer_pid is not None:
-        observer_gone_before_cleanup = wait_process_gone(observer_pid, 5)
+        observer_gone_before_cleanup = wait_process_gone(observer_pid, float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
 finally:
     if not adapter_gone_before_cleanup and transport_pid is not None:
         try:
@@ -799,13 +824,13 @@ finally:
             os.killpg(child, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        launcher_reaped = reap_child(child, 2)
+        launcher_reaped = reap_child(child, float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
         if not launcher_reaped:
             try:
                 os.kill(child, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            launcher_reaped = reap_child(child, 1)
+            launcher_reaped = reap_child(child, float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
     os.close(master)
 
 exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
@@ -919,7 +944,7 @@ launcher_state_before_cleanup = ""
 runtime_seen = False
 transport_state_before_cleanup = ""
 transport_gone_before_cleanup = False
-prompt_deadline = time.monotonic() + 20
+prompt_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 try:
     while time.monotonic() < prompt_deadline:
         observed_runtime, observed_interrupt = observe_runtime()
@@ -935,7 +960,7 @@ try:
             os.write(master, b"\x03")
             cancel_sent = True
             break
-    exit_deadline = time.monotonic() + 20
+    exit_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while cancel_sent and time.monotonic() < exit_deadline:
         observed_runtime, observed_interrupt = observe_runtime()
         runtime_seen = runtime_seen or observed_runtime
@@ -971,7 +996,7 @@ try:
         except (FileNotFoundError, ValueError):
             pass
         else:
-            transport_deadline = time.monotonic() + 5
+            transport_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
             while time.monotonic() < transport_deadline:
                 transport_state = subprocess.run(
                     ["ps", "-o", "stat=", "-p", str(completed_transport_pid)],
@@ -1001,7 +1026,7 @@ finally:
             os.kill(child, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        reap_deadline = time.monotonic() + 2
+        reap_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
         while time.monotonic() < reap_deadline:
             try:
                 waited, candidate = os.waitpid(child, os.WNOHANG)
@@ -1133,7 +1158,7 @@ foreground_pgid = None
 progress = None
 restop_count = None
 transport_pid = None
-deadline = time.monotonic() + 20
+deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 try:
     while time.monotonic() < deadline:
         readable, _, _ = select.select([master], [], [], 0.1)
@@ -1162,7 +1187,7 @@ try:
         )
         if current_progress != progress:
             progress = current_progress
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
         waited, candidate = os.waitpid(child, os.WNOHANG)
         if waited:
             status = candidate
@@ -1186,7 +1211,7 @@ try:
             suspend_sent = True
             resume_target = restop_count + 1
             os.killpg(os.getpgid(transport_pid), signal.SIGSTOP)
-            resume_deadline = time.monotonic() + 2
+            resume_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
             while time.monotonic() < resume_deadline:
                 launcher_state = subprocess.run(
                     ["ps", "-o", "stat=", "-p", str(child)],
@@ -1226,7 +1251,7 @@ try:
             try:
                 os.kill(child, signal.SIGSTOP)
                 launcher_stopped = True
-                launcher_stop_deadline = time.monotonic() + 1
+                launcher_stop_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
                 while time.monotonic() < launcher_stop_deadline:
                     launcher_state = subprocess.run(
                         ["ps", "-o", "stat=", "-p", str(child)],
@@ -1249,7 +1274,7 @@ try:
                         pass
                 continue
             try:
-                stop_deadline = time.monotonic() + 1
+                stop_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
                 while time.monotonic() < stop_deadline:
                     transport_state = subprocess.run(
                         ["ps", "-o", "stat=", "-p", str(transport_pid)],
@@ -1274,7 +1299,7 @@ try:
                         pass
             break
 
-    exit_deadline = time.monotonic() + 8
+    exit_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
     while handoff and time.monotonic() < exit_deadline:
         waited, candidate = os.waitpid(child, os.WNOHANG)
         if waited:
@@ -1418,7 +1443,7 @@ launcher_reaped = False
 transport_pid = None
 adapter_gone = False
 interrupt_injected = False
-deadline = time.monotonic() + 15
+deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 try:
     while time.monotonic() < deadline:
         readable, _, _ = select.select([master], [], [], 0.1)
@@ -1459,7 +1484,7 @@ try:
     except (FileNotFoundError, ValueError):
         pass
     if status is not None and transport_pid is not None:
-        gone_deadline = time.monotonic() + 2
+        gone_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
         while time.monotonic() < gone_deadline:
             state = subprocess.run(
                 ["ps", "-o", "stat=", "-p", str(transport_pid)],
@@ -1477,13 +1502,13 @@ finally:
             os.killpg(child, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        launcher_reaped, status = reap_child(child, 1)
+        launcher_reaped, status = reap_child(child, float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
         if not launcher_reaped:
             try:
                 os.kill(child, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            launcher_reaped, status = reap_child(child, 1)
+            launcher_reaped, status = reap_child(child, float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
     if not adapter_gone and transport_pid is not None:
         try:
             os.killpg(os.getpgid(transport_pid), signal.SIGKILL)
@@ -1522,4 +1547,5 @@ _assert_exit "interactive handoff: late transport Ctrl-C returns status 130" \
 
 echo ""
 
+_assert_no_leaked_workers
 _test_summary

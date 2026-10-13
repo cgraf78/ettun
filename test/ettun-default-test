@@ -122,9 +122,13 @@ PY
 _local_port_closed() {
   local probe_exit _
 
-  # A connection probe can consume the one-shot listener and hide a leak.
-  # Poll for a successful bind instead, matching the fixture's allocation test.
-  for _ in {1..40}; do
+  # A connection probe can consume a one-shot listener and hide a leak, so
+  # poll for a successful bind for the whole budget. A refused bind alone is
+  # not a leak: an unrelated outgoing connection can reuse the port as soon
+  # as the listener closes. Only after the budget does one connection
+  # attempt decide: refused means no listener remains.
+  local deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  while ((SECONDS < deadline)); do
     probe_exit=0
     _local_port_available "$1" || probe_exit=$?
     case "$probe_exit" in
@@ -133,8 +137,641 @@ _local_port_closed() {
       *) return "$probe_exit" ;;
     esac
   done
+  ! _local_port_listening "$1"
+}
+
+_local_port_listening() {
+  "$test_python" - "$1" <<'PY'
+import os
+import socket
+import sys
+
+scale = float(os.environ.get("ETTUN_TEST_TIME_SCALE", "1"))
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=scale).close()
+except OSError:
+    sys.exit(1)
+PY
+}
+
+# Print a currently free loopback port below the default ephemeral ranges of
+# Linux and Android (32768+) and macOS and BSD (49152+), so on such hosts no
+# outgoing connection can claim it between this check and the bind a case
+# makes later. Only a new listener could, and the random choice makes that a
+# negligible collision.
+_free_port() {
+  "$test_python" - <<'PY'
+import errno
+import random
+import socket
+import sys
+
+
+def bindable(family, host, port):
+    try:
+        probe = socket.socket(family)
+    except OSError:
+        return True
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        probe.bind((host, port))
+        probe.listen(1)
+    except OSError as error:
+        # Without IPv6 loopback only the IPv4 answer matters.
+        return family == socket.AF_INET6 and error.errno != errno.EADDRINUSE
+    finally:
+        probe.close()
+    return True
+
+
+for _ in range(200):
+    port = random.randint(20000, 29999)
+    if bindable(socket.AF_INET, "127.0.0.1", port) and bindable(
+        socket.AF_INET6, "::1", port
+    ):
+        print(port)
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+_ipv6_loopback_available() {
+  "$test_python" -c '
+import socket
+probe = socket.socket(socket.AF_INET6)
+probe.bind(("::1", 0))
+probe.close()
+' 2>/dev/null
+}
+
+# Leave one loopback TCP endpoint in TIME-WAIT and print its port. "client"
+# models an outgoing connection, such as an `nc -z` health check, whose source
+# port is PORT (or an ephemeral one) and which closes first without
+# SO_REUSEADDR. "server" models a just-stopped SO_REUSEADDR listener that
+# closed its accepted connection first. Exit 3 means PORT was already taken.
+_make_time_wait() {
+  "$test_python" - "$1" "${2:-0}" <<'PY'
+import errno
+import os
+import socket
+import sys
+
+side, port = sys.argv[1], int(sys.argv[2])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+client = socket.socket()
+try:
+    if side == "server":
+        server.bind(("127.0.0.1", port))
+    else:
+        server.bind(("127.0.0.1", 0))
+        if port:
+            client.bind(("127.0.0.1", port))
+except OSError as error:
+    if error.errno == errno.EADDRINUSE:
+        sys.exit(3)
+    raise
+server.listen(1)
+if side == "server":
+    client.connect(server.getsockname())
+    accepted, _ = server.accept()
+    held = server.getsockname()[1]
+    first, second = accepted, client
+else:
+    client.connect(server.getsockname())
+    accepted, _ = server.accept()
+    held = client.getsockname()[1]
+    first, second = client, accepted
+first.close()
+# Wait for the first closer's FIN so that side, not its peer, ends in TIME-WAIT.
+second.settimeout(float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
+second.recv(1)
+second.close()
+server.close()
+print(held)
+PY
+}
+
+# Holds a requested port for the losing-transport stub. By default it is bound
+# without SO_REUSEADDR and not listening, so ettun's control helper is refused
+# at once instead of stalling on an accepted connection that never answers.
+# "listen" instead uses a SO_REUSEADDR listener, which can still claim a port
+# whose previous listener left TIME-WAIT behind; it closes every connection
+# it accepts so ettun's helper never waits on it.
+_start_port_occupier() {
+  local occupy_mode=${1:-bind}
+
+  occupy_request="$tmp/occupy-request"
+  occupy_ack="$tmp/occupy-ack"
+  occupy_stop="$tmp/occupy-stop"
+  occupy_state="$tmp/occupy-state"
+  rm -f "$occupy_request" "$occupy_ack" "$occupy_ack.failed" "$occupy_stop" \
+    "$occupy_state"
+  "$test_python" - "$occupy_request" "$occupy_ack" "$occupy_stop" \
+    "$occupy_mode" <<'PY' &
+import os
+import socket
+import sys
+import time
+
+request, ack, stop, mode = sys.argv[1:]
+# The losing-transport stub waits three shared bounds for the acknowledgement.
+deadline = time.monotonic() + 3 * float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
+while not os.path.exists(request) and not os.path.exists(stop):
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(0.01)
+if os.path.exists(stop):
+    sys.exit(0)
+with open(request, encoding="utf-8") as source:
+    port = int(source.read())
+holder = socket.socket()
+if mode == "listen":
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    holder.bind(("127.0.0.1", port))
+except OSError:
+    # Host traffic took the port first; the stub reports a missed
+    # precondition and the case retries with fresh ports.
+    open(ack + ".failed", "wb").close()
+    sys.exit(0)
+if mode == "listen":
+    holder.listen(8)
+    holder.settimeout(0.01)
+open(ack, "wb").close()
+# A fresh deadline bounds the hold independently of how long the request took.
+deadline = time.monotonic() + 6 * float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
+while not os.path.exists(stop) and time.monotonic() < deadline:
+    if mode == "listen":
+        try:
+            holder.accept()[0].close()
+        except OSError:
+            pass
+    else:
+        time.sleep(0.01)
+holder.close()
+PY
+  occupier_pid=$!
+}
+
+_stop_port_occupier() {
+  : >"$occupy_stop"
+  wait "$occupier_pid" 2>/dev/null || true
+}
+
+# Run ettun with the losing-transport stub in ROLE, after starting an
+# occupier in OCCUPY_MODE ("none" for no occupier). Extra NAME=VALUE
+# arguments are exported for that run only. When host traffic already held a
+# port the scenario needed, the stub reports a missed precondition; retry
+# with fresh ports so the assertions only ever see a valid scenario.
+_run_losing() {
+  local role="$1" occupy_mode="$2" probe_path="$3" assignment _
+  shift 3
+
+  for _ in 1 2 3 4 5 6 7 8; do
+    if [[ $occupy_mode == none ]]; then
+      occupy_request="$tmp/occupy-request"
+      occupy_ack="$tmp/occupy-ack"
+      occupy_state="$tmp/occupy-state"
+      rm -f "$occupy_request" "$occupy_ack" "$occupy_ack.failed" \
+        "$occupy_state"
+    else
+      _start_port_occupier "$occupy_mode"
+    fi
+    for assignment in "$@"; do
+      export "${assignment?}"
+    done
+    free_port=$(_free_port)
+    ETTUN_TEST_PATH="$probe_path" \
+      ETTUN_TEST_TRANSPORT="$bin/losing-transport" \
+      ETTUN_TEST_OCCUPY_ROLE="$role" \
+      ETTUN_TEST_OCCUPY_REQUEST="$occupy_request" \
+      ETTUN_TEST_OCCUPY_ACK="$occupy_ack" \
+      ETTUN_TEST_OCCUPY_STATE="$occupy_state" \
+      _run_ettun gateway.example "$free_port" service.internal 443
+    for assignment in "$@"; do
+      unset "${assignment%%=*}"
+    done
+    [[ $occupy_mode == none ]] || _stop_port_occupier
+    grep -q 'losing-transport: precondition missed' "$stderr" || return 0
+  done
+  _fail "losing transport [$role]: host traffic held its ports on every attempt"
   return 1
 }
+
+# Run ettun's bind-probe cases with one probe implementation on PATH. Every
+# case uses a real loopback socket; ETTUN_TEST_LSOF_EXIT=1 makes the stubbed
+# socket tables report every port free, so only the bind probe can reject one.
+_bind_probe_cases() {
+  local probe_path="$2" label="bind probe [$1]"
+  local held_port_file held_port_pid held_port time_wait_port time_wait_bind
+  local time_wait_expected free_port probe_slot first_control make_status
+  local hidden_expected full_queue_file full_queue_pid full_queue_port
+  local full_queue_ready full_queue_start full_queue_elapsed
+  local probe_mapping probe_control lost_control lost_mappings
+  local lost_retry_mapping
+
+  export ETTUN_TEST_LSOF_EXIT=1
+
+  held_port_file="$tmp/probe-held-port"
+  rm -f "$held_port_file"
+  "$test_python" - "$held_port_file" <<'PY' &
+import os
+import socket
+import sys
+import time
+
+holder = socket.socket()
+holder.bind(("127.0.0.1", 0))
+# This holder never accepts, so every completed connection stays queued.
+# The case may connect once to set its expectation and ettun connects again.
+# On macOS a backlog of one was already full after the first, so ettun's
+# connect check saw no listener; Linux admits one extra connection.
+holder.listen(16)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(f"{holder.getsockname()[1]}\n")
+# Killed by the case; the backstop only bounds an aborted run.
+time.sleep(3 * float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
+PY
+  held_port_pid=$!
+  if _wait_for_file "$held_port_file"; then
+    read -r held_port <"$held_port_file"
+    # With the socket tables blind to it (as for another user's socket under
+    # non-root lsof), the refused bind still stops the launch, and a
+    # connection check identifies a lasting listener rather than a closing
+    # connection. ettun connects with perl when it has it, else with nc;
+    # without either only the temporary-failure answer is possible.
+    hidden_expected=75
+    if PATH="$probe_path" perl -MIO::Socket::INET -e 1 >/dev/null 2>&1 ||
+      PATH="$probe_path" nc -z -w "$ETTUN_TEST_TIME_SCALE" 127.0.0.1 "$held_port" \
+        </dev/null >/dev/null 2>&1; then
+      hidden_expected=1
+    fi
+    ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
+      _run_ettun gateway.example "$held_port" service.internal 443
+    _assert_exit "$label: listener hidden from socket tables is rejected" \
+      "$hidden_expected" "$run_exit"
+    _assert_file_content "$label: hidden listener rejected before transport" \
+      "" "$log"
+    ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
+      ETTUN_TEST_LSOF_EXIT='' ETTUN_TEST_LSOF_ESTABLISHED_PORT="$held_port" \
+      _run_ettun gateway.example "$held_port" service.internal 443
+    _assert_exit "$label: owned live listener rejected" 1 "$run_exit"
+    _assert_contains "$label: owned live listener suggests an existing tunnel" \
+      "may already be running" "$(<"$stderr")"
+    _assert_file_content "$label: owned live listener rejected before transport" \
+      "" "$log"
+  else
+    _fail "$label: holder binds a loopback listener"
+  fi
+  kill "$held_port_pid" 2>/dev/null || true
+  wait "$held_port_pid" 2>/dev/null || true
+
+  # A listener whose accept queue is full drops new SYNs. ettun cannot tell
+  # it from a closing connection (a documented limitation, exit 75), but it
+  # must decide within its one-second connect bounds; macOS nc's -w once let
+  # this stall for over a minute.
+  full_queue_file="$tmp/probe-full-queue"
+  rm -f "$full_queue_file"
+  "$test_python" - "$full_queue_file" <<'PY' &
+import os
+import socket
+import sys
+import time
+
+scale = float(os.environ.get("ETTUN_TEST_TIME_SCALE", "1"))
+wait = float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
+holder = socket.socket()
+holder.bind(("127.0.0.1", 0))
+holder.listen(1)
+port = holder.getsockname()[1]
+clients = []
+full = 0
+for _ in range(16):
+    client = socket.socket()
+    client.settimeout(scale)
+    try:
+        client.connect(("127.0.0.1", port))
+    except socket.timeout:
+        # Dropped, not refused: the queue is full, the case under test.
+        client.close()
+        full = 1
+        break
+    except OSError:
+        client.close()
+        break
+    clients.append(client)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(f"{port} {full}\n")
+# Killed by the case; the backstop only bounds an aborted run.
+time.sleep(3 * wait)
+PY
+  full_queue_pid=$!
+  if _wait_for_file "$full_queue_file"; then
+    read -r full_queue_port full_queue_ready <"$full_queue_file"
+    if ((full_queue_ready == 1)); then
+      full_queue_start=$SECONDS
+      ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
+        _run_ettun gateway.example "$full_queue_port" service.internal 443
+      full_queue_elapsed=$((SECONDS - full_queue_start))
+      _assert_exit "$label: full-queue listener is a documented temporary failure" \
+        75 "$run_exit"
+      if ((full_queue_elapsed < WAIT_DEADLINE_SECONDS)); then
+        _pass "$label: full-queue listener check is bounded"
+      else
+        _fail "$label: full-queue listener check is bounded (took ${full_queue_elapsed}s)"
+      fi
+    else
+      printf '  SKIP: %s: could not fill a loopback accept queue\n' "$label"
+    fi
+  else
+    _fail "$label: holder fills a loopback accept queue"
+  fi
+  kill "$full_queue_pid" 2>/dev/null || true
+  wait "$full_queue_pid" 2>/dev/null || true
+
+  # Linux rejects a SO_REUSEADDR bind over an outgoing TIME-WAIT that did not
+  # set SO_REUSEADDR; BSD and macOS allow it. Compare with a real bind so the
+  # probe is held to whatever the listener itself would see on this host. No
+  # process owns that TIME-WAIT, so ettun reports a temporary failure.
+  if time_wait_port=$(_make_time_wait client); then
+    time_wait_bind=0
+    _local_port_available "$time_wait_port" || time_wait_bind=$?
+    if [[ $(uname -s) == Linux ]]; then
+      _assert_exit "$label: outgoing TIME-WAIT blocks a Linux listener" \
+        1 "$time_wait_bind"
+    fi
+    time_wait_expected=23
+    ((time_wait_bind != 1)) || time_wait_expected=75
+    ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
+      _run_ettun gateway.example "$time_wait_port" service.internal 443
+    _assert_exit "$label: outgoing TIME-WAIT matches a real bind" \
+      "$time_wait_expected" "$run_exit"
+    if ((time_wait_bind == 1)); then
+      _assert_contains "$label: outgoing TIME-WAIT is reported as temporary" \
+        "retry within about a minute" "$(<"$stderr")"
+      _assert_file_content "$label: outgoing TIME-WAIT rejected before transport" \
+        "" "$log"
+    fi
+  else
+    _fail "$label: fixture leaves an outgoing TIME-WAIT"
+  fi
+
+  if time_wait_port=$(_make_time_wait server); then
+    ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
+      _run_ettun gateway.example "$time_wait_port" service.internal 443
+    _assert_exit "$label: stopped listener's TIME-WAIT allows a restart" \
+      23 "$run_exit"
+  else
+    _fail "$label: fixture leaves a listener TIME-WAIT"
+  fi
+
+  free_port=$(_free_port)
+  ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
+    _run_ettun gateway.example "$free_port" service.internal 443
+  _assert_exit "$label: free port reaches the transport" 23 "$run_exit"
+
+  # A successful 127.0.0.1 bind is not final: a ::1 or wildcard listener seen
+  # only in the socket tables (here, the lsof stub) still owns the port.
+  free_port=$(_free_port)
+  ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_LSOF_EXIT=0 ETTUN_TEST_EXIT=23 \
+    _run_ettun gateway.example "$free_port" service.internal 443
+  _assert_exit "$label: successful bind still defers to socket tables" 1 \
+    "$run_exit"
+  _assert_file_content "$label: socket-table owner rejected before transport" \
+    "" "$log"
+
+  # ettun prefers one parity for control ports (see preferred_parity), and
+  # for a slot of that parity the first preferred candidate is palette four.
+  # Use slots no other case touches, because the TIME-WAIT outlives this
+  # suite's run; each mode and each repeated run within a minute walks on.
+  probe_slot=''
+  while ((probe_slot_cursor < 800)); do
+    first_control=$((49152 + 4 * 819 + probe_slot_cursor))
+    make_status=0
+    time_wait_port=$(_make_time_wait client "$first_control") ||
+      make_status=$?
+    probe_slot_cursor=$((probe_slot_cursor + 2))
+    case $make_status in
+      0)
+        probe_slot=$((probe_slot_cursor - 2))
+        break
+        ;;
+      3) ;;
+      *)
+        _fail "$label: fixture leaves a slot control candidate in TIME-WAIT"
+        break
+        ;;
+    esac
+  done
+  if [[ -n $probe_slot ]]; then
+    time_wait_bind=0
+    _local_port_available "$first_control" || time_wait_bind=$?
+    if [[ $(uname -s) == Linux ]]; then
+      _assert_exit "$label: slot candidate TIME-WAIT blocks a Linux listener" \
+        1 "$time_wait_bind"
+    fi
+    free_port=$(_free_port)
+    ETTUN_REMOTE_PORT_SLOT_V1=$probe_slot ETTUN_TEST_PATH="$probe_path" \
+      _run_ettun gateway.example "$free_port" service.internal 443
+    probe_mapping=$(sed -n '/^<-t>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
+    probe_control=${probe_mapping##*,}
+    probe_control=${probe_control%%:*}
+    _assert_exit "$label: slotted launch succeeds" 0 "$run_exit"
+    if [[ $probe_control =~ ^[0-9]+$ ]] &&
+      ((probe_control >= 49152 && (\
+      probe_control - 49152) % 819 == probe_slot)); then
+      _pass "$label: local control port stays in its remote port slot"
+    else
+      _fail "$label: local control port stays in its remote port slot (got '$probe_mapping')"
+    fi
+    if ((time_wait_bind == 1)); then
+      if [[ $probe_control != "$first_control" ]]; then
+        _pass "$label: control selection skips a TIME-WAIT candidate"
+      else
+        _fail "$label: control selection skips a TIME-WAIT candidate"
+      fi
+    fi
+    if [[ $probe_control =~ ^[0-9]+$ ]] &&
+      ((probe_control % 2 == preferred_parity)); then
+      _pass "$label: control selection prefers the parity connect() avoids"
+    else
+      _fail "$label: control selection prefers the parity connect() avoids (got '$probe_control')"
+    fi
+  elif [[ $(uname -s) == Linux ]]; then
+    _fail "$label: no free slot control candidate for a TIME-WAIT fixture"
+  else
+    printf '  SKIP: %s: no free slot control candidate for a TIME-WAIT fixture\n' \
+      "$label"
+  fi
+
+  _run_losing control bind "$probe_path"
+  lost_control=$(cat "$occupy_request" 2>/dev/null)
+  lost_mappings=$(sed -n '/^losing$/{n;p;}' "$log")
+  _assert_exit "$label: lost control port retries to success" 0 "$run_exit"
+  _assert_eq "$label: lost control port reinvokes the adapter once" \
+    2 "$(grep -c '^losing$' "$log")"
+  _assert_contains "$label: lost control port diagnostic names the port" \
+    "local control port 127.0.0.1:$lost_control is now in use" "$(<"$stderr")"
+  _assert_contains "$label: lost control port reports the retry" \
+    "was busy; retrying (2/5)" "$(<"$stderr")"
+  lost_retry_mapping=$(sed -n 2p <<<"$lost_mappings")
+  if [[ -n $lost_retry_mapping && $lost_retry_mapping != *",$lost_control:"* ]]; then
+    _pass "$label: lost control port retry selects another control port"
+  else
+    _fail "$label: lost control port retry selects another control port (got '$lost_mappings')"
+  fi
+
+  _run_losing control bind "$probe_path" ETTUN_TRANSPORT_SINGLE_INVOCATION_V1=1
+  lost_control=$(cat "$occupy_request" 2>/dev/null)
+  _assert_exit "$label: single-invocation lost control port fails retryably" \
+    75 "$run_exit"
+  _assert_eq "$label: single-invocation lost control port is not reinvoked" \
+    1 "$(grep -c '^losing$' "$log")"
+  _assert_contains "$label: single-invocation lost control port names the port" \
+    "local control port 127.0.0.1:$lost_control is now in use" "$(<"$stderr")"
+  _assert_contains "$label: single-invocation lost control port asks for a rerun" \
+    "rerun the command that owns this tunnel" "$(<"$stderr")"
+
+  # A listener left on the control port after the transport failed is more
+  # likely the transport's own leftover forward than the race a retry exists
+  # for, so ettun names it and keeps the transport status.
+  _run_losing control listen "$probe_path" \
+    ETTUN_TEST_LSOF_LISTENER_FILE="$tmp/occupy-request"
+  lost_control=$(cat "$occupy_request" 2>/dev/null)
+  _assert_exit "$label: listener on the control port preserves the status" 1 \
+    "$run_exit"
+  _assert_eq "$label: listener on the control port is not retried" \
+    1 "$(grep -c '^losing$' "$log")"
+  _assert_contains "$label: listener on the control port is named" \
+    "127.0.0.1:$lost_control is held by a listener" "$(<"$stderr")"
+
+  # The dead transport's own closing connections still appear in the socket
+  # tables; only a refused bind may classify the control port as lost.
+  _run_losing linger none "$probe_path" \
+    ETTUN_TEST_LSOF_OWNER_FILE="$tmp/occupy-request"
+  _assert_exit "$label: lingering connection preserves the transport status" 1 \
+    "$run_exit"
+  _assert_eq "$label: lingering connection is not retried" \
+    1 "$(grep -c '^losing$' "$log")"
+  _assert_not_contains "$label: lingering connection has no diagnostic" \
+    "is now in use" "$(<"$stderr")"
+
+  # A transport whose listener lacks SO_REUSEADDR and closes ettun's control
+  # connection first leaves its own TIME-WAIT; having reached that listener,
+  # ettun must not mistake the refused bind for a lost port.
+  _run_losing early-close none "$probe_path"
+  _assert_exit "$label: transport's own TIME-WAIT preserves the status" 1 \
+    "$run_exit"
+  _assert_eq "$label: transport's own TIME-WAIT is not retried" \
+    1 "$(grep -c '^losing$' "$log")"
+  _assert_contains "$label: transport's own TIME-WAIT follows a connection" \
+    "closed" "$(cat "$occupy_state" 2>/dev/null)"
+  _assert_not_contains "$label: transport's own TIME-WAIT has no diagnostic" \
+    "is now in use" "$(<"$stderr")"
+
+  _run_losing local bind "$probe_path"
+  _assert_exit "$label: lost local port preserves the transport status" 1 \
+    "$run_exit"
+  _assert_eq "$label: lost local port is not retried" \
+    1 "$(grep -c '^losing$' "$log")"
+  _assert_contains "$label: lost local port diagnostic names the port" \
+    "localhost:$free_port is now in use" "$(<"$stderr")"
+
+  _run_losing control bind "$probe_path" ETTUN_TEST_OCCUPY_EXIT=0
+  _assert_exit "$label: lost control port after success keeps the success" 0 \
+    "$run_exit"
+  _assert_eq "$label: lost control port after success is not reinvoked" \
+    1 "$(grep -c '^losing$' "$log")"
+  _assert_not_contains "$label: lost control port after success has no diagnostic" \
+    "is now in use" "$(<"$stderr")"
+
+  # Once a session attached, the transport's own listener was proven, so a
+  # port taken afterwards must not reinvoke (and reauthenticate) the adapter.
+  _run_losing attached listen "$probe_path"
+  _assert_exit "$label: lost control port after attachment preserves the status" \
+    1 "$run_exit"
+  _assert_eq "$label: lost control port after attachment is not reinvoked" \
+    1 "$(grep -c '^losing$' "$log")"
+  _assert_file_exists "$label: lost control port after attachment was taken" \
+    "$occupy_ack"
+  _assert_not_contains "$label: lost control port after attachment has no diagnostic" \
+    "is now in use" "$(<"$stderr")"
+  _assert_not_contains "$label: lost control port after attachment names no listener" \
+    "held by a listener" "$(<"$stderr")"
+
+  # ET binds localhost on both families and keeps whichever succeeds. When a
+  # socket claims 127.0.0.1 between ettun's probe and that bind, the tunnel
+  # must still attach over ::1, on the first invocation, instead of waiting
+  # for 127.0.0.1 forever.
+  if _ipv6_loopback_available; then
+    _run_losing et none "$probe_path"
+    _assert_exit "$label: control port lost on 127.0.0.1 still attaches" 0 \
+      "$run_exit"
+    _assert_eq "$label: control port lost on 127.0.0.1 needs one invocation" \
+      1 "$(grep -c '^losing$' "$log")"
+    _assert_contains "$label: control port lost on 127.0.0.1 completes the handshake" \
+      "attached" "$(cat "$occupy_state" 2>/dev/null)"
+    if [[ $(uname -s) == Linux ]]; then
+      _assert_eq "$label: control port lost on 127.0.0.1 attaches over ::1" \
+        $'bound ::1\nattached' "$(cat "$occupy_state" 2>/dev/null)"
+    fi
+  else
+    printf '  SKIP: %s: ::1 control fallback requires IPv6 loopback\n' "$label"
+  fi
+
+  _run_losing "" none "$probe_path" ETTUN_TEST_EXIT=1
+  _assert_exit "$label: free ports after failure preserve the transport status" \
+    1 "$run_exit"
+  _assert_eq "$label: free ports after failure are not retried" \
+    1 "$(grep -c '^losing$' "$log")"
+  _assert_not_contains "$label: free ports after failure have no diagnostic" \
+    "is now in use" "$(<"$stderr")"
+
+  unset ETTUN_TEST_LSOF_EXIT
+}
+
+echo ""
+echo "=== ettun local bind probe ==="
+
+probe_slot_cursor=$((700 + preferred_parity))
+if [[ -n "$real_perl" ]]; then
+  _bind_probe_cases perl "$perl_bin:$bin:$test_system_path"
+else
+  printf '  SKIP: perl bind probe checks require perl\n'
+fi
+
+# Hosts such as Termux and Alpine often lack perl. Mirror the system
+# directories without perl, keep the socket-table stubs, and put the suite's
+# Python first so the python3 fallback probe runs wherever ettun would use it.
+noperl_bin="$tmp/noperl-bin"
+mkdir -p "$noperl_bin"
+ln -s "$test_python" "$noperl_bin/python3"
+ln -s "$bin/ss" "$noperl_bin/ss"
+ln -s "$bin/lsof" "$noperl_bin/lsof"
+ln -s "$bin/et" "$noperl_bin/et"
+noperl_sources=()
+IFS=: read -r -a noperl_dirs <<<"$test_system_path"
+for noperl_dir in "${noperl_dirs[@]}"; do
+  for noperl_source in "$noperl_dir"/*; do
+    [[ -x "$noperl_source" && ! -d "$noperl_source" ]] || continue
+    [[ ${noperl_source##*/} != perl ]] || continue
+    noperl_sources+=("$noperl_source")
+  done
+done
+# One ln call: an existing name keeps its earlier, higher-precedence target.
+ln -s "${noperl_sources[@]}" "$noperl_bin/" 2>/dev/null || true
+if [[ ${OSTYPE:-} == darwin* ]]; then
+  # ettun never runs python3 on macOS, whose python3 may be an installer
+  # shim; perl always ships there, so the perl pass above covers the probe.
+  printf '  SKIP: python3 bind probe fallback is not used on macOS\n'
+elif PATH="$noperl_bin" command -v perl >/dev/null 2>&1; then
+  _fail "bind probe [python3]: fixture PATH hides perl"
+else
+  _bind_probe_cases python3 "$noperl_bin"
+fi
 
 _ncat_supports_ettun() {
   local help
@@ -271,6 +908,12 @@ if [[ "$control_local_port" =~ ^[0-9]+$ ]] &&
   _pass "default launch: chooses a private local control port"
 else
   _fail "default launch: chooses a private local control port (got '$control_local_port')"
+fi
+if [[ "$control_local_port" =~ ^[0-9]+$ ]] &&
+  ((control_local_port % 2 == preferred_parity)); then
+  _pass "default launch: prefers the parity connect() avoids"
+else
+  _fail "default launch: prefers the parity connect() avoids (got '$control_local_port')"
 fi
 _assert_contains "default launch: sends a remote relay command" "<--command>" "$commands"
 _assert_contains "default launch: enters an explicit POSIX remote shell" \
@@ -433,8 +1076,18 @@ _assert_contains "remote port slot v1: first palette owns the relay port" \
   $'<-t>\n<10455:49152,' "$slot_zero_commands"
 _assert_contains "remote port slot v1: first palette owns the control port" \
   ':49971>' "$slot_zero_commands"
+# The local control port is the slot's first palette value of the preferred
+# parity outside the remote tuple (palette 5 when odd, palette 4 when even).
+slot_zero_control=53247
+slot_retry_control=56523
+slot_target_control=53247
+if ((preferred_parity == 0)); then
+  slot_zero_control=52428
+  slot_retry_control=55704
+  slot_target_control=54066
+fi
 _assert_contains "remote port slot v1: local control avoids the remote tuple" \
-  '<10455:49152,52428:49971>' "$slot_zero_commands"
+  "<10455:49152,$slot_zero_control:49971>" "$slot_zero_commands"
 _assert_contains "remote port slot v1: first palette owns the reverse port" \
   $'<-r>\n<127.0.0.1:51609:127.0.0.1:22>' "$slot_zero_commands"
 
@@ -446,7 +1099,7 @@ _assert_exit "remote port slot v1: delayed reverse target succeeds" 0 \
   "$run_exit"
 _assert_contains \
   "remote port slot v1: local control avoids the reverse target port" \
-  $'<-t>\n<53247:49971>' "$slot_target_commands"
+  "$(printf '<-t>\n<%s:49971>' "$slot_target_control")" "$slot_target_commands"
 _assert_contains "remote port slot v1: delayed reverse target remains explicit" \
   $'<-r>\n<127.0.0.1:51609:127.0.0.1:52428>' "$slot_target_commands"
 
@@ -458,7 +1111,8 @@ _assert_exit "remote port slot v1: colliding local endpoint succeeds" 0 \
   "$run_exit"
 _assert_contains \
   "remote port slot v1: generated tuple avoids the local endpoint" \
-  $'<-t>\n<49152:52428,55704:53247>' "$slot_local_commands"
+  "$(printf '<-t>\n<49152:52428,%s:53247>' "$slot_retry_control")" \
+  "$slot_local_commands"
 
 ETTUN_REMOTE_PORT_SLOT_V1=0 _run_ettun gateway.example \
   --local 10456 127.0.0.1 49971
@@ -468,7 +1122,8 @@ _assert_exit "remote port slot v1: colliding destination endpoint succeeds" 0 \
   "$run_exit"
 _assert_contains \
   "remote port slot v1: generated tuple avoids the destination endpoint" \
-  $'<-t>\n<10456:52428,55704:53247>' "$slot_destination_commands"
+  "$(printf '<-t>\n<10456:52428,%s:53247>' "$slot_retry_control")" \
+  "$slot_destination_commands"
 
 ETTUN_REMOTE_PORT_SLOT_V1=1 _run_ettun gateway.example 10456 service.internal 443
 unset ETTUN_REMOTE_PORT_SLOT_V1
@@ -514,7 +1169,8 @@ _write_stub "$remote_bin/wc" \
   '  : >"$ETTUN_REMOTE_STOP_RACE_USED"' \
   '  stop_pid=' \
   '  [[ ! -r "${ETTUN_REMOTE_STOP_PID:-}" ]] || read -r stop_pid <"$ETTUN_REMOTE_STOP_PID"' \
-  '  for _ in {1..80}; do' \
+  '  stop_wait=$((SECONDS + ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
+  '  while ((SECONDS < stop_wait)); do' \
   '    stop_state=$(ps -o stat= -p "$stop_pid" 2>/dev/null || true)' \
   '    if [[ -z "$stop_state" || "$stop_state" == *Z* ]]; then' \
   '      : >"$ETTUN_REMOTE_STOP_RACE_READY"' \
@@ -551,7 +1207,7 @@ _write_stub "$remote_bin/fifo-sender" \
   'import os' \
   'import sys' \
   'import time' \
-  'deadline = time.monotonic() + 8' \
+  'deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))' \
   'while True:' \
   '    try:' \
   '        descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)' \
@@ -577,7 +1233,8 @@ _write_stub "$remote_bin/relay-action" \
   '    if [[ -n "${ETTUN_REMOTE_FAIL_DATA_PORT:-}" && "$port" == "$ETTUN_REMOTE_FAIL_DATA_PORT" ]]; then' \
   '      if [[ -n "${ETTUN_REMOTE_FAIL_DATA_WAIT_FOR:-}" ]]; then' \
   '        wait_ready=0' \
-  '        for _ in {1..80}; do' \
+  '        peer_wait=$((SECONDS + ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
+  '        while ((SECONDS < peer_wait)); do' \
   '          if [[ -r "$ETTUN_REMOTE_FAIL_DATA_WAIT_FOR" ]]; then wait_ready=1; break; fi' \
   '          sleep 0.1' \
   '        done' \
@@ -603,7 +1260,8 @@ _write_stub "$remote_bin/relay-action" \
   '    elif [[ -n "${ETTUN_REMOTE_CONTROL_PID:-}" ]]; then' \
   '      printf "%s\n" "$$" >"$ETTUN_REMOTE_CONTROL_PID"' \
   '    fi' \
-  '    for _ in {1..50}; do [[ -p "$ETTUN_REMOTE_FIFO_DIR/$port" ]] && break; sleep 0.1; done' \
+  '    fifo_wait=$((SECONDS + ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
+  '    while [[ ! -p "$ETTUN_REMOTE_FIFO_DIR/$port" ]] && ((SECONDS < fifo_wait)); do sleep 0.1; done' \
   '    if [[ -n "$handler" ]]; then' \
   '      exec "$handler" 127.0.0.1 "$port" <"$ETTUN_REMOTE_FIFO_DIR/$port" >"$ETTUN_REMOTE_FIFO_DIR/$port.reply"' \
   '    else' \
@@ -688,15 +1346,23 @@ _write_remote_fifo() {
 }
 
 _wait_for_line() {
-  local path="$1" expected="$2"
-  local _
-  for _ in {1..80}; do
+  local path="$1" expected="$2" deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  while :; do
     if [[ -r "$path" ]] && grep -Fxq -- "$expected" "$path"; then
       return
     fi
+    ((SECONDS < deadline)) || return 1
     sleep 0.1
   done
-  return 1
+}
+
+_wait_for_line_containing() {
+  local path="$1" expected="$2" deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  while :; do
+    grep -Fq -- "$expected" "$path" 2>/dev/null && return
+    ((SECONDS < deadline)) || return 1
+    sleep 0.1
+  done
 }
 
 _report_remote_timeout() {
@@ -727,18 +1393,21 @@ _report_remote_timeout() {
   tail -n 20 "$remote_log" >&2 || true
 }
 
+# A replacement supervisor first waits up to five seconds for the prior
+# owner to stop before reclaiming it, so this needs the full helper bound.
 _wait_for_owner_control() {
   local path="$1" expected="$2" token control _
-  for _ in {1..80}; do
+  local deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  while :; do
     token=
     control=
     [[ -r "$path" ]] && read -r token control _ <"$path"
     if [[ -n "$token" && "$control" == "$expected" ]]; then
       return
     fi
+    ((SECONDS < deadline)) || return 1
     sleep 0.1
   done
-  return 1
 }
 
 # A mixed route is the parity-critical shape: one supervisor must own both
@@ -946,7 +1615,6 @@ rm -f "$bootstrap_dir"
 rm -rf "$bootstrap_guard_target"
 
 if _real_relay_available; then
-  _select_local_remote_launch
   base64_invoked="$tmp/bootstrap-base64.invoked"
   _write_stub "$remote_bin/base64" \
     'touch "$ETTUN_REMOTE_BASE64_INVOKED"' \
@@ -954,32 +1622,27 @@ if _real_relay_available; then
   mv "$remote_bin/ncat" "$remote_bin/ncat.supervisor"
   # This path exercises the real bootstrap listener, not the relay fixture.
   mv "$remote_bin/socat" "$remote_bin/socat.supervisor"
-  decoder_exit=0
-  PATH="$remote_bin:$PATH" \
-    ETTUN_REMOTE_BASE64_INVOKED="$base64_invoked" \
-    sh -c "$remote_transport_command" >"$tmp/decoder.stdout" 2>"$tmp/decoder.stderr" &
-  decoder_pid=$!
-  for _ in {1..50}; do
-    [[ -d "$bootstrap_dir" ]] && break
-    sleep 0.05
-  done
-  bootstrap_mode=$(stat -c '%a' "$bootstrap_dir" 2>/dev/null ||
-    stat -f '%Lp' "$bootstrap_dir" 2>/dev/null || true)
-  _assert_eq "remote bootstrap staging: creates a private directory" \
-    "700" "$bootstrap_mode"
-
   _bootstrap_exchange() {
-    "$test_python" - "$control_remote_port" "$1" <<'PY'
+    "$test_python" - "$control_remote_port" "$1" "${2:-}" <<'PY'
+import os
 import socket
 import sys
 import time
 
-port, request = sys.argv[1:]
-deadline = time.monotonic() + 5
+port, request, watched = sys.argv[1:]
+deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 while True:
     try:
-        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=1)
+        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=float(os.environ.get("ETTUN_TEST_TIME_SCALE", "1")))
+        # The short timeout bounds only the connect; replies get the full bound.
+        connection.settimeout(float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
     except ConnectionRefusedError:
+        # The bootstrap's own retry marker means its listener lost the port
+        # to another socket; the caller retries with a fresh launch.
+        if watched:
+            with open(watched, encoding="utf-8", errors="replace") as source:
+                if "ETTUN_COLLISION:" in source.read():
+                    sys.exit(3)
         if time.monotonic() >= deadline:
             raise
         time.sleep(0.05)
@@ -1008,7 +1671,41 @@ sys.stdout.buffer.write(response)
 PY
   }
 
-  bootstrap_reply=$(_bootstrap_exchange "")
+  # This runs a real loopback listener on a port in the ephemeral range, so an
+  # unrelated connection can take it between selection and bind. The
+  # bootstrap reports that with its token-scoped retry marker; retry the whole
+  # setup with a fresh launch rather than fail on host traffic.
+  decoder_started=0
+  for _ in 1 2 3 4 5; do
+    _select_local_remote_launch
+    decoder_exit=0
+    PATH="$remote_bin:$PATH" \
+      ETTUN_REMOTE_BASE64_INVOKED="$base64_invoked" \
+      sh -c "$remote_transport_command" >"$tmp/decoder.stdout" 2>"$tmp/decoder.stderr" &
+    decoder_pid=$!
+    # Stop early if the bootstrap already exited, e.g. after losing its port.
+    decoder_wait=$((SECONDS + WAIT_DEADLINE_SECONDS))
+    while [[ ! -d "$bootstrap_dir" ]] && kill -0 "$decoder_pid" 2>/dev/null &&
+      ((SECONDS < decoder_wait)); do
+      sleep 0.05
+    done
+    bootstrap_mode=$(stat -c '%a' "$bootstrap_dir" 2>/dev/null ||
+      stat -f '%Lp' "$bootstrap_dir" 2>/dev/null || true)
+    bootstrap_status=0
+    bootstrap_reply=$(_bootstrap_exchange "" "$tmp/decoder.stderr") ||
+      bootstrap_status=$?
+    if ((bootstrap_status == 3)); then
+      wait "$decoder_pid" 2>/dev/null || true
+      continue
+    fi
+    decoder_started=1
+    break
+  done
+  ((decoder_started == 1)) ||
+    _fail "remote bootstrap: listener lost its port on every attempt"
+  _assert_eq "remote bootstrap staging: creates a private directory" \
+    "700" "$bootstrap_mode"
+
   _assert_eq "remote bootstrap probe: identifies the pre-supervisor listener" \
     "ETTUN_BOOTSTRAP" "$bootstrap_reply"
   tampered_payload="${transport_remote_payload%?}X"
@@ -1046,10 +1743,14 @@ PY
     _fail "remote decoder failure: removes private temporary files"
   fi
 
-  _select_local_remote_launch
-  bootstrap_timeout_exit=0
-  bootstrap_timeout_output=$(ETTUN_BOOTSTRAP_TIMEOUT=1 \
-    sh -c "$remote_transport_command" 2>&1) || bootstrap_timeout_exit=$?
+  # Retry a lost listener port, as the decoder case above does.
+  for _ in 1 2 3 4 5; do
+    _select_local_remote_launch
+    bootstrap_timeout_exit=0
+    bootstrap_timeout_output=$(ETTUN_BOOTSTRAP_TIMEOUT=1 \
+      sh -c "$remote_transport_command" 2>&1) || bootstrap_timeout_exit=$?
+    [[ $bootstrap_timeout_output == *"ETTUN_COLLISION:"* ]] || break
+  done
   _assert_exit "remote bootstrap deadline: expires an abandoned listener" \
     124 "$bootstrap_timeout_exit"
   _assert_contains "remote bootstrap deadline: emits a tokenized fatal marker" \
@@ -1082,9 +1783,16 @@ _assert_contains "remote setup failure: emits a tokenized fatal marker" \
 mkdir -p "$remote_state"
 startup_lock_holder=""
 if [[ -n "$real_flock" ]]; then
-  "$real_flock" "$remote_startup_lock" sleep 2 &
+  startup_lock_release="$tmp/startup-lock.release"
+  rm -f "$startup_lock_release"
+  # Hold the lock until the check below has run, not for a fixed time that
+  # CPU contention could outlast; the shared bound is only a backstop.
+  "$real_flock" "$remote_startup_lock" bash -c \
+    'end=$((SECONDS + $2)); while [[ ! -e $1 ]] && ((SECONDS < end)); do sleep 0.05; done' \
+    _ "$startup_lock_release" "$WAIT_DEADLINE_SECONDS" &
   startup_lock_holder=$!
-  for _ in {1..50}; do
+  wait_deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  while ((SECONDS < wait_deadline)); do
     "$real_flock" -n "$remote_startup_lock" true 2>/dev/null || break
     sleep 0.1
   done
@@ -1097,6 +1805,7 @@ else
   _fail "remote startup lock: waits for a live same-key owner when flock is available"
 fi
 if [[ -n "$startup_lock_holder" ]]; then
+  : >"$startup_lock_release"
   wait "$startup_lock_holder" 2>/dev/null || true
 fi
 if _wait_for_file "$remote_owner"; then
@@ -1113,7 +1822,8 @@ fi
 startup_lock_released=1
 if [[ -n "$real_flock" ]]; then
   startup_lock_released=0
-  for _ in {1..80}; do
+  wait_deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  while ((SECONDS < wait_deadline)); do
     if "$real_flock" -n "$remote_startup_lock" true 2>/dev/null; then
       startup_lock_released=1
       break
@@ -1203,7 +1913,8 @@ _wait_for_file "$remote_owner" || _fail "remote control death: owner starts"
 _wait_for_file "$tmp/remote-control.pid" || _fail "remote control death: listener starts"
 read -r killed_control_pid <"$tmp/remote-control.pid"
 kill -KILL "$killed_control_pid"
-for _ in {1..50}; do
+wait_deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+while ((SECONDS < wait_deadline)); do
   killed_control_state=$(ps -o stat= -p "$remote_pid" 2>/dev/null || true)
   [[ -z "$killed_control_state" || "$killed_control_state" == *Z* ]] && break
   sleep 0.1
@@ -1235,10 +1946,8 @@ first_remote_pid=$remote_pid
 read -r first_relay_pid <"$tmp/remote-data.pid"
 read -r first_control_pid <"$tmp/remote-control.pid"
 read -r first_stop_pid <"$tmp/remote-stop.pid"
-for _ in {1..80}; do
-  grep -Fq "control $control_remote_port" "$remote_log" && break
-  sleep 0.1
-done
+_wait_for_line_containing "$remote_log" "control $control_remote_port" ||
+  _fail "remote replacement: first control listener is armed"
 kill -KILL "$first_remote_pid" 2>/dev/null || true
 first_exit=0
 wait "$first_remote_pid" 2>/dev/null || first_exit=$?
@@ -1290,26 +1999,35 @@ if command -v flock >/dev/null 2>&1 && _real_relay_available; then
   control_stop_cache="$tmp/control-stop-cache"
   control_stop_state="$control_stop_cache/ettun/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-10451"
   mkdir -p "$control_stop_cache"
-  _select_local_remote_launch 10451 all
-  control_stop_command="$remote_command"
-  control_stop_port=$(sed -n 's/^ettun_control_port=//p' <<<"$control_stop_command")
-  control_stop_token=$(sed -n 's/^ettun_token=//p' <<<"$control_stop_command")
-  XDG_CACHE_HOME="$control_stop_cache" HOME="$tmp" \
-    sh -c "$control_stop_command" \
-    >"$tmp/control-stop.stdout" 2>"$tmp/control-stop.stderr" &
-  control_stop_pid=$!
-  control_stop_exchange=$(
-    "$test_python" - "$control_stop_port" "$control_stop_token" <<'PY'
+  # The supervisor binds real listeners on ephemeral-range ports. Like the
+  # bootstrap cases, retry with a fresh launch when its retry marker reports
+  # that host traffic took one of them first.
+  for _ in 1 2 3 4 5; do
+    _select_local_remote_launch 10451 all
+    control_stop_command="$remote_command"
+    control_stop_port=$(sed -n 's/^ettun_control_port=//p' <<<"$control_stop_command")
+    control_stop_token=$(sed -n 's/^ettun_token=//p' <<<"$control_stop_command")
+    XDG_CACHE_HOME="$control_stop_cache" HOME="$tmp" \
+      sh -c "$control_stop_command" \
+      >"$tmp/control-stop.stdout" 2>"$tmp/control-stop.stderr" &
+    control_stop_pid=$!
+    control_stop_status=0
+    control_stop_exchange=$(
+      "$test_python" - "$control_stop_port" "$control_stop_token" \
+        "$tmp/control-stop.stderr" <<'PY'
+import os
 import socket
 import sys
 import time
 
-port, token = sys.argv[1:]
-deadline = time.monotonic() + 8
+port, token, watched = sys.argv[1:]
+deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
 last_role = None
 while True:
     try:
-        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=1)
+        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=float(os.environ.get("ETTUN_TEST_TIME_SCALE", "1")))
+        # The short timeout bounds only the connect; replies get the full bound.
+        connection.settimeout(float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
         with connection:
             stream = connection.makefile("rb")
             role = stream.readline().decode().strip()
@@ -1320,15 +2038,20 @@ while True:
                 break
     except (ConnectionRefusedError, TimeoutError):
         pass
+    with open(watched, encoding="utf-8", errors="replace") as source:
+        if "ETTUN_COLLISION:" in source.read():
+            sys.exit(3)
     if time.monotonic() >= deadline:
         raise TimeoutError(f"control role not ready; last role was {last_role!r}")
     time.sleep(0.05)
 print(role)
 print(stopped)
 PY
-  )
-  control_stop_exit=0
-  wait "$control_stop_pid" || control_stop_exit=$?
+    ) || control_stop_status=$?
+    control_stop_exit=0
+    wait "$control_stop_pid" || control_stop_exit=$?
+    ((control_stop_status == 3)) || break
+  done
   _assert_contains "remote pre-attachment stop: advertises the control role" \
     "ETTUN_CONTROL" "$control_stop_exchange"
   _assert_contains "remote pre-attachment stop: acknowledges the authenticated request" \
@@ -1361,4 +2084,5 @@ fi
 
 echo ""
 
+_assert_no_leaked_workers
 _test_summary

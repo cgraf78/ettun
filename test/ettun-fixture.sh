@@ -5,6 +5,64 @@
 set -o pipefail
 export NO_COLOR=1
 
+# A non-interactive shell starts an asynchronous simple command (`suite &`)
+# with SIGINT and SIGQUIT ignored, and a Bash started that way can neither
+# trap nor reset them. Every ettun launched beneath would then ignore the
+# Ctrl-C the terminal cases send, and wait out their deadlines. Re-execute
+# the suite once with default dispositions, which only Python can restore;
+# Python also detects them, since `trap -p` reporting varies across Bashes.
+# Python itself ignores SIGPIPE and SIGXFSZ, so reset those before exec too,
+# and unblock all four in case the caller blocked them. A one-shot marker
+# bounds the re-exec even if a host defeats the checks below.
+# A caller that ignores SIGPIPE (systemd does by default) also changes how
+# pipelines behave; Python cannot see that, since it ignores SIGPIPE itself,
+# but a writer into a closed pipe shows it.
+signals_need_reset=0
+if command -v yes >/dev/null 2>&1; then
+  yes 2>/dev/null | head -n 1 >/dev/null
+  ((PIPESTATUS[0] == 141)) || signals_need_reset=1
+fi
+if [[ -z "${ETTUN_TEST_SIGNALS_RESET:-}" ]] && {
+  ((signals_need_reset == 1)) || python3 -I -c '
+import signal, sys
+ignored = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGQUIT))
+sys.exit(0 if signal.SIG_IGN in ignored else 1)
+'
+}; then
+  export ETTUN_TEST_SIGNALS_RESET=1
+  exec python3 -I -c '
+import os, signal, sys
+names = ("SIGINT", "SIGQUIT", "SIGPIPE", "SIGXFSZ")
+for name in names:
+    signal.signal(getattr(signal, name), signal.SIG_DFL)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {getattr(signal, name) for name in names})
+os.execv(sys.argv[1], sys.argv[1:])
+' "$BASH" "$0" "$@"
+fi
+unset ETTUN_TEST_SIGNALS_RESET signals_need_reset
+# ettun hands a terminal on its standard input to the transport. Cases that
+# need a terminal open their own pseudo-terminal, so never let the caller's
+# terminal reach the rest.
+exec </dev/null
+
+# Every time bound in the suites derives from two exported values, which a
+# static check in ettun-collision-test enforces:
+# - ETTUN_TEST_WAIT_SECONDS (WAIT_DEADLINE_SECONDS here) bounds each "wait
+#   until X happens" poll. A generous bound costs time only when a case
+#   fails; a tight one turns CPU contention on a shared runner into false
+#   failures, since each 0.1s sleep and every probe can take far longer than
+#   nominal.
+# - ETTUN_TEST_TIME_SCALE multiplies the deliberately short bounds, such as
+#   a per-attempt connect timeout. Slow hosts and CI can raise it (a
+#   positive integer, default 1); the shared wait scales with it.
+ETTUN_TEST_TIME_SCALE=${ETTUN_TEST_TIME_SCALE:-1}
+if [[ ! $ETTUN_TEST_TIME_SCALE =~ ^[1-9][0-9]*$ ]]; then
+  printf 'ettun tests: ETTUN_TEST_TIME_SCALE must be a positive integer\n' >&2
+  exit 2
+fi
+WAIT_DEADLINE_SECONDS=$((20 * ETTUN_TEST_TIME_SCALE))
+export ETTUN_TEST_TIME_SCALE ETTUN_TEST_WAIT_SECONDS=$WAIT_DEADLINE_SECONDS
+
 ETTUN_TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=lib/test.sh
 . "$ETTUN_TEST_ROOT/test/lib/test.sh"
@@ -45,6 +103,14 @@ real_mv=$(command -v mv)
 printf -v real_mv_q '%q' "$real_mv"
 printf -v test_python_q '%q' "$test_python"
 mkdir -p "$bin" "$test_home"
+# ettun prefers local control ports of the parity Linux connect() avoids: the
+# opposite of ip_local_port_range's start, or odd where that is unknown.
+preferred_parity=1
+if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]] &&
+  read -r range_low _ </proc/sys/net/ipv4/ip_local_port_range &&
+  [[ $range_low =~ ^[0-9]+$ ]]; then
+  preferred_parity=$(((10#$range_low + 1) % 2))
+fi
 
 _write_stub() {
   local path="$1"
@@ -64,6 +130,27 @@ _write_stub() {
 # _run_ettun do not pass ETTUN_TEST_PYTHON, and an empty interpreter name used
 # to report every candidate as free.
 _write_stub "$bin/lsof" \
+  'if [[ " $* " == *" -sTCP:LISTEN "* ]]; then' \
+  '  listener_port=' \
+  '  [[ -z "${ETTUN_TEST_LSOF_LISTENER_FILE:-}" || ! -r "$ETTUN_TEST_LSOF_LISTENER_FILE" ]] ||' \
+  '    read -r listener_port <"$ETTUN_TEST_LSOF_LISTENER_FILE"' \
+  '  for arg in "$@"; do' \
+  '    if [[ -n "$listener_port" && "$arg" == "-iTCP:$listener_port" ]]; then' \
+  '      printf "p12345\\nn127.0.0.1:%s\\n" "$listener_port"' \
+  '      exit 0' \
+  '    fi' \
+  '  done' \
+  '  exit 1' \
+  'fi' \
+  'if [[ -n "${ETTUN_TEST_LSOF_OWNER_FILE:-}" && -r "$ETTUN_TEST_LSOF_OWNER_FILE" ]]; then' \
+  '  read -r owner_port <"$ETTUN_TEST_LSOF_OWNER_FILE"' \
+  '  for arg in "$@"; do' \
+  '    if [[ "$arg" == "-iTCP:$owner_port" ]]; then' \
+  '      printf "p12345\\nn127.0.0.1:%s->127.0.0.1:443\\n" "$owner_port"' \
+  '      exit 0' \
+  '    fi' \
+  '  done' \
+  'fi' \
   'if [[ -n "${ETTUN_TEST_LSOF_ESTABLISHED_PORT:-}" ]]; then' \
   '  for arg in "$@"; do' \
   '    if [[ "$arg" == "-iTCP:$ETTUN_TEST_LSOF_ESTABLISHED_PORT" ]]; then' \
@@ -122,9 +209,17 @@ _write_stub "$bin/lsof" \
   '  exit $?' \
   'fi' \
   'exit 1'
-# ettun prefers ss and falls back to lsof only when ss fails. A failing ss
-# keeps the lsof-driven fixtures above on that path wherever a real ss would
-# otherwise be visible (Ubuntu installs it in /usr/bin).
+# ettun prefers a real perl bind probe, then ss, then lsof. The probe sees the
+# host's real sockets, so the stub reports it inconclusive and fixed fixture
+# ports stay host-independent on the socket-table fallback. Bind-probe tests
+# put the real perl first through perl_bin.
+_write_stub "$bin/perl" 'exit 2'
+perl_bin="$tmp/perl-bin"
+mkdir -p "$perl_bin"
+real_perl=$(command -v perl 2>/dev/null || true)
+[[ -z "$real_perl" ]] || ln -s "$real_perl" "$perl_bin/perl"
+# A failing ss keeps the lsof-driven fixtures above on that path wherever a
+# real ss would otherwise be visible (Ubuntu installs it in /usr/bin).
 _write_stub "$bin/ss" 'exit 1'
 ss_bin="$tmp/ss-bin"
 mkdir -p "$ss_bin"
@@ -167,15 +262,24 @@ _write_stub "$bin/et" \
   '  bootstrap_mapping=${tunnel_spec##*,}' \
   '  bootstrap_port=${bootstrap_mapping%%:*}' \
   '  "$ETTUN_TEST_PYTHON" - "$bootstrap_port" "$ETTUN_TEST_BOOTSTRAP_PAYLOAD" "$ETTUN_RETRY_MARKER" <<PY' \
+  'import os' \
   'import socket' \
   'import sys' \
   'port, output, retry_marker = sys.argv[1:]' \
   'token = retry_marker.split(":")[1]' \
-  'server = socket.socket()' \
-  'server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
-  'server.bind(("127.0.0.1", int(port)))' \
+  '# Like ET, fall back to ::1 if a socket claimed 127.0.0.1 after the probe.' \
+  'try:' \
+  '    server = socket.socket()' \
+  '    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
+  '    server.bind(("127.0.0.1", int(port)))' \
+  'except OSError:' \
+  '    server.close()' \
+  '    server = socket.socket(socket.AF_INET6)' \
+  '    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
+  '    server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)' \
+  '    server.bind(("::1", int(port)))' \
   'server.listen(2)' \
-  'server.settimeout(5)' \
+  'server.settimeout(float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))' \
   'for _ in range(4):' \
   '    connection, _ = server.accept()' \
   '    connection.sendall(b"ETTUN_BOOTSTRAP\\n")' \
@@ -218,6 +322,168 @@ _write_stub "$bin/single-invocation-transport" \
   'printf "single-invocation\n" >>"$ETTUN_TEST_LOG"' \
   'printf "%s\n" "$ETTUN_RETRY_MARKER" >&2' \
   'exit 75'
+# Control-side helper for the losing-transport stub. "handshake" binds the
+# control port the way ET binds localhost (127.0.0.1 and ::1, keeping
+# whichever succeeds), records the bound families, and completes ettun's
+# control handshake. With "time-wait" it first leaves an outgoing TIME-WAIT
+# on 127.0.0.1:PORT, modeling a socket that claimed the port after ettun's
+# probe but before the transport bound it. Exit 4 means host traffic already
+# held a port the scenario needed, so the caller retries with fresh ports.
+losing_helper="$tmp/losing-transport.py"
+cat >"$losing_helper" <<'PY'
+import errno
+import os
+import select
+import socket
+import sys
+
+_, port, token, state, mode = sys.argv
+port = int(port)
+
+
+def record(line):
+    with open(state, "a", encoding="utf-8") as output:
+        output.write(line + "\n")
+
+
+if mode == "time-wait":
+    peer = socket.socket()
+    peer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    peer.bind(("127.0.0.1", 0))
+    peer.listen(1)
+    client = socket.socket()
+    try:
+        client.bind(("127.0.0.1", port))
+    except OSError as error:
+        if error.errno == errno.EADDRINUSE:
+            sys.exit(4)
+        raise
+    client.connect(peer.getsockname())
+    accepted, _ = peer.accept()
+    client.close()
+    accepted.settimeout(float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
+    accepted.recv(1)
+    accepted.close()
+    peer.close()
+if mode == "early-close":
+    # A transport listener without SO_REUSEADDR that closes ettun's first
+    # control connection itself, leaving its own TIME-WAIT on the port.
+    listener = socket.socket()
+    try:
+        listener.bind(("127.0.0.1", port))
+    except OSError as error:
+        if error.errno == errno.EADDRINUSE:
+            sys.exit(4)
+        raise
+    listener.listen(1)
+    listener.settimeout(float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
+    connection, _ = listener.accept()
+    listener.close()
+    connection.close()
+    record("closed")
+    sys.exit(0)
+listeners = []
+for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    try:
+        listener = socket.socket(family)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        listener.bind((host, port))
+        listener.listen(1)
+    except OSError as error:
+        listener.close()
+        # The ::1 case needs ET's other family available on this port.
+        if (mode == "time-wait" and family == socket.AF_INET6
+                and error.errno == errno.EADDRINUSE):
+            sys.exit(4)
+        continue
+    listeners.append(listener)
+    record(f"bound {host}")
+if not listeners:
+    sys.exit(1)
+ready, _, _ = select.select(listeners, [], [], float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
+if not ready:
+    sys.exit(1)
+connection, _ = ready[0].accept()
+for listener in listeners:
+    listener.close()
+connection.settimeout(float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
+reader = connection.makefile("rb")
+connection.sendall(b"ETTUN_CONTROL\n")
+if reader.readline() != f"{token}\n".encode():
+    sys.exit(1)
+connection.sendall(f"ETTUN_ATTACHED:{token}\n".encode())
+if reader.readline() != f"ETTUN_CONFIRM:{token}\n".encode():
+    sys.exit(1)
+connection.sendall(f"ETTUN_CONFIRMED:{token}\n".encode())
+record("attached")
+PY
+printf -v losing_helper_q '%q' "$losing_helper"
+# Models a local socket claiming a port after ettun probed it but before the
+# transport's listener bound it. The first invocation asks the test's occupier
+# to take its control or local data port, then fails as a bind failure would
+# (or exits with ETTUN_TEST_OCCUPY_EXIT). Role "attached" first completes the
+# control handshake, so the port is lost only after a real session attached.
+# Role "et" leaves a TIME-WAIT on 127.0.0.1 and then, like ET, serves the
+# handshake on ::1 and exits successfully. Role "linger" only publishes its
+# control port, for a socket-table stub to list as a leftover connection.
+# Role "early-close" accepts ettun's first control connection on a listener
+# without SO_REUSEADDR, closes it first, and fails.
+_write_stub "$bin/losing-transport" \
+  "losing_helper=$losing_helper_q" \
+  'printf "losing\n" >>"$ETTUN_TEST_LOG"' \
+  'printf "<%s>\n" "$2" >>"$ETTUN_TEST_LOG"' \
+  'count=0' \
+  '[[ -r "$ETTUN_TEST_COUNT" ]] && read -r count <"$ETTUN_TEST_COUNT"' \
+  'count=$((count + 1))' \
+  'printf "%s\n" "$count" >"$ETTUN_TEST_COUNT"' \
+  'if ((count == 1)) && [[ -n "${ETTUN_TEST_OCCUPY_ROLE:-}" ]]; then' \
+  '  mapping=$2' \
+  '  control_mapping=${mapping##*,}' \
+  '  case $ETTUN_TEST_OCCUPY_ROLE in' \
+  '    control | attached | et | linger | early-close) port=${control_mapping%%:*} ;;' \
+  '    local) port=${mapping%%:*} ;;' \
+  '  esac' \
+  '  token=${ETTUN_RETRY_MARKER#ETTUN_COLLISION:}' \
+  '  token=${token%%:*}' \
+  '  case $ETTUN_TEST_OCCUPY_ROLE in' \
+  '    attached | et | early-close)' \
+  '      helper_mode=plain' \
+  '      [[ $ETTUN_TEST_OCCUPY_ROLE != et ]] || helper_mode=time-wait' \
+  '      [[ $ETTUN_TEST_OCCUPY_ROLE != early-close ]] || helper_mode=early-close' \
+  '      helper_status=0' \
+  '      "$ETTUN_TEST_PYTHON" "$losing_helper" "$port" "$token" "$ETTUN_TEST_OCCUPY_STATE" "$helper_mode" || helper_status=$?' \
+  '      if ((helper_status == 4)); then' \
+  '        printf "losing-transport: precondition missed on port %s\\n" "$port" >&2' \
+  '        exit 98' \
+  '      fi' \
+  '      ((helper_status == 0)) || exit 1' \
+  '      [[ $ETTUN_TEST_OCCUPY_ROLE != et ]] || exit 0' \
+  '      [[ $ETTUN_TEST_OCCUPY_ROLE != early-close ]] || exit 1' \
+  '      ;;' \
+  '  esac' \
+  '  printf "%s\n" "$port" >"$ETTUN_TEST_OCCUPY_REQUEST.tmp"' \
+  '  mv "$ETTUN_TEST_OCCUPY_REQUEST.tmp" "$ETTUN_TEST_OCCUPY_REQUEST"' \
+  '  [[ $ETTUN_TEST_OCCUPY_ROLE != linger ]] || exit 1' \
+  '  # Wait as long as the occupier waits for this request.' \
+  '  ack_wait=$((SECONDS + 3 * ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
+  '  while ((SECONDS < ack_wait)); do' \
+  '    [[ -e "$ETTUN_TEST_OCCUPY_ACK" || -e "$ETTUN_TEST_OCCUPY_ACK.failed" ]] && break' \
+  '    sleep 0.05' \
+  '  done' \
+  '  if [[ -e "$ETTUN_TEST_OCCUPY_ACK.failed" ]]; then' \
+  '    printf "losing-transport: precondition missed on port %s\\n" "$port" >&2' \
+  '    exit 98' \
+  '  fi' \
+  '  if [[ ! -e "$ETTUN_TEST_OCCUPY_ACK" ]]; then' \
+  '    printf "losing-transport: occupier never confirmed port %s\n" "$port" >&2' \
+  '    exit 97' \
+  '  fi' \
+  '  printf "bind 127.0.0.1:%s: Address already in use\n" "$port" >&2' \
+  '  exit "${ETTUN_TEST_OCCUPY_EXIT:-1}"' \
+  'fi' \
+  'exit "${ETTUN_TEST_EXIT:-0}"'
 _write_stub "$bin/blocking-transport" \
   'printf "%s\n" "$$" >"$ETTUN_TEST_TRANSPORT_PID"' \
   'sleep 300 &' \
@@ -245,7 +511,8 @@ _write_stub "$bin/interactive-transport" \
   '  resume_observer=$!' \
   '  printf "%s\n" "$resume_observer" >"$resume_pid_file"' \
   '  # Stay alive to avoid SIGCHLD during read; group cleanup is asserted by the test.' \
-  '  for _ in {1..50}; do [[ -e "$resume_ready" ]] && break; sleep 0.1; done' \
+  '  resume_wait=$((SECONDS + ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
+  '  while [[ ! -e "$resume_ready" ]] && ((SECONDS < resume_wait)); do sleep 0.1; done' \
   '  if [[ ! -e "$resume_ready" ]]; then' \
   '    printf "resume observer did not become ready\n" >&2' \
   '    kill "$resume_observer" 2>/dev/null || true' \
@@ -288,9 +555,17 @@ _write_stub "$bin/interactive-attached-transport" \
   'signal.signal(signal.SIGINT, lambda _signum, _frame: sys.exit(130))' \
   'signal.signal(signal.SIGCONT, signal.SIG_DFL)' \
   'signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT, signal.SIGCONT})' \
-  'server = socket.socket()' \
-  'server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
-  'server.bind(("127.0.0.1", int(sys.argv[1])))' \
+  '# Like ET, fall back to ::1 if a socket claimed 127.0.0.1 after the probe.' \
+  'try:' \
+  '    server = socket.socket()' \
+  '    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
+  '    server.bind(("127.0.0.1", int(sys.argv[1])))' \
+  'except OSError:' \
+  '    server.close()' \
+  '    server = socket.socket(socket.AF_INET6)' \
+  '    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
+  '    server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)' \
+  '    server.bind(("::1", int(sys.argv[1])))' \
   'server.listen(1)' \
   'open(os.environ["ETTUN_TEST_CONTROL_READY"], "wb").close()' \
   'connection, _ = server.accept()' \
@@ -322,7 +597,7 @@ _write_stub "$bin/interactive-attached-transport" \
   '    signal.signal(signal.SIGCONT, mark_resumed)' \
   '    connection.sendall(f"ETTUN_CONFIRMED:{sys.argv[2]}\\n".encode())' \
   '    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCONT})' \
-  '    resume_deadline = time.monotonic() + 20' \
+  '    resume_deadline = time.monotonic() + float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))' \
   '    resumed = os.environ["ETTUN_TEST_CONTROL_RESUMED"]' \
   '    while not os.path.exists(resumed) and time.monotonic() < resume_deadline:' \
   '        time.sleep(0.01)' \
@@ -361,25 +636,41 @@ _write_stub "$bin/delayed-control-transport" \
   'import sys' \
   'signal.signal(signal.SIGINT, lambda _signum, _frame: sys.exit(130))' \
   'signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})' \
-  'server = socket.socket()' \
-  'server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
-  'server.bind(("127.0.0.1", int(sys.argv[1])))' \
+  '# Like ET, fall back to ::1 if a socket claimed 127.0.0.1 after the probe.' \
+  'try:' \
+  '    server = socket.socket()' \
+  '    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
+  '    server.bind(("127.0.0.1", int(sys.argv[1])))' \
+  'except OSError:' \
+  '    server.close()' \
+  '    server = socket.socket(socket.AF_INET6)' \
+  '    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
+  '    server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)' \
+  '    server.bind(("::1", int(sys.argv[1])))' \
   'server.listen(1)' \
   'if sys.argv[3]:' \
   '    open(sys.argv[3], "wb").close()' \
-  'connection, _ = server.accept()' \
-  'connection.sendall(b"ETTUN_CONTROL\\n")' \
-  'received = b""' \
-  'with connection:' \
+  'expected_stop = f"ETTUN_STOP:{sys.argv[4]}\n".encode()' \
+  'expected_attach = f"{sys.argv[4]}\n".encode()' \
+  '# Without an attach marker the case expects a stop request. Under load the' \
+  '# control helper can still attach before the signal lands; turn it away' \
+  '# and keep listening rather than record that race as the result.' \
+  'while True:' \
+  '    connection, _ = server.accept()' \
+  '    connection.sendall(b"ETTUN_CONTROL\\n")' \
+  '    received = b""' \
   '    while b"\n" not in received:' \
   '        chunk = connection.recv(256)' \
   '        if not chunk:' \
   '            break' \
   '        received += chunk' \
+  '    if received == expected_attach and not sys.argv[5]:' \
+  '        connection.close()' \
+  '        continue' \
+  '    break' \
+  'with connection:' \
   '    with open(sys.argv[2], "wb") as output:' \
   '        output.write(received)' \
-  '    expected_stop = f"ETTUN_STOP:{sys.argv[4]}\n".encode()' \
-  '    expected_attach = f"{sys.argv[4]}\n".encode()' \
   '    if received == expected_stop:' \
   '        connection.sendall(f"ETTUN_STOPPED:{sys.argv[4]}\n".encode())' \
   '    elif received == expected_attach:' \
@@ -416,9 +707,17 @@ _write_stub "$bin/dropping-control-transport" \
   'import socket' \
   'import time' \
   'import sys' \
-  'server = socket.socket()' \
-  'server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
-  'server.bind(("127.0.0.1", int(sys.argv[1])))' \
+  '# Like ET, fall back to ::1 if a socket claimed 127.0.0.1 after the probe.' \
+  'try:' \
+  '    server = socket.socket()' \
+  '    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
+  '    server.bind(("127.0.0.1", int(sys.argv[1])))' \
+  'except OSError:' \
+  '    server.close()' \
+  '    server = socket.socket(socket.AF_INET6)' \
+  '    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)' \
+  '    server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)' \
+  '    server.bind(("::1", int(sys.argv[1])))' \
   'server.listen(4)' \
   'open(os.environ["ETTUN_TEST_CONTROL_READY"], "wb").close()' \
   'while not os.path.exists(os.environ["ETTUN_TEST_CONTROL_GATE"]):' \
@@ -504,23 +803,58 @@ _run_ettun() {
 }
 
 _wait_for_file() {
-  local path="$1"
-  local _
-  for _ in {1..80}; do
+  local path="$1" deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  while :; do
     [[ -s "$path" ]] && return
+    ((SECONDS < deadline)) || return 1
     sleep 0.1
   done
-  return 1
 }
 
 _wait_for_marker() {
-  local path="$1"
-  local _
-  for _ in {1..80}; do
+  local path="$1" deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  while :; do
     [[ -e "$path" ]] && return
+    ((SECONDS < deadline)) || return 1
     sleep 0.1
   done
-  return 1
+}
+
+# Every transport worker a suite starts carries a runtime directory beneath
+# this suite's private temporary root in its argv, which proves ownership.
+# Give exiting workers the usual bound, then kill and report any survivor so
+# a cleanup gap fails the suite instead of leaving orphans on the host.
+_leaked_workers() {
+  local pid args
+
+  while read -r pid args; do
+    [[ $pid =~ ^[0-9]+$ && $args == *--ettun-transport-worker*"$tmp/"* ]] &&
+      printf '%s\n' "$pid"
+  done < <("$real_ps" -axo pid=,args= 2>/dev/null)
+}
+
+_assert_no_leaked_workers() {
+  local pid deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
+  local -a leaked
+
+  while :; do
+    leaked=()
+    while read -r pid; do
+      leaked+=("$pid")
+    done < <(_leaked_workers)
+    ((${#leaked[@]} == 0)) && break
+    ((SECONDS < deadline)) || break
+    sleep 0.1
+  done
+  if ((${#leaked[@]} == 0)); then
+    _pass "suite cleanup: no transport worker survives"
+    return
+  fi
+  for pid in "${leaked[@]}"; do
+    # A worker started under job control leads its own process group.
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  done
+  _fail "suite cleanup: no transport worker survives (killed ${leaked[*]})"
 }
 
 _process_has_stopped() {
@@ -531,9 +865,9 @@ _process_has_stopped() {
 }
 
 _wait_for_processes_stopped() {
-  local _ pid all_stopped
+  local pid all_stopped deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
 
-  for _ in {1..80}; do
+  while :; do
     all_stopped=1
     for pid in "$@"; do
       if ! _process_has_stopped "$pid"; then
@@ -541,7 +875,7 @@ _wait_for_processes_stopped() {
       fi
     done
     ((all_stopped == 1)) && return
+    ((SECONDS < deadline)) || return 1
     sleep 0.1
   done
-  return 1
 }

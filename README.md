@@ -94,7 +94,16 @@ The client needs:
 - the `et` client, unless a custom transport adapter is configured;
 - `base64`, `gzip`, and one of `sha256sum`, `shasum`, or `openssl`;
 - standard Unix tools including `awk`, `od`, `ps`, `sed`, and `tee`; and
-- `ss` (preferred) or `lsof` for early detection of an occupied local port.
+- `ss` (preferred) or `lsof` for early detection of an occupied local port,
+  plus `perl` (or, without it, `python3`, except on macOS) where available.
+  Either attempts the listener's actual loopback bind, which also catches a
+  Linux TIME-WAIT left by an outgoing connection; socket tables list TIME-WAIT
+  but cannot show whether it blocks a listener. A requested local port that
+  refuses the bind while no visible process owns it and nothing accepts on it
+  (checked with a one-second loopback connect through perl or `nc`, when
+  either is available) fails with status 75 and a hint to retry shortly. A
+  listener whose accept queue is full drops that connect too, so it also
+  gets status 75: a known limitation.
 
 The `VIA` host needs `/bin/sh`, `etserver`, `flock`, `base64`, `gzip`, a
 SHA-256 implementation, and either `socat` or Nmap's `ncat`. `socat` is
@@ -150,7 +159,16 @@ remain in the foreground for the connection's lifetime, preserve its exit
 status, and leave standard input attached when it needs interactive
 authentication. It inherits `ETTUN_RETRY_MARKER`, the exact per-attempt marker
 that makes a remote bind collision retryable. Arbitrary adapter errors are not
-retried, even when their text happens to mention a collision.
+retried, even when their text happens to mention a collision. The one local
+exception is decided by the kernel rather than adapter output: when the adapter
+fails before control attachment and a fresh bind probe finds that ettun's
+generated local control port is now taken by a socket other than a listener,
+and ettun never reached the adapter's control listener, that attempt counts as
+a collision. A listener there is more likely a forward the adapter left behind,
+so ettun names it and keeps the adapter's status. Stock ET does not exit when a
+forward fails: it binds every address `localhost` resolves to (normally both
+families) and keeps whichever succeeds, so ettun connects to its control
+forward on `127.0.0.1` and then `::1`.
 
 A `connect-v2` adapter which cannot safely be invoked again without repeating
 authentication or rebuilding private session state should also print
@@ -183,15 +201,23 @@ source. A provider managing concurrent legs can assign each one a distinct
 `ETTUN_REMOTE_PORT_SLOT_V1`; the 819 version-one slots partition all generated
 data, control, stop, reverse-transport, and local-control candidates across the
 five attempts. The value is consumed by the engine and is not inherited by a
-transport adapter. Collisions with unrelated processes remain authenticated
-and fail or retry under the same adapter policy.
+transport adapter. Collisions with unrelated processes remain authenticated and
+fail or retry under the same adapter policy. Among the local-control candidates
+ettun prefers the parity that Linux leaves to bind(0): plain outgoing
+connections get ephemeral ports with the parity of `ip_local_port_range`'s
+start (even by default) while any remain, so an unrelated health check or
+similar connection practically never holds a preferred candidate by the time
+the transport binds it.
 
 The supervisor records private state beneath
 `${XDG_CACHE_HOME:-$HOME/.cache}/ettun`, serializes replacement with `flock`,
 and removes only state whose token and process ownership match. Random relay
 bind collisions retry with a fresh token and port set, up to five attempts,
 except for an adapter declaring `single-invocation-v1` as described above. A
-collision on the requested fixed reverse port fails immediately and actionably.
+generated local control port taken between ettun's probe and the transport's
+bind follows the same policy, staying within any provider-assigned slot. A
+collision on the requested fixed reverse port fails immediately and actionably,
+as does losing the requested fixed local port, which is named in the error.
 
 The full supervisor is never placed directly in ET's command argument. A small
 bootstrap listener accepts a size-bounded payload over the private control

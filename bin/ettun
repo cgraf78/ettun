@@ -270,7 +270,55 @@ transport_query_capabilities() {
   ((single_invocation == 0)) || transport_single_invocation=1
 }
 
-local_port_in_use() {
+# Attempt the bind the transport will make and report whether the kernel
+# refuses it: 0 refused (EADDRINUSE), 1 bindable, 2 unknown. The probes exit
+# 3 for EADDRINUSE so an interpreter crash (status 1 or 255) stays unknown. ET listens with
+# SO_REUSEADDR, and ettun connects to its 127.0.0.1 listener. Socket tables
+# cannot see every reason that bind fails. On Linux a TIME-WAIT left by an
+# outgoing connection that did not set SO_REUSEADDR, such as an `nc -z` health
+# check whose ephemeral source port landed on a generated port, belongs to no
+# process yet still fails it; so does a loopback connection that connected to
+# itself. A stopped listener's own TIME-WAIT sockets inherit its SO_REUSEADDR
+# and do not, so restarting a tunnel stays possible. Perl ships with macOS and
+# nearly every Linux. Python 3 covers hosts such as Termux that lack perl; it
+# is skipped on macOS, whose python3 may be an installer shim that opens a
+# dialog.
+port_bind_refused() {
+  local port="$1" probe_status=0
+
+  if command -v perl >/dev/null 2>&1; then
+    perl -MSocket -e '
+      socket(my $s, PF_INET, SOCK_STREAM, 0) or exit 2;
+      setsockopt($s, SOL_SOCKET, SO_REUSEADDR, 1) or exit 2;
+      exit 0 if bind($s, pack_sockaddr_in($ARGV[0], inet_aton("127.0.0.1")))
+        && listen($s, 1);
+      exit($!{EADDRINUSE} ? 3 : 2);
+    ' "$port" </dev/null >/dev/null 2>&1 || probe_status=$?
+  elif [[ ${OSTYPE:-} != darwin* ]] && command -v python3 >/dev/null 2>&1; then
+    python3 -I -c '
+import errno, socket, sys
+try:
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+    s.listen(1)
+except OSError as error:
+    sys.exit(3 if error.errno == errno.EADDRINUSE else 2)
+' "$port" </dev/null >/dev/null 2>&1 || probe_status=$?
+  else
+    return 2
+  fi
+  case $probe_status in
+    0) return 1 ;;
+    3) return 0 ;;
+  esac
+  return 2
+}
+
+# Report whether the socket tables show a process-owned socket on the port.
+# This sees owners a successful 127.0.0.1 bind cannot rule out: a ::1
+# listener, or on BSD a wildcard one, still answers localhost:PORT.
+port_has_owner() {
   local port="$1" endpoint connections
 
   # ss answers from the kernel socket table in milliseconds, while lsof walks
@@ -282,14 +330,13 @@ local_port_in_use() {
       "sport = :$port" 2>/dev/null); then
     # Include every owned TCP state, not only LISTEN: an established
     # connection may already own the candidate as its local ephemeral source
-    # port. TIME-WAIT sockets belong to no process and do not block a new
-    # listener, so counting them would reject restarting a just-stopped tunnel.
+    # port. Counting TIME-WAIT would reject restarting a just-stopped tunnel;
+    # the bind probe catches the outgoing TIME-WAIT this view cannot.
     [[ -z $connections ]] || return 0
     # With netlink denied (Android), ss falls back to /proc/net and can exit 0
     # with a restricted view, so an empty answer is not proof. A bounded
     # loopback probe still catches a listener ss could not see.
-    command -v nc >/dev/null 2>&1 &&
-      nc -z -w 1 127.0.0.1 "$port" >/dev/null 2>&1
+    port_accepts "$port"
     return
   fi
 
@@ -311,6 +358,94 @@ local_port_in_use() {
   fi
 
   return 1
+}
+
+# Report whether a loopback connect to the port is accepted: 0 yes, 1
+# refused (perl only; nc cannot tell refusal from other failures), 2 unknown
+# (no tool, or no answer within the bound). The bound must
+# not depend on nc's -w: macOS nc applies it only to idle time, so a dropped
+# SYN (a full accept queue, or a socket bound without listening) stalled for
+# the system connect timeout, over a minute. Perl's IO::Socket::INET bounds
+# the connect itself; macOS nc needs -G for that.
+port_accepts() {
+  local port="$1" probe_status=0 nc_help
+
+  if command -v perl >/dev/null 2>&1; then
+    perl -MIO::Socket::INET -e '
+      my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1",
+        PeerPort => $ARGV[0], Proto => "tcp", Timeout => 1);
+      exit 0 if $s;
+      exit 4 if $!{ETIMEDOUT};
+      exit($!{ECONNREFUSED} ? 3 : 2);
+    ' "$port" </dev/null >/dev/null 2>&1 || probe_status=$?
+    # A timeout is the answer: nc would only wait another second on the same
+    # kernel. Anything else (a broken perl, a missing module) falls to nc.
+    case $probe_status in
+      0) return 0 ;;
+      3) return 1 ;;
+      4) return 2 ;;
+    esac
+  fi
+  command -v nc >/dev/null 2>&1 || return 2
+  probe_status=0
+  nc_help=$(nc -h </dev/null 2>&1)
+  if [[ $nc_help == *conntimeout* ]]; then
+    nc -z -G 1 -w 1 127.0.0.1 "$port" </dev/null >/dev/null 2>&1 ||
+      probe_status=$?
+  else
+    nc -z -w 1 127.0.0.1 "$port" </dev/null >/dev/null 2>&1 || probe_status=$?
+  fi
+  # nc reports refused, timed out, and unsupported flags alike as failure.
+  ((probe_status == 0)) && return 0
+  return 2
+}
+
+# Report whether a listener owns the port: 0 yes, 1 no, 2 unknown. A port
+# lost to a listener after a transport failed is more likely a forward the
+# transport left behind, such as one held by an SSH ControlMaster, than the
+# probe-to-bind race a retry exists for.
+port_has_listener() {
+  local port="$1" listeners endpoint
+
+  if command -v ss >/dev/null 2>&1 &&
+    listeners=$(LC_ALL=C ss -H -ltn "sport = :$port" 2>/dev/null) &&
+    [[ -n $listeners ]]; then
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    while IFS= read -r endpoint; do
+      [[ "$endpoint" == n* ]] && return 0
+    done < <(lsof -nP -iTCP:"$port" -sTCP:LISTEN -Fn 2>/dev/null)
+  fi
+  # Non-root lsof and a restricted ss cannot show another user's listener,
+  # which still refuses the bind. A bounded loopback connect finds it; only
+  # a successful connect counts as proof, so a listener whose accept queue is
+  # full stays unknown (a documented limitation).
+  port_accepts "$port"
+}
+
+# A port is in use when a process owns a socket on it or the transport's bind
+# would be refused; a successful bind alone is not proof of a free port. Ask
+# the tables first: on BSD the probe's brief listener could otherwise bind
+# beside, and shadow, a live wildcard listener for that instant.
+local_port_in_use() {
+  port_has_owner "$1" && return 0
+  port_bind_refused "$1"
+}
+
+# Open fd 9 to the forwarded control port. ET binds every address localhost
+# resolves to (normally 127.0.0.1 and ::1) and keeps whichever succeeded, so
+# if a socket claims 127.0.0.1 between ettun's probe and ET's bind, ET still
+# listens on ::1 where localhost includes it. Trying both keeps that tunnel
+# usable. Any local process able to bind the port could already impersonate
+# the 127.0.0.1 listener, so ::1 adds no exposure. stop_transport calls this
+# from a signal trap, where a bare `return` would report the status of the
+# command the trap interrupted, so no bare `return` is used here.
+open_control_stream() {
+  if { exec 9<>"/dev/tcp/127.0.0.1/$control_local_port"; } 2>/dev/null; then
+    return 0
+  fi
+  { exec 9<>"/dev/tcp/::1/$control_local_port"; } 2>/dev/null
 }
 
 random_hex() {
@@ -436,17 +571,53 @@ client_id() {
 }
 
 choose_local_control_port() {
-  local seed="$1" attempt="$2" slot=${3:-} probe candidate palette_index
+  local seed="$1" attempt="$2" slot=${3:-} parity probe candidate palette_index
+  local preferred=1 range_low=''
 
-  if [[ -n $slot ]]; then
-    # A provider-assigned slot owns one value from each of twenty spread
-    # palettes. Stay inside that slot locally as well, so concurrent legs
-    # cannot race before either control listener has bound.
-    for ((probe = 0; probe < MAX_RELAY_ATTEMPTS * REMOTE_PORT_ROLE_COUNT; probe++)); do
-      palette_index=$(((attempt * REMOTE_PORT_ROLE_COUNT + probe) % (\
-        MAX_RELAY_ATTEMPTS * REMOTE_PORT_ROLE_COUNT)))
-      candidate=$((RELAY_PORT_MIN + palette_index * REMOTE_PORT_SLOT_COUNT + \
-        slot))
+  # Prefer the parity plain outgoing connections avoid. Linux gives
+  # connect() ephemeral source ports with the parity of ip_local_port_range's
+  # start (even by default) while any remain, and leaves the other parity to
+  # bind(0). A plain outgoing connection such as a health check, or a probe
+  # that connects to itself, then practically never holds the preferred
+  # parity when the transport binds the port, long after this probe; a client
+  # that binds port 0 before connecting still can. Elsewhere the preference
+  # costs nothing.
+  if [[ -r /proc/sys/net/ipv4/ip_local_port_range ]] &&
+    read -r range_low _ </proc/sys/net/ipv4/ip_local_port_range &&
+    [[ $range_low =~ ^[0-9]+$ ]]; then
+    preferred=$(((10#$range_low + 1) % 2))
+  fi
+  for parity in "$preferred" "$((1 - preferred))"; do
+    if [[ -n $slot ]]; then
+      # A provider-assigned slot owns one value from each of twenty spread
+      # palettes. Stay inside that slot locally as well, so concurrent legs
+      # cannot race before either control listener has bound.
+      for ((probe = 0; probe < MAX_RELAY_ATTEMPTS * REMOTE_PORT_ROLE_COUNT; probe++)); do
+        palette_index=$(((attempt * REMOTE_PORT_ROLE_COUNT + probe) % (\
+          MAX_RELAY_ATTEMPTS * REMOTE_PORT_ROLE_COUNT)))
+        candidate=$((RELAY_PORT_MIN + palette_index * REMOTE_PORT_SLOT_COUNT + \
+          slot))
+        ((candidate % 2 == parity)) || continue
+        if ((candidate != local_port && candidate != target_port && \
+          candidate != reverse_port && candidate != reverse_target_port && \
+          candidate != relay_port && candidate != control_remote_port && \
+          candidate != stop_remote_port && \
+          candidate != reverse_transport_port)) &&
+            ! local_port_in_use "$candidate"; then
+          printf '%s\n' "$candidate"
+          return
+        fi
+      done
+      continue
+    fi
+
+    # ET needs a second local forward for its control protocol. Probe a
+    # deterministic-but-spread sequence while excluding every fixed endpoint
+    # and current remote role; a collision retry changes the sequence again.
+    for ((probe = 0; probe < 64; probe++)); do
+      candidate=$((RELAY_PORT_MIN + (\
+        seed + attempt * RELAY_PORT_STRIDE + probe * 3571) % RELAY_PORT_SPAN))
+      ((candidate % 2 == parity)) || continue
       if ((candidate != local_port && candidate != target_port && \
         candidate != reverse_port && candidate != reverse_target_port && \
         candidate != relay_port && candidate != control_remote_port && \
@@ -457,29 +628,13 @@ choose_local_control_port() {
         return
       fi
     done
-
-    printf 'ettun: could not find a free local control port in remote port slot\n' >&2
-    return 1
-  fi
-
-  # ET needs a second local forward for its control protocol. Probe a
-  # deterministic-but-spread sequence while excluding every fixed endpoint
-  # and current remote role; a collision retry changes the sequence again.
-  for ((probe = 0; probe < 64; probe++)); do
-    candidate=$((RELAY_PORT_MIN + (\
-      seed + attempt * RELAY_PORT_STRIDE + probe * 3571) % RELAY_PORT_SPAN))
-    if ((candidate != local_port && candidate != target_port && \
-      candidate != reverse_port && candidate != reverse_target_port && \
-      candidate != relay_port && candidate != control_remote_port && \
-      candidate != stop_remote_port && \
-      candidate != reverse_transport_port)) &&
-        ! local_port_in_use "$candidate"; then
-      printf '%s\n' "$candidate"
-      return
-    fi
   done
 
-  printf 'ettun: could not find a free local control port\n' >&2
+  if [[ -n $slot ]]; then
+    printf 'ettun: could not find a free local control port in remote port slot\n' >&2
+  else
+    printf 'ettun: could not find a free local control port\n' >&2
+  fi
   return 1
 }
 
@@ -1244,7 +1399,7 @@ stop_transport() {
     # A bootstrap listener is deliberately left empty so its watchdog can reap
     # the remote command after local authentication is cancelled.
     while transport_is_running; do
-      if { exec 9<>"/dev/tcp/127.0.0.1/$control_local_port"; } 2>/dev/null; then
+      if open_control_stream; then
         control_role=""
         if IFS= read -r -t 2 -u 9 control_role 2>/dev/null &&
           [[ "$control_role" == ETTUN_CONTROL ]] &&
@@ -1304,6 +1459,7 @@ cleanup_local() {
     rm -f "$runtime_dir/stdout" "$runtime_dir/stderr" \
       "$runtime_dir/stdout.fifo" "$runtime_dir/stderr.fifo" \
       "$runtime_dir/transport.pid" "$runtime_dir/control.attached" \
+      "$runtime_dir/control.connected" \
       "$runtime_dir/control.stop" "$runtime_dir/transport.foreground" \
       "$runtime_dir/transport.foreground.failed" \
       "$runtime_dir/transport.interrupted" "$runtime_dir/transport.ready" \
@@ -1370,7 +1526,10 @@ control_handoff_helper() {
     fi
     state=$(ps -o stat= -p "$child_pid" 2>/dev/null || true)
     [[ "$state" != Z* ]] || return 0
-    if { exec 9<>"/dev/tcp/127.0.0.1/$control_local_port"; } 2>/dev/null; then
+    if open_control_stream; then
+      # Proof that the transport's control listener bound; a later failure
+      # cannot then be a control port lost before that bind.
+      : >"$runtime_dir/control.connected"
       received_reply=""
       if IFS= read -r -t 15 -u 9 received_reply 2>/dev/null; then
         if [[ "$received_reply" == "$control_marker" ]] &&
@@ -1455,6 +1614,7 @@ run_transport() {
 
   [[ -t 8 ]] && use_terminal_handoff=1
   rm -f "$runtime_dir/transport.pid" "$runtime_dir/control.attached" \
+    "$runtime_dir/control.connected" \
     "$runtime_dir/control.stop" "$runtime_dir/transport.foreground" \
     "$runtime_dir/transport.foreground.failed" \
     "$runtime_dir/transport.interrupted" "$runtime_dir/transport.ready"
@@ -1803,10 +1963,26 @@ unset ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TRANSPORT_SINGLE_INVOCATION_V1
 if [[ -n "${ETTUN_TRANSPORT:-}" && $jump_host_set -eq 1 ]]; then
   die_usage "--jump-host requires stock ET"
 fi
-if ((local_enabled == 1)) && local_port_in_use "$local_port"; then
-  printf 'ettun: localhost:%s is already in use; this tunnel may already be running.\n' \
-    "$local_port" >&2
-  exit 1
+if ((local_enabled == 1)); then
+  if port_has_owner "$local_port"; then
+    printf 'ettun: localhost:%s is already in use; this tunnel may already be running.\n' \
+      "$local_port" >&2
+    exit 1
+  fi
+  # The kernel refuses the bind but no visible process owns the port. A
+  # listener the tables cannot show (another user's) is a lasting conflict;
+  # otherwise this is typically an outgoing connection's TIME-WAIT, which
+  # expires on its own, so report it as temporary (EX_TEMPFAIL).
+  if port_bind_refused "$local_port"; then
+    if port_has_listener "$local_port"; then
+      printf 'ettun: localhost:%s is already in use; this tunnel may already be running.\n' \
+        "$local_port" >&2
+      exit 1
+    fi
+    printf 'ettun: localhost:%s cannot be bound and no visible process owns it, typically a closing connection; retry within about a minute.\n' \
+      "$local_port" >&2
+    exit 75
+  fi
 fi
 
 transport_path=""
@@ -1958,20 +2134,51 @@ for ((attempt = 0; attempt < MAX_RELAY_ATTEMPTS; attempt++)); do
   if [[ -n "$fatal_status" ]]; then
     exit "$fatal_status"
   fi
+  busy_port="remote relay port"
   if ((collision_seen == 0)); then
-    exit "$transport_status"
+    if ((transport_status == 0)) ||
+      [[ -e "$runtime_dir/control.attached" ]]; then
+      exit "$transport_status"
+    fi
+    # The probes above only narrow a race: a socket can claim a local port
+    # before the transport's listener binds it, and that bind is authoritative.
+    # Transports report bind failures as arbitrary text, so after an early
+    # failure ask the kernel again and name a port that is now taken. Only a
+    # refused bind counts: socket tables would also list the dead transport's
+    # own closing connections. The requested local port is fixed and fails as
+    # before. The generated control port retries like a remote collision; a
+    # provider's remote-port slot owns all twenty palette values for it, so
+    # the next attempt stays in that slot.
+    if ((local_enabled == 1)) && port_bind_refused "$local_port"; then
+      printf 'ettun: localhost:%s is now in use; the transport may have failed to listen on it\n' \
+        "$local_port" >&2
+      exit "$transport_status"
+    fi
+    port_bind_refused "$control_local_port" || exit "$transport_status"
+    if port_has_listener "$control_local_port"; then
+      printf 'ettun: local control port 127.0.0.1:%s is held by a listener, possibly one the transport left running; not retrying\n' \
+        "$control_local_port" >&2
+      exit "$transport_status"
+    fi
+    # Once ettun reached the transport's control listener, a refused bind is
+    # the transport's own leftover socket (for example a TIME-WAIT from a
+    # listener without SO_REUSEADDR, or a BSD FIN-WAIT), not a lost port.
+    [[ ! -e "$runtime_dir/control.connected" ]] || exit "$transport_status"
+    busy_port="local control port 127.0.0.1:$control_local_port"
+    printf 'ettun: %s is now in use; the transport may have failed to listen on it\n' \
+      "$busy_port" >&2
   fi
   if ((transport_single_invocation == 1)); then
-    printf 'ettun: transport adapter permits one invocation; rerun the command that owns this tunnel after the remote relay collision\n' \
-      >&2
+    printf 'ettun: transport adapter permits one invocation; rerun the command that owns this tunnel after the %s collision\n' \
+      "$busy_port" >&2
     exit 75
   fi
   if ((attempt + 1 < MAX_RELAY_ATTEMPTS)); then
-    printf 'ettun: remote relay port was busy; retrying (%s/%s)\n' \
-      "$((attempt + 2))" "$MAX_RELAY_ATTEMPTS" >&2
+    printf 'ettun: %s was busy; retrying (%s/%s)\n' \
+      "$busy_port" "$((attempt + 2))" "$MAX_RELAY_ATTEMPTS" >&2
   fi
 done
 
-printf 'ettun: could not reserve remote relay ports after %s attempts\n' \
+printf 'ettun: could not reserve relay ports after %s attempts\n' \
   "$MAX_RELAY_ATTEMPTS" >&2
 exit 75
