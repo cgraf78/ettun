@@ -384,7 +384,11 @@ import time
 
 holder = socket.socket()
 holder.bind(("127.0.0.1", 0))
-holder.listen(1)
+# This holder never accepts, so every completed connection stays queued.
+# The case connects once to set its expectation and ettun connects again.
+# On macOS a backlog of one was already full after the first, so ettun's
+# `nc -z` timed out and saw no listener; Linux admits one extra connection.
+holder.listen(16)
 with open(sys.argv[1], "w", encoding="utf-8") as output:
     output.write(f"{holder.getsockname()[1]}\n")
 # Killed by the case; the backstop only bounds an aborted run.
