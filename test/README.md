@@ -64,9 +64,10 @@ ETTUN_TEST_TIME_SCALE=3 test/run
 ```
 
 A static check in `ettun-collision-test` fails on literal deadlines in the
-test tree (`monotonic() + N`, `timeout=N`, `read -t N`, `SECONDS + N`, and
-sleeps or socket timeouts of half a second or more), so new waits must use
-those values too.
+test tree (`monotonic() + N`, `timeout=N`, `read -t N`, `SECONDS + N`,
+sleeps or socket timeouts of half a second or more, and counted polls such as
+`for _ in {1..N}` or `while ((n < N))` whose body sleeps), so new waits must
+use those values too.
 
 Local runs invoke ShellCheck when it is installed. Shared CI sets
 `ETTUN_SKIP_SHELLCHECK=1` for the behavioral matrix because its separate

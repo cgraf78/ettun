@@ -292,10 +292,10 @@ _write_stub "$gate_bin/ps" \
   '    if [[ -n "${ETTUN_TEST_PROBE_HELD:-}" ]]; then' \
   '      : >"$ETTUN_TEST_PROBE_HELD"' \
   '      # The helper ignores common signals, so retain an abnormal-exit bound.' \
-  '      probe_wait=0' \
-  '      while [[ ! -e "$ETTUN_TEST_PROBE_RELEASE" ]] && ((probe_wait < 600)); do' \
+  '      # It outlasts the cancel case, whose gate timeout is 1.5 x the wait.' \
+  '      probe_wait=$((SECONDS + 2 * ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
+  '      while [[ ! -e "$ETTUN_TEST_PROBE_RELEASE" ]] && ((SECONDS < probe_wait)); do' \
   '        sleep 0.05' \
-  '        probe_wait=$((probe_wait + 1))' \
   '      done' \
   '      # A resume case lets the real probe prove foreground ownership.' \
   '      if [[ -n "${ETTUN_TEST_PROBE_PASS:-}" && -e "$ETTUN_TEST_PROBE_RELEASE" ]]; then' \
