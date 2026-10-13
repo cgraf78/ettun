@@ -750,6 +750,10 @@ _assert_contains "terminal gate: authentication completes after a gate Ctrl-Z" \
 # Exercise a real controlling PTY rather than piping input. macOS Bash job
 # control differs from noninteractive subprocess behavior: Ctrl-Z is terminal
 # input, foreground PGID determines signal delivery, and fg restores termios.
+# The publish delay leaves each stub file created but not yet written under its
+# temporary name. This harness reads the auth result once, as soon as it
+# exists, so a publish_file that wrote in place would fail here every time
+# instead of only under load.
 interactive_transport_pid_file="$tmp/interactive-transport.pid"
 interactive_auth_result="$tmp/interactive-auth.result"
 interactive_auth_state="$tmp/interactive-auth.state"
@@ -762,6 +766,7 @@ PATH="$bin:$test_extended_system_path" \
   ETTUN_TEST_TRANSPORT_PID="$interactive_transport_pid_file" \
   ETTUN_TEST_AUTH_RESULT="$interactive_auth_result" \
   ETTUN_TEST_AUTH_STATE="$interactive_auth_state" \
+  ETTUN_TEST_PUBLISH_DELAY=0.2 \
   ETTUN_TEST_PYTHON="$test_python" \
   ETTUN_TEST_RESUME_MARKER="$interactive_resume_marker" \
   ETTUN_TRANSPORT="$bin/interactive-transport" \
@@ -834,6 +839,7 @@ suspend_observed = False
 continue_observed = False
 resume_observed = False
 authenticated = False
+auth_value = None
 adapter_gone_before_cleanup = False
 observer_gone_before_cleanup = False
 foreground_at_prompt = False
@@ -905,7 +911,8 @@ try:
                 break
         if os.path.exists(auth_result):
             with open(auth_result, "r", encoding="utf-8") as result:
-                authenticated = result.read().strip() == "test-passcode"
+                auth_value = result.read()
+            authenticated = auth_value.strip() == "test-passcode"
             try:
                 with open(auth_state, "r", encoding="utf-8") as state_input:
                     state_fields = state_input.read().split()
@@ -991,7 +998,7 @@ if not success:
     sys.stderr.write(
         f"suspend_sent={suspend_sent} suspend_observed={suspend_observed} "
         f"continue_observed={continue_observed} resume_observed={resume_observed} "
-        f"authenticated={authenticated} "
+        f"authenticated={authenticated} auth_value={auth_value!r} "
         f"foreground_at_prompt={foreground_at_prompt} "
         f"launcher_reaped={launcher_reaped} "
         f"adapter_gone={adapter_gone_before_cleanup} "

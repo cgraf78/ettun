@@ -1220,15 +1220,16 @@ _write_stub "$remote_bin/fifo-sender" \
   '    output.write((sys.argv[2] + "\\n").encode())' \
   'PY'
 _write_stub "$remote_bin/relay-action" \
+  "$publish_file_function" \
   'action=$1' \
   'port=$2' \
   'handler=${3:-}' \
   'printf "%s %s\n" "$action" "$port" >>"$ETTUN_REMOTE_TEST_LOG"' \
   'case "$action" in' \
   '  data)' \
-  '    printf "%s\n" "$$" >"$ETTUN_REMOTE_DATA_PID"' \
+  '    publish_file "$ETTUN_REMOTE_DATA_PID" "$$"' \
   '    if [[ -n "${ETTUN_REMOTE_DATA_DIR:-}" ]]; then' \
-  '      printf "%s\n" "$$" >"$ETTUN_REMOTE_DATA_DIR/$port.pid"' \
+  '      publish_file "$ETTUN_REMOTE_DATA_DIR/$port.pid" "$$"' \
   '    fi' \
   '    if [[ -n "${ETTUN_REMOTE_FAIL_DATA_PORT:-}" && "$port" == "$ETTUN_REMOTE_FAIL_DATA_PORT" ]]; then' \
   '      if [[ -n "${ETTUN_REMOTE_FAIL_DATA_WAIT_FOR:-}" ]]; then' \
@@ -1248,17 +1249,17 @@ _write_stub "$remote_bin/relay-action" \
   '    fi' \
   '    sleep 300 &' \
   '    data_child=$!' \
-  '    printf "%s\n" "$data_child" >"$ETTUN_REMOTE_DATA_CHILD_PID"' \
+  '    publish_file "$ETTUN_REMOTE_DATA_CHILD_PID" "$data_child"' \
   '    if [[ -n "${ETTUN_REMOTE_DATA_DIR:-}" ]]; then' \
-  '      printf "%s\n" "$data_child" >"$ETTUN_REMOTE_DATA_DIR/$port.child.pid"' \
+  '      publish_file "$ETTUN_REMOTE_DATA_DIR/$port.child.pid" "$data_child"' \
   '    fi' \
   '    wait "$data_child"' \
   '    ;;' \
   '  control)' \
   '    if [[ "$port" == "${ETTUN_REMOTE_STOP_PORT:-}" && -n "${ETTUN_REMOTE_STOP_PID:-}" ]]; then' \
-  '      printf "%s\n" "$$" >"$ETTUN_REMOTE_STOP_PID"' \
+  '      publish_file "$ETTUN_REMOTE_STOP_PID" "$$"' \
   '    elif [[ -n "${ETTUN_REMOTE_CONTROL_PID:-}" ]]; then' \
-  '      printf "%s\n" "$$" >"$ETTUN_REMOTE_CONTROL_PID"' \
+  '      publish_file "$ETTUN_REMOTE_CONTROL_PID" "$$"' \
   '    fi' \
   '    fifo_wait=$((SECONDS + ${ETTUN_TEST_WAIT_SECONDS:-20}))' \
   '    while [[ ! -p "$ETTUN_REMOTE_FIFO_DIR/$port" ]] && ((SECONDS < fifo_wait)); do sleep 0.1; done' \
