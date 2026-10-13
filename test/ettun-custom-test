@@ -314,15 +314,22 @@ _write_stub "$gate_bin/ps" \
 _write_stub "$gate_sleep_bin/sleep" \
   "real_ps=$real_ps_q" \
   "real_sleep=$(printf '%q' "$(command -v sleep)")" \
+  "test_python=$test_python_q" \
   'if [[ -n "${ETTUN_TEST_WORKER_SLEEP_HELD:-}" && ! -e "$ETTUN_TEST_WORKER_SLEEP_HELD" ]] &&' \
   '  [[ "$("$real_ps" -ww -o args= -p "$PPID" 2>/dev/null)" == *" --ettun-transport-worker "* ]]; then' \
   '  : >"$ETTUN_TEST_WORKER_SLEEP_HELD"' \
-  '  held=0' \
-  '  while [[ ! -e "$ETTUN_TEST_WORKER_SLEEP_RELEASE" ]] && ((held < 600)); do' \
-  '    "$real_sleep" 0.05' \
-  '    held=$((held + 1))' \
-  '  done' \
-  '  exit 0' \
+  '  # Hold in this one process, which keeps the TSTP disposition it was' \
+  '  # started with. A nested external sleep could get a different one from' \
+  '  # an older Bash. The bound outlasts the case and only limits an aborted run.' \
+  '  exec "$test_python" - "$ETTUN_TEST_WORKER_SLEEP_RELEASE" <<PY' \
+  'import os' \
+  'import sys' \
+  'import time' \
+  'bound = 1.5 * float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))' \
+  'deadline = time.monotonic() + bound' \
+  'while not os.path.exists(sys.argv[1]) and time.monotonic() < deadline:' \
+  '    time.sleep(0.05)' \
+  'PY' \
   'fi' \
   'exec "$real_sleep" "$@"'
 # Bash 3.2 sources BASH_ENV before making the script's positional parameters
@@ -558,8 +565,8 @@ def run_case(port, cancel=False, startup_mode="", suspend=False, resume=False):
                             os.write(master, b"test-passcode\n")
                             passcode_sent = True
                     elif resume:
-                        # Poll the content, not mere existence: the stub's
-                        # result write is not an atomic publication.
+                        # Poll the content, not mere existence, so this case
+                        # does not depend on how the stub publishes it.
                         try:
                             with open(auth_result, "r", encoding="utf-8") as result:
                                 authenticated = result.read() == "test-passcode\n"
