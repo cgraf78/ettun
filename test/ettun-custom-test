@@ -284,7 +284,8 @@ gate_adapter_pid="$tmp/gate-adapter.pid"
 gate_results="$tmp/gate-results"
 gate_bin="$tmp/gate-bin"
 gate_bash_env="$tmp/gate-bash-env"
-mkdir -p "$gate_runtime_root" "$gate_bin"
+gate_sleep_bin="$tmp/gate-sleep-bin"
+mkdir -p "$gate_runtime_root" "$gate_bin" "$gate_sleep_bin"
 _write_stub "$gate_bin/ps" \
   'for arg in "$@"; do' \
   '  if [[ "$arg" == tpgid= ]]; then' \
@@ -296,12 +297,34 @@ _write_stub "$gate_bin/ps" \
   '        sleep 0.05' \
   '        probe_wait=$((probe_wait + 1))' \
   '      done' \
+  '      # A resume case lets the real probe prove foreground ownership.' \
+  '      if [[ -n "${ETTUN_TEST_PROBE_PASS:-}" && -e "$ETTUN_TEST_PROBE_RELEASE" ]]; then' \
+  "        exec $real_ps_q \"\$@\"" \
+  '      fi' \
   '    fi' \
   '    sleep 0.05' \
   '    exit 1' \
   '  fi' \
   'done' \
   "exec $real_ps_q \"\$@\""
+# Park the worker's first gate-loop sleep so Ctrl-Z deterministically lands
+# while the worker is waiting on an external child, the state in which a
+# stopped foreground child used to wedge it. Only the Ctrl-Z case puts this on
+# PATH. BSD ps truncates args to 79 columns without -ww.
+_write_stub "$gate_sleep_bin/sleep" \
+  "real_ps=$real_ps_q" \
+  "real_sleep=$(printf '%q' "$(command -v sleep)")" \
+  'if [[ -n "${ETTUN_TEST_WORKER_SLEEP_HELD:-}" && ! -e "$ETTUN_TEST_WORKER_SLEEP_HELD" ]] &&' \
+  '  [[ "$("$real_ps" -ww -o args= -p "$PPID" 2>/dev/null)" == *" --ettun-transport-worker "* ]]; then' \
+  '  : >"$ETTUN_TEST_WORKER_SLEEP_HELD"' \
+  '  held=0' \
+  '  while [[ ! -e "$ETTUN_TEST_WORKER_SLEEP_RELEASE" ]] && ((held < 600)); do' \
+  '    "$real_sleep" 0.05' \
+  '    held=$((held + 1))' \
+  '  done' \
+  '  exit 0' \
+  'fi' \
+  'exec "$real_sleep" "$@"'
 # Bash 3.2 sources BASH_ENV before making the script's positional parameters
 # available. Classify on the first script command instead: ordinary Bash
 # subprocesses remove the DEBUG trap immediately, while the sentinel worker
@@ -336,7 +359,7 @@ PATH="$gate_bin:$bin:$test_extended_system_path" \
   ETTUN_TEST_TRANSPORT_PID="$gate_adapter_pid" \
   ETTUN_TRANSPORT="$bin/interactive-transport" \
   "$test_python" - "$BASH" "$SCRIPT" "$gate_runtime_root" \
-  "$gate_adapter_pid" "$gate_results" <<'PY' || gate_exit=$?
+  "$gate_adapter_pid" "$gate_results" "$gate_sleep_bin" <<'PY' || gate_exit=$?
 import fcntl
 import os
 import pty
@@ -347,7 +370,14 @@ import sys
 import termios
 import time
 
-bash, script, runtime_root, adapter_pid_file, results_file = sys.argv[1:]
+(
+    bash,
+    script,
+    runtime_root,
+    adapter_pid_file,
+    results_file,
+    gate_sleep_bin,
+) = sys.argv[1:]
 
 def kill_session(session):
     """SIGKILL everything left in a case's session.
@@ -366,9 +396,9 @@ def kill_session(session):
         except (ValueError, OSError):
             pass
 
-def transport_worker_state():
+def transport_worker_state(stale=()):
     for entry in os.listdir(runtime_root):
-        if not entry.startswith("ettun."):
+        if not entry.startswith("ettun.") or entry in stale:
             continue
         run_dir = os.path.join(runtime_root, entry)
         pid_path = os.path.join(run_dir, "transport.pid")
@@ -395,7 +425,7 @@ def reap_child(pid, timeout):
         time.sleep(0.05)
     return False, None
 
-def run_case(port, cancel=False, startup_mode=""):
+def run_case(port, cancel=False, startup_mode="", suspend=False, resume=False):
     try:
         os.unlink(adapter_pid_file)
     except FileNotFoundError:
@@ -404,8 +434,14 @@ def run_case(port, cancel=False, startup_mode=""):
     gate_fifo = f"{results_file}.{port}.gate"
     probe_held = f"{results_file}.{port}.probe-held"
     probe_release = f"{results_file}.{port}.probe-release"
+    sleep_held = f"{results_file}.{port}.sleep-held"
+    sleep_release = f"{results_file}.{port}.sleep-release"
+    auth_result = f"{results_file}.{port}.auth"
     if startup_mode == "block":
         os.mkfifo(gate_fifo)
+    # A case killed at its bound leaves its run directory behind. Ignore those
+    # so a later case cannot mistake a dead worker for its own.
+    stale_runs = set(os.listdir(runtime_root))
     # The gate is meaningful only with a controlling PTY: without one, the
     # worker deliberately skips foreground ownership and starts immediately.
     master, slave = pty.openpty()
@@ -435,6 +471,22 @@ def run_case(port, cancel=False, startup_mode=""):
                     "ETTUN_TEST_PROBE_RELEASE": probe_release,
                 }
             )
+        if suspend:
+            environment.update(
+                {
+                    "PATH": f"{gate_sleep_bin}:{environment['PATH']}",
+                    "ETTUN_TEST_WORKER_SLEEP_HELD": sleep_held,
+                    "ETTUN_TEST_WORKER_SLEEP_RELEASE": sleep_release,
+                }
+            )
+        if resume:
+            environment.update(
+                {
+                    "ETTUN_TEST_PROBE_PASS": "1",
+                    "ETTUN_TEST_AUTH_RESULT": auth_result,
+                    "ETTUN_TEST_AUTH_STATE": f"{auth_result}.state",
+                }
+            )
         os.execve(
             bash,
             ["bash", script, "gateway.example", str(port), "service.internal", "443"],
@@ -446,6 +498,10 @@ def run_case(port, cancel=False, startup_mode=""):
     status = None
     reaped = False
     cancel_sent = False
+    suspend_sent = False
+    gate_released = False
+    passcode_sent = False
+    authenticated = False
     blocked_seen = False
     probe_held_seen = False
     ready_before_cancel = False
@@ -463,7 +519,7 @@ def run_case(port, cancel=False, startup_mode=""):
                     output += os.read(master, 4096)
                 except OSError:
                     pass
-            worker_pid, worker_ready = transport_worker_state()
+            worker_pid, worker_ready = transport_worker_state(stale_runs)
             if cancel and not cancel_sent and worker_pid is not None:
                 try:
                     terminal_pgid = os.tcgetpgrp(master)
@@ -475,6 +531,43 @@ def run_case(port, cancel=False, startup_mode=""):
                         ready_before_cancel = worker_ready
                         os.write(master, b"\x03")
                         cancel_sent = True
+                    # The Ctrl-Z case presses Ctrl-Z while the gated worker
+                    # waits on its parked sleep. Once this write returns and
+                    # its ^Z echo is read, TSTP has been sent to the group, so
+                    # the Ctrl-C below is handled only if that Ctrl-Z did not
+                    # wedge the worker's traps.
+                    elif (
+                        suspend
+                        and not suspend_sent
+                        and worker_ready
+                        and worker_foreground
+                        and probe_held_seen
+                        and os.path.exists(sleep_held)
+                    ):
+                        os.write(master, b"\x1a")
+                        suspend_sent = True
+                    # The resume case then lets the gate finish: the adapter
+                    # must still prompt and authenticate after that Ctrl-Z.
+                    elif resume and suspend_sent and not gate_released:
+                        if b"^Z" in output:
+                            open(sleep_release, "ab").close()
+                            open(probe_release, "ab").close()
+                            gate_released = True
+                    elif resume and not passcode_sent:
+                        if b"Passcode: " in output:
+                            os.write(master, b"test-passcode\n")
+                            passcode_sent = True
+                    elif resume:
+                        # Poll the content, not mere existence: the stub's
+                        # result write is not an atomic publication.
+                        try:
+                            with open(auth_result, "r", encoding="utf-8") as result:
+                                authenticated = result.read() == "test-passcode\n"
+                        except FileNotFoundError:
+                            pass
+                        if authenticated:
+                            os.write(master, b"\x03")
+                            cancel_sent = True
                     # The normal gate case covers cancellation after the worker
                     # really owns the terminal. The startup case above instead
                     # requires Ctrl-C to remain with the launcher.
@@ -487,7 +580,10 @@ def run_case(port, cancel=False, startup_mode=""):
                         and worker_ready
                         and worker_foreground
                         and probe_held_seen
+                        and (not suspend or b"^Z" in output)
                     ):
+                        if suspend:
+                            open(sleep_release, "ab").close()
                         ready_before_cancel = worker_ready
                         os.write(master, b"\x03")
                         cancel_sent = True
@@ -500,6 +596,8 @@ def run_case(port, cancel=False, startup_mode=""):
                 break
     finally:
         open(probe_release, "ab").close()
+        if suspend:
+            open(sleep_release, "ab").close()
         if status is None:
             if worker_pid is not None:
                 try:
@@ -534,12 +632,16 @@ def run_case(port, cancel=False, startup_mode=""):
         "ready": ready_before_cancel,
         "reaped": reaped,
         "runtime_clean": not os.listdir(runtime_root),
+        "suspend_sent": suspend_sent,
+        "authenticated": authenticated,
     }
 
 bounded_case = run_case(10454)
 cancel_case = run_case(10455, cancel=True)
 startup_cancel_case = run_case(10456, cancel=True, startup_mode="block")
 startup_exit_case = run_case(10457, startup_mode="exit")
+suspend_case = run_case(10458, cancel=True, suspend=True)
+resume_case = run_case(10459, cancel=True, suspend=True, resume=True)
 bounded = (
     bounded_case["exit"] == 1
     and bounded_case["reaped"]
@@ -571,11 +673,28 @@ startup_exit_preserved = (
     and startup_exit_case["runtime_clean"]
     and not startup_exit_case["adapter"]
 )
+suspended_cancelled = (
+    suspend_case["suspend_sent"]
+    and suspend_case["cancel_sent"]
+    and suspend_case["exit"] == 130
+    and suspend_case["reaped"]
+    and not suspend_case["adapter"]
+)
+resumed_authenticated = (
+    resume_case["suspend_sent"]
+    and resume_case["authenticated"]
+    and resume_case["cancel_sent"]
+    and resume_case["exit"] == 130
+    and resume_case["reaped"]
+    and resume_case["adapter"]
+)
 with open(results_file, "w", encoding="utf-8") as results:
     results.write(f"bounded={int(bounded)}\n")
     results.write(f"cancelled={int(cancelled)}\n")
     results.write(f"startup_cancelled={int(startup_cancelled)}\n")
     results.write(f"startup_exit_preserved={int(startup_exit_preserved)}\n")
+    results.write(f"suspended_cancelled={int(suspended_cancelled)}\n")
+    results.write(f"resumed_authenticated={int(resumed_authenticated)}\n")
 if not bounded:
     sys.stderr.write(f"bounded: {bounded_case}\n")
     sys.stderr.buffer.write(bounded_case["output"])
@@ -588,7 +707,26 @@ if not startup_cancelled:
 if not startup_exit_preserved:
     sys.stderr.write(f"startup exit: {startup_exit_case}\n")
     sys.stderr.buffer.write(startup_exit_case["output"])
-sys.exit(0 if all((bounded, cancelled, startup_cancelled, startup_exit_preserved)) else 1)
+if not suspended_cancelled:
+    sys.stderr.write(f"gate suspension: {suspend_case}\n")
+    sys.stderr.buffer.write(suspend_case["output"])
+if not resumed_authenticated:
+    sys.stderr.write(f"gate resume: {resume_case}\n")
+    sys.stderr.buffer.write(resume_case["output"])
+sys.exit(
+    0
+    if all(
+        (
+            bounded,
+            cancelled,
+            startup_cancelled,
+            startup_exit_preserved,
+            suspended_cancelled,
+            resumed_authenticated,
+        )
+    )
+    else 1
+)
 PY
 _assert_exit "terminal gate: a failed foreground probe is bounded" 0 "$gate_exit"
 if [[ -r "$gate_results" ]]; then
@@ -604,6 +742,10 @@ _assert_contains "terminal gate: startup Ctrl-C stays with the launcher until tr
   "startup_cancelled=1" "$gate_result_text"
 _assert_contains "terminal gate: preserves a worker failure before readiness" \
   "startup_exit_preserved=1" "$gate_result_text"
+_assert_contains "terminal gate: Ctrl-Z does not wedge the gated worker" \
+  "suspended_cancelled=1" "$gate_result_text"
+_assert_contains "terminal gate: authentication completes after a gate Ctrl-Z" \
+  "resumed_authenticated=1" "$gate_result_text"
 
 # Exercise a real controlling PTY rather than piping input. macOS Bash job
 # control differs from noninteractive subprocess behavior: Ctrl-Z is terminal

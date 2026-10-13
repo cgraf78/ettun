@@ -49,11 +49,12 @@ run_transport_worker() {
   local gate_deadline=$((SECONDS + FOREGROUND_GATE_TIMEOUT + 2))
   local -a et_argv=()
 
-  # An adapter may restore SIGTSTP to its default while asking for credentials,
-  # stopping this entire process group even though the launcher ignores Ctrl-Z.
-  # Before control attachment no other process can safely resume that group, so
-  # this worker does it. After attachment the launcher owns the bg/CONT handoff.
-  trap '[[ -e "$worker_runtime_dir/control.attached" ]] || kill -CONT 0 2>/dev/null || true' TSTP
+  # Keep the script-wide TSTP ignore until the adapter is launched below. The
+  # gate and status cleanup run external commands in the foreground while this
+  # group can own the terminal. A command stopped by Ctrl-Z would block this
+  # non-job-control shell, and with it every trap, until something else killed
+  # it. Inherited SIG_IGN keeps those commands running instead.
+
   # While the worker owns the terminal, Ctrl-C is delivered here rather than to
   # the launcher. Publish intent first, then kill the whole group. The launcher
   # uses the marker to return 130 even when macOS Bash reports a transient fg or
@@ -89,6 +90,12 @@ run_transport_worker() {
   fi
 
   rm -f "$worker_status_file" "$worker_status_tmp"
+  # An adapter may restore SIGTSTP to its default while asking for credentials,
+  # stopping this entire process group even though the launcher ignores Ctrl-Z.
+  # Before control attachment no other process can safely resume that group, so
+  # this worker does it while waiting below. After attachment the launcher owns
+  # the bg/CONT handoff.
+  trap '[[ -e "$worker_runtime_dir/control.attached" ]] || kill -CONT 0 2>/dev/null || true' TSTP
   # A trapped TSTP makes Bash wait statuses platform- and timing-dependent. In
   # practice, the same stop/resume race produced 128+TSTP, 255, and a later -1
   # that became 255, while the adapter's real exit was 126 or 127. Retrying wait
@@ -152,6 +159,9 @@ run_transport_worker() {
     fi
     break
   done
+  # The wrapper is gone, so there is nothing left to resume. Ignore Ctrl-Z again
+  # before the foreground cleanup below for the same reason as the gate.
+  trap '' TSTP
   if [[ -r "$worker_status_file" ]]; then
     IFS= read -r recorded_status <"$worker_status_file" || true
     # A killed wrapper may never publish. Validate before overriding the best
