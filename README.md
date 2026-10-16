@@ -19,7 +19,7 @@ token-protected control port are opened on the client's loopback interface.
 Only loopback listeners are opened on the ET server. `database.internal:443`
 does not need to run ET; it only needs to be reachable from `gateway.example`.
 
-Why not ET's own `-t`/`-r` forwards? In ET 7.0.0, the current release, those
+Why not ET's own `-t`/`-r` forwards? In ET releases through 7.0.0, those
 always connect to localhost on the far end, even when given a destination
 host. `ettun` relays to any host the far end can reach (the ET server for a
 local route, the client for a reverse route). Ctrl-C cleans up the remote
