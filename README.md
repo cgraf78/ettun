@@ -19,6 +19,13 @@ token-protected control port are opened on the client's loopback interface.
 Only loopback listeners are opened on the ET server. `database.internal:443`
 does not need to run ET; it only needs to be reachable from `gateway.example`.
 
+Why not ET's own `-t`/`-r` forwards? In ET 7.0.0, the current release, those
+always connect to localhost on the far end, even when given a destination
+host. `ettun` relays to any host the far end can reach (the ET server for a
+local route, the client for a reverse route). Ctrl-C cleans up the remote
+relay, and a relay left behind by a lost connection is reclaimed by the next
+run from the same client for the same port.
+
 ## Installation
 
 Install with a checkout-backed curl bootstrap:
@@ -119,8 +126,8 @@ should use `socat`.
 | `ETTUN_ET` | ET client executable name or path. Defaults to `et`. |
 | `ETTUN_TRANSPORT` | Executable adapter used instead of invoking `et` directly. |
 | `ETTUN_CLIENT_ID` | Stable 32-character lowercase hexadecimal client identity. Normally generated automatically. |
-| `ETTUN_REMOTE_PORT_SLOT_V1` | Provider-assigned integer from 0 through 818 that selects one disjoint generated-port palette. |
-| `ETTUN_TRANSPORT_SINGLE_INVOCATION_V1` | Prevalidated provider assertion that the selected adapter must not be reinvoked. The only accepted value is `1`. |
+| `ETTUN_REMOTE_PORT_SLOT_V1` | For orchestrators such as [fwdports](https://github.com/cgraf78/fwdports). Provider-assigned integer from 0 through 818 that selects one disjoint generated-port palette. |
+| `ETTUN_TRANSPORT_SINGLE_INVOCATION_V1` | For orchestrators such as [fwdports](https://github.com/cgraf78/fwdports). Prevalidated provider assertion that the selected adapter must not be reinvoked. The only accepted value is `1`. |
 
 Without `ETTUN_CLIENT_ID`, ettun creates a private identity at
 `${XDG_STATE_HOME:-$HOME/.local/state}/ettun/client-id`. The identity is not an
