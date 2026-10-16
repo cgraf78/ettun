@@ -28,10 +28,11 @@ configuration variables, and the adapter protocol.
 - fwdports' `ettun` driver depends on this interface: it matches the
   `Usage: ettun VIA LOCAL_PORT TARGET TARGET_PORT`,
   `ettun VIA [--jump-host JUMP_HOST]`, and `Provider contract:
-  remote-port-slot-v1` lines of `ettun --help`, probes
-  `--ettun-capabilities` for `connect-v2`, and sets `ETTUN_TRANSPORT`,
-  `ETTUN_REMOTE_PORT_SLOT_V1`, and `ETTUN_TRANSPORT_SINGLE_INVOCATION_V1`.
-  Keep them compatible.
+  remote-port-slot-v1` lines of `ettun --help`; it sets `ETTUN_TRANSPORT`,
+  `ETTUN_REMOTE_PORT_SLOT_V1`, and `ETTUN_TRANSPORT_SINGLE_INVOCATION_V1`;
+  and it queries its own transport adapter with the README's
+  `ADAPTER --ettun-capabilities` protocol, requiring `connect-v2` for
+  reverse routes. Keep all of these compatible.
 - The README claims Bash 3.2, but CI does not enforce it: there is no
   `macos-bash32` job and the macOS leg runs Homebrew Bash. On macOS, check
   with `/bin/bash test/run`.
@@ -40,9 +41,9 @@ configuration variables, and the adapter protocol.
 
 - Local: `test/run`. It lints the inventory's `program` rows when
   `shellcheck` is installed (skipping silently otherwise), then runs the
-  suites listed in it, in order. A new suite must be added to that list or
-  it never runs, locally or in CI. Never parallelize them: they own process
-  groups, pseudo-terminals, and loopback listeners.
+  suites hard-coded in `test/run`, in order. A new suite must be added to
+  that list or it never runs, locally or in CI. Never parallelize them:
+  they own process groups, pseudo-terminals, and loopback listeners.
 - CI: `ETTUN_SKIP_SHELLCHECK=1 test/run`, on the full shared matrix
   (Linux, macOS, Termux) for every PR.
 - Slow host: `ETTUN_TEST_TIME_SCALE=3 test/run`.
