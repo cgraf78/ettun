@@ -35,7 +35,8 @@ configuration variables, and the adapter protocol.
   reverse routes. Keep all of these compatible.
 - The README names Bash 3.2 as the minimum but says CI does not test it:
   there is no `macos-bash32` job and the macOS leg runs Homebrew Bash. On
-  macOS, check with `/bin/bash test/run`.
+  macOS, check with `PATH="/bin:$PATH" test/run`. `/bin/bash test/run` runs
+  only the runner under 3.2: the suites and `bin/ettun` find `bash` on PATH.
 
 ## Testing
 
