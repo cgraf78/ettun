@@ -20,8 +20,8 @@ jobs:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@e3a25ae946aea8fd57da3bf2ffbf9f94ea84b8d9
     with:
       # Signal and job-control behavior differs materially across GNU/Linux,
-      # macOS Bash 3.2, and Termux. Run the full shared matrix on every PR so a
-      # cleanup regression cannot wait for the scheduled compatibility run.
+      # macOS, and Termux. Run the full shared matrix on every PR so a cleanup
+      # regression cannot wait for the scheduled compatibility run.
       matrix-set: full
       profiles: base,python,openssh-netcat-lsof,procps
       shellcheck-inventory-path: .github/shellcheck-files.txt
