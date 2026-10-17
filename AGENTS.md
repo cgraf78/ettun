@@ -33,9 +33,10 @@ configuration variables, and the adapter protocol.
   and it queries its own transport adapter with the README's
   `ADAPTER --ettun-capabilities` protocol, requiring `connect-v2` for
   reverse routes. Keep all of these compatible.
-- The README claims Bash 3.2, but CI does not enforce it: there is no
-  `macos-bash32` job and the macOS leg runs Homebrew Bash. On macOS, check
-  with `/bin/bash test/run`.
+- The README names Bash 3.2 as the minimum but says CI does not test it:
+  there is no `macos-bash32` job and the macOS leg runs Homebrew Bash. On
+  macOS, check with `PATH="/bin:$PATH" test/run`. `/bin/bash test/run` runs
+  only the runner under 3.2: the suites and `bin/ettun` find `bash` on PATH.
 
 ## Testing
 

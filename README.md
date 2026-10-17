@@ -2,7 +2,7 @@
 
 ![Tests](https://github.com/cgraf78/ettun/actions/workflows/test.yml/badge.svg?branch=main)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
+[![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2%20%283.2%20not%20CI--tested%29-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Termux-lightgrey.svg)](#)
 
 `ettun` exposes a TCP endpoint reachable from an Eternal Terminal server at a
@@ -37,7 +37,8 @@ curl -fsSL https://raw.githubusercontent.com/cgraf78/ettun/main/install.sh | bas
 This keeps a durable managed checkout under `$XDG_DATA_HOME` when that path is
 absolute, or under `$HOME/.local/share` otherwise, and publishes a link to its
 `ettun` command. It does not use a release asset or copy a second runtime tree.
-Git and Bash 3.2 or newer are required.
+Git and Bash 3.2 or newer are required; CI tests only newer Bash (see
+[Requirements](#requirements)).
 
 To choose and manage the checkout yourself instead:
 
@@ -97,7 +98,8 @@ control stream must stay alive for the remote relay's lifetime.
 
 The client needs:
 
-- Bash 3.2 or newer;
+- Bash 3.2 or newer (CI runs only newer Bash, so stock macOS `/bin/bash`
+  3.2 is not CI-tested);
 - the `et` client, unless a custom transport adapter is configured;
 - `base64`, `gzip`, and one of `sha256sum`, `shasum`, or `openssl`;
 - standard Unix tools including `awk`, `od`, `ps`, `sed`, and `tee`; and
