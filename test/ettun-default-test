@@ -28,7 +28,8 @@ ETTUN_TEST_EXIT=23 \
 unset ETTUN_TEST_EXIT
 _assert_exit "jump host: reaches stock ET" 23 "$run_exit"
 _assert_contains "jump host: selects ET native jump mode" \
-  $'<--jumphost>\n<jump.example>' "$(cat "$log")"
+  $'<--jumphost>\n<jump.example>\n<--no-terminal>\n<--no-persist>\n<--keepalive>\n<5>\n<--terminal-path>\n<env NO_TMUX=1 etterminal>\n<--tunnel>' \
+  "$(cat "$log")"
 _assert_contains "jump host: preserves the relay destination" \
   '<gateway.example>' "$(cat "$log")"
 
@@ -899,8 +900,9 @@ _capture_default_launch
 _assert_exit "default launch: succeeds" 0 "$run_exit"
 _assert_contains "default launch: runs ET without a terminal" $'et\n<--no-terminal>' "$commands"
 _assert_contains "default launch: enables ET keepalives" $'<--keepalive>\n<5>' "$commands"
-_assert_contains "default launch: starts the remote login shell with NO_TMUX=1" \
-  $'<--terminal-path>\n<env NO_TMUX=1 etterminal>' "$commands"
+_assert_contains "default launch: passes the complete stock ET option prefix" \
+  $'et\n<--no-terminal>\n<--no-persist>\n<--keepalive>\n<5>\n<--terminal-path>\n<env NO_TMUX=1 etterminal>\n<--tunnel>' \
+  "$commands"
 # ET 7.1 reads these short flags with OpenSSH meanings that break the tunnel.
 for short_flag in -N -t; do
   _assert_not_contains "default launch: avoids the ambiguous ET flag $short_flag" \
@@ -927,7 +929,7 @@ _assert_contains "default launch: enters an explicit POSIX remote shell" \
   "exec /bin/sh -c '" \
   "$transport_remote_command"
 case "$transport_remote_command" in
-  ' test -z "$TMUX" && exec /bin/sh -c '*) _pass "default launch: execs only outside tmux" ;;
+  ' printenv TMUX>/dev/null||exec /bin/sh -c '*) _pass "default launch: execs only outside tmux" ;;
   *) _fail "default launch: execs only outside tmux" ;;
 esac
 case "$transport_remote_command" in
@@ -1062,6 +1064,8 @@ _assert_contains "reverse-only route: keeps the private control mapping" \
   $'<--tunnel>\n<' "$reverse_only_commands"
 _assert_contains "reverse-only route: adds the reverse ET mapping" \
   $'<--reversetunnel>\n<127.0.0.1:' "$reverse_only_commands"
+_assert_contains "reverse-only route: starts the login shell with NO_TMUX=1" \
+  $'<--terminal-path>\n<env NO_TMUX=1 etterminal>' "$reverse_only_commands"
 _assert_contains "reverse-only route: reports the requested listener" \
   'localhost:22023 -> 127.0.0.1:22' "$reverse_only_output"
 
@@ -1615,16 +1619,11 @@ bootstrap_guard_target="$tmp/bootstrap-guard-target"
 mkdir -p "$bootstrap_guard_target"
 printf 'unchanged\n' >"$bootstrap_guard_target/w"
 ln -s "$bootstrap_guard_target" "$bootstrap_dir"
-# ET types the command followed by `; exit`, so run that exact line plus a
-# later command: outside tmux the bootstrap must replace the login shell.
-typed_remote_command="$remote_transport_command; exit"$'\n'"echo shell-survived"
 bootstrap_guard_exit=0
-bootstrap_guard_output=$(sh -c "$typed_remote_command" 2>&1) ||
+bootstrap_guard_output=$(sh -c "$remote_transport_command" 2>&1) ||
   bootstrap_guard_exit=$?
 _assert_exit "remote bootstrap staging: refuses a preexisting shared path" \
   73 "$bootstrap_guard_exit"
-_assert_not_contains "typed bootstrap: replaces the login shell outside tmux" \
-  shell-survived "$bootstrap_guard_output"
 _assert_contains "remote bootstrap staging: reports a tokenized state failure" \
   "ETTUN_FATAL:$remote_token:73:bootstrap-state" "$bootstrap_guard_output"
 _assert_eq "remote bootstrap staging: does not follow a hostile symlink" \
@@ -1637,34 +1636,55 @@ fi
 rm -f "$bootstrap_dir"
 rm -rf "$bootstrap_guard_target"
 
-# A startup file that attaches to tmux before ET types the command sends the
-# line to a pane's shell instead. It must leave that shell alone: no exec, no
-# bootstrap state, and ET's `; exit` must not end it. Check every shell family
-# installed here; each parses the line as an interactive login would.
+# ET types the command followed by `; exit`. Outside tmux the bootstrap must
+# replace the login shell. A startup file that attached to tmux first sends
+# the line to a pane's shell instead, which it must leave alone: no exec, and
+# ET's `; exit` must not end it. Check every installed shell family, also
+# under nounset, by running that exact line plus a later command. A hostile
+# staging path makes an exec fail fast with status 73 instead of waiting out
+# the bootstrap deadline.
+typed_remote_command="$remote_transport_command; exit"$'\n'"echo shell-survived"
 typed_shell_home="$tmp/typed-shell-home"
-mkdir -p "$typed_shell_home"
-for typed_shell in sh bash zsh fish; do
-  command -v "$typed_shell" >/dev/null 2>&1 || continue
+mkdir -p "$typed_shell_home" "$bootstrap_guard_target"
+ln -s "$bootstrap_guard_target" "$bootstrap_dir"
+for typed_shell in sh bash bash-nounset zsh zsh-nounset fish; do
   case $typed_shell in
+    bash-nounset) typed_shell_argv=(bash -u -c) ;;
     zsh) typed_shell_argv=(zsh -f -c) ;;
+    zsh-nounset) typed_shell_argv=(zsh -f -o nounset -c) ;;
     fish) typed_shell_argv=(fish --no-config -c) ;;
     *) typed_shell_argv=("$typed_shell" -c) ;;
   esac
-  typed_exit=0
-  typed_output=$(HOME="$typed_shell_home" ZDOTDIR="$typed_shell_home" \
-    XDG_CONFIG_HOME="$typed_shell_home" XDG_DATA_HOME="$typed_shell_home" \
-    HISTFILE=/dev/null TMUX=/tmp/tmux-test/default,1,0 \
-    "${typed_shell_argv[@]}" "$typed_remote_command" 2>&1) || typed_exit=$?
-  _assert_exit "typed bootstrap in tmux ($typed_shell): keeps the shell" \
-    0 "$typed_exit"
-  _assert_eq "typed bootstrap in tmux ($typed_shell): runs nothing else" \
-    shell-survived "$typed_output"
+  if ! command -v "${typed_shell_argv[0]}" >/dev/null 2>&1; then
+    printf '  SKIP: typed bootstrap (%s): shell is not installed\n' \
+      "$typed_shell"
+    continue
+  fi
+  for typed_tmux in "" /tmp/tmux-test/default,1,0; do
+    typed_exit=0
+    typed_output=$(
+      if [[ -n $typed_tmux ]]; then export TMUX=$typed_tmux; fi
+      HOME="$typed_shell_home" ZDOTDIR="$typed_shell_home" \
+        XDG_CONFIG_HOME="$typed_shell_home" XDG_DATA_HOME="$typed_shell_home" \
+        HISTFILE=/dev/null ETTUN_BOOTSTRAP_TIMEOUT="$ETTUN_TEST_TIME_SCALE" \
+        "${typed_shell_argv[@]}" "$typed_remote_command" 2>&1
+    ) || typed_exit=$?
+    if [[ -z $typed_tmux ]]; then
+      _assert_exit "typed bootstrap ($typed_shell): execs outside tmux" \
+        73 "$typed_exit"
+      _assert_not_contains \
+        "typed bootstrap ($typed_shell): replaces the shell outside tmux" \
+        shell-survived "$typed_output"
+    else
+      _assert_exit "typed bootstrap in tmux ($typed_shell): keeps the shell" \
+        0 "$typed_exit"
+      _assert_eq "typed bootstrap in tmux ($typed_shell): runs nothing else" \
+        shell-survived "$typed_output"
+    fi
+  done
 done
-if [[ ! -e "$bootstrap_dir" && ! -L "$bootstrap_dir" ]]; then
-  _pass "typed bootstrap in tmux: creates no bootstrap state"
-else
-  _fail "typed bootstrap in tmux: creates no bootstrap state"
-fi
+rm -f "$bootstrap_dir"
+rm -rf "$bootstrap_guard_target"
 
 if _real_relay_available; then
   base64_invoked="$tmp/bootstrap-base64.invoked"

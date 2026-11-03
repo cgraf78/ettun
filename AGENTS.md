@@ -32,7 +32,9 @@ configuration variables, and the adapter protocol.
   `ETTUN_REMOTE_PORT_SLOT_V1`, and `ETTUN_TRANSPORT_SINGLE_INVOCATION_V1`;
   and it queries its own transport adapter with the README's
   `ADAPTER --ettun-capabilities` protocol, requiring `connect-v2` for
-  reverse routes. Keep all of these compatible.
+  reverse routes. Keep all of these compatible. fwdports' stock-ET gate
+  also pins the exact ET argv shape that `bin/ettun` builds, so a change to
+  that argv needs a matching fwdports gate change landed first.
 - The README names Bash 3.2 as the minimum but says CI does not test it:
   there is no `macos-bash32` job and the macOS leg runs Homebrew Bash. On
   macOS, check with `PATH="/bin:$PATH" test/run`. `/bin/bash test/run` runs

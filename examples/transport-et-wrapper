@@ -28,9 +28,10 @@ else
 fi
 et_name=${ETTUN_ET:-et}
 # Mirror ettun's stock ET invocation. Long options mean the same in ET 7.0 and
-# 7.1, and the terminal path starts the remote login shell with NO_TMUX=1 so a
-# startup file can skip a tmux attach before ET types the remote command.
-et_argv=(--no-terminal --keepalive 5
+# 7.1, --no-persist stops ET 7.1 saving a session it cannot reattach with its
+# forwards, and the terminal path starts the remote login shell with NO_TMUX=1
+# so a startup file can skip a tmux attach before ET types the remote command.
+et_argv=(--no-terminal --no-persist --keepalive 5
   --terminal-path 'env NO_TMUX=1 etterminal')
 
 # Resolve one executable instead of evaluating a command string. An adapter is

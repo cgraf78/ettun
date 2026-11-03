@@ -139,7 +139,10 @@ run_transport_worker() {
       fi
       # Long options mean the same in ET 7.0 and 7.1. ET 7.1 reads -N and
       # -t with their OpenSSH meanings (no remote command, force a pty).
-      et_argv+=(--no-terminal --keepalive 5
+      # ET 7.1 also saves a reattachable session record by default, which
+      # cannot restore forwards and outlives a killed client; 7.0 ignores
+      # the unknown --no-persist.
+      et_argv+=(--no-terminal --no-persist --keepalive 5
         --terminal-path "$ET_TERMINAL_PATH" --tunnel "$worker_tunnel_spec")
       if [[ -n "$worker_reverse_tunnel_spec" ]]; then
         et_argv+=(--reversetunnel "$worker_reverse_tunnel_spec")
@@ -1257,11 +1260,13 @@ build_remote_command() {
   #
   # ET types this line plus `; exit` into the remote login shell. If a startup
   # file attached to tmux anyway, the line lands in a pane instead, so it must
-  # not replace or end that shell: the TMUX test skips exec, and the trailing
-  # backslash turns ET's `; exit` into ignored bootstrap arguments. The leading
-  # space keeps it out of histories that ignore space-prefixed commands.
+  # not replace or end that shell: the TMUX check skips exec, and the trailing
+  # backslash turns ET's `; exit` into ignored bootstrap arguments. printenv
+  # keeps the check valid under nounset and in fish, where `$TMUX` and
+  # `${TMUX-}` respectively fail. The leading space keeps the line out of
+  # histories that ignore space-prefixed commands.
   printf -v command '%s' \
-    " test -z \"\$TMUX\" && exec /bin/sh -c 'p=\$1; t=\$2; m=\$3; h=\$4; n=\$5; b=\${TMPDIR:-/tmp}/ettun-bootstrap.\$t; o=0; w=\$b/w; z=\$b/z; s=\$b/s; a=\$b/a; c=\$b/c; l=; d=; umask 077; " \
+    " printenv TMUX>/dev/null||exec /bin/sh -c 'p=\$1; t=\$2; m=\$3; h=\$4; n=\$5; b=\${TMPDIR:-/tmp}/ettun-bootstrap.\$t; o=0; w=\$b/w; z=\$b/z; s=\$b/s; a=\$b/a; c=\$b/c; l=; d=; umask 077; " \
     "stop_child() { k=; [ ! -r \"\$c\" ] || IFS= read -r k <\"\$c\" || :; case \"\$k\" in *[!0-9]*|\"\") ;; *) kill \"\$k\" 2>/dev/null || : ;; esac; }; cleanup() { [ \"\$o\" != 1 ] || stop_child; [ -z \"\$l\" ] || kill \"\$l\" 2>/dev/null || :; [ -z \"\$d\" ] || kill \"\$d\" 2>/dev/null || :; if [ \"\$o\" = 1 ]; then rm -f \"\$w\" \"\$z\" \"\$s\" \"\$a\" \"\$c\"; rmdir \"\$b\" 2>/dev/null || :; fi; }; fail() { status=\$1; reason=\$2; printf \"ETTUN_FATAL:%s:%s:%s\\n\" \"\$t\" \"\$status\" \"\$reason\" >&2; exit \"\$status\"; }; trap cleanup EXIT; trap \"exit 129\" HUP; trap \"exit 130\" INT; trap \"exit 143\" TERM; trap \"fail 124 bootstrap-timeout\" ALRM; mkdir \"\$b\" 2>/dev/null || fail 73 bootstrap-state; o=1; " \
     "command -v base64 >/dev/null 2>&1 || fail 127 missing-base64; command -v gzip >/dev/null 2>&1 || fail 127 missing-gzip; if command -v sha256sum >/dev/null 2>&1; then v=sha256sum; elif command -v shasum >/dev/null 2>&1; then v=shasum; elif command -v openssl >/dev/null 2>&1; then v=openssl; else fail 127 missing-sha256; fi; if command -v socat >/dev/null 2>&1; then r=socat; elif command -v ncat >/dev/null 2>&1; then r=ncat; else fail 127 missing-relay; fi; " \
     "printf \"#!/bin/sh\\necho \\\$\\\$ >\\\"\\\$ETB_C\\\"\\necho \\\"\\\$ETB_M\\\"\\nexec cat >\\\"\\\$ETB_W\\\"\\n\" >\"\$a\" || fail 74 bootstrap-handler; chmod 700 \"\$a\" || fail 74 bootstrap-handler; export ETB_W=\$w ETB_C=\$c ETB_M=ETTUN_BOOTSTRAP; " \

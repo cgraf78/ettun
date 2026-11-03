@@ -19,12 +19,12 @@ token-protected control port are opened on the client's loopback interface.
 Only loopback listeners are opened on the ET server. `database.internal:443`
 does not need to run ET; it only needs to be reachable from `gateway.example`.
 
-Why not ET's own `-t`/`-r` forwards? In ET releases through 7.0.0, those
-always connect to localhost on the far end, even when given a destination
-host. `ettun` relays to any host the far end can reach (the ET server for a
-local route, the client for a reverse route). Ctrl-C cleans up the remote
-relay, and a relay left behind by a lost connection is reclaimed by the next
-run from the same client for the same port.
+Why not ET's own `--tunnel`/`--reversetunnel` forwards? In ET releases through
+7.0.0, those always connect to localhost on the far end, even when given a
+destination host. `ettun` relays to any host the far end can reach (the ET
+server for a local route, the client for a reverse route). Ctrl-C cleans up
+the remote relay, and a relay left behind by a lost connection is reclaimed by
+the next run from the same client for the same port.
 
 ## Installation
 
@@ -127,15 +127,21 @@ ET runs `--command` by typing it into the remote login shell after that shell
 starts. A startup file that attaches to tmux, or execs another interactive
 program, would receive the command instead, and the tunnel would never start.
 ettun therefore starts the ET session with `NO_TMUX=1` in the login shell's
-environment, through ET's `--terminal-path` (`env NO_TMUX=1 etterminal`, so
-`etterminal` must be on the `PATH` of a non-interactive SSH command, as stock
-ET already requires). Startup files that auto-attach should skip the attach
-when `NO_TMUX` is set. If the command still lands in a tmux pane's shell
-(`TMUX` set), it neither replaces nor exits that shell, and the tunnel does
-not start. Interactive `et` logins are unaffected.
+environment, through ET's `--terminal-path` (`env NO_TMUX=1 etterminal`).
+ettun owns that option, so `etterminal` must be on the `PATH` of a
+non-interactive SSH command on `VIA`; a host that needs another etterminal
+path needs a custom transport adapter. Startup files that auto-attach should
+skip the attach when `NO_TMUX` is set. Interactive `et` logins are unaffected.
 
-ettun passes ET only long options, which ET 7.0 and 7.1 clients read the same
-way.
+As a best-effort fallback, a command that still lands at a tmux pane's shell
+prompt (`TMUX` set) neither replaces nor exits that shell. A full-screen
+program in that pane would still receive it as typed input. Either way the
+tunnel does not start, and ettun keeps waiting for the remote bootstrap until
+it is stopped.
+
+ettun passes ET only long options, which ET 7.0 and 7.1 clients parse the
+same way, plus `--no-persist`, which stops a 7.1 client from saving a session
+record that could not restore the forwards (7.0 ignores it).
 
 ## Configuration
 
@@ -182,10 +188,12 @@ before connection unless `connect-v2` is declared.
 The adapter must provide ET-compatible forwarding and remote-command behavior,
 remain in the foreground for the connection's lifetime, preserve its exit
 status, and leave standard input attached when it needs interactive
-authentication. Like stock ET, it should start the remote login shell with
-`NO_TMUX=1` in its environment (see
+authentication. Like ettun's stock ET invocation, it should start the remote
+login shell with `NO_TMUX=1` in its environment (see
 [Remote login shells](#remote-login-shells)); with ET, pass
-`--terminal-path 'env NO_TMUX=1 etterminal'`. It inherits
+`--terminal-path 'env NO_TMUX=1 etterminal'`. The command is written for
+ET's typed delivery: it ends with a line continuation that absorbs the
+`; exit` ET appends, so the adapter must deliver it the same way. It inherits
 `ETTUN_RETRY_MARKER`, the exact per-attempt marker
 that makes a remote bind collision retryable. Arbitrary adapter errors are not
 retried, even when their text happens to mention a collision. The one local
