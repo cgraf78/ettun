@@ -1023,7 +1023,7 @@ _assert_contains "mixed routes: keeps the local ET mapping" \
   $'<--tunnel>\n<10444:' "$mixed_commands"
 _assert_contains "mixed routes: adds a separate reverse ET mapping" \
   $'<--reversetunnel>\n<127.0.0.1:' "$mixed_commands"
-_assert_not_contains "mixed routes: avoids the ambiguous ET flag -r" \
+_assert_not_contains "mixed routes: uses the long reverse-tunnel option" \
   '<-r>' "$mixed_commands"
 _assert_contains "mixed routes: reverse target remains explicit" \
   ':127.0.0.1:22>' "$mixed_commands"
@@ -1649,14 +1649,18 @@ mkdir -p "$typed_shell_home" "$bootstrap_guard_target"
 ln -s "$bootstrap_guard_target" "$bootstrap_dir"
 for typed_shell in sh bash bash-nounset zsh zsh-nounset fish; do
   case $typed_shell in
-    bash-nounset) typed_shell_argv=(bash -u -c) ;;
+    bash-nounset) typed_shell_argv=(env -u BASH_ENV bash -u -c) ;;
     zsh) typed_shell_argv=(zsh -f -c) ;;
     zsh-nounset) typed_shell_argv=(zsh -f -o nounset -c) ;;
     fish) typed_shell_argv=(fish --no-config -c) ;;
     *) typed_shell_argv=("$typed_shell" -c) ;;
   esac
-  if ! command -v "${typed_shell_argv[0]}" >/dev/null 2>&1; then
-    printf '  SKIP: typed bootstrap (%s): shell is not installed\n' \
+  # Probe the exact invocation: a missing shell, or a fish too old for
+  # --no-config, is a skip rather than a failure.
+  if ! HOME="$typed_shell_home" XDG_CONFIG_HOME="$typed_shell_home" \
+    XDG_DATA_HOME="$typed_shell_home" "${typed_shell_argv[@]}" : \
+    >/dev/null 2>&1; then
+    printf '  SKIP: typed bootstrap (%s): shell is not available\n' \
       "$typed_shell"
     continue
   fi

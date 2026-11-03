@@ -100,7 +100,8 @@ The client needs:
 
 - Bash 3.2 or newer (CI runs only newer Bash, so stock macOS `/bin/bash`
   3.2 is not CI-tested);
-- the `et` client, unless a custom transport adapter is configured;
+- the `et` client (ET 7.0 or newer), unless a custom transport adapter is
+  configured;
 - `base64`, `gzip`, and one of `sha256sum`, `shasum`, or `openssl`;
 - standard Unix tools including `awk`, `od`, `ps`, `sed`, and `tee`; and
 - `ss` (preferred) or `lsof` for early detection of an occupied local port,
@@ -114,7 +115,7 @@ The client needs:
   listener whose accept queue is full drops that connect too, so it also
   gets status 75: a known limitation.
 
-The `VIA` host needs `/bin/sh`, `etserver`, `flock`, `base64`, `gzip`, a
+The `VIA` host needs `/bin/sh`, `env`, `etserver`, `flock`, `base64`, `gzip`, a
 SHA-256 implementation, and either `socat` or Nmap's `ncat`. `socat` is
 preferred because its relay preserves transparent half-close behavior. The
 `ncat` fallback is suitable for long-lived full-duplex protocols such as RDP
@@ -128,10 +129,12 @@ starts. A startup file that attaches to tmux, or execs another interactive
 program, would receive the command instead, and the tunnel would never start.
 ettun therefore starts the ET session with `NO_TMUX=1` in the login shell's
 environment, through ET's `--terminal-path` (`env NO_TMUX=1 etterminal`).
-ettun owns that option, so `etterminal` must be on the `PATH` of a
-non-interactive SSH command on `VIA`; a host that needs another etterminal
-path needs a custom transport adapter. Startup files that auto-attach should
-skip the attach when `NO_TMUX` is set. Interactive `et` logins are unaffected.
+ettun owns that option: its value replaces one an `ETTUN_ET` wrapper passes
+ahead of ettun's arguments, including `--macserver`'s. `etterminal` must
+therefore be on the `PATH` of a non-interactive SSH command on `VIA` (and on
+a `--jump-host`); a host that needs another etterminal path needs a custom
+transport adapter. Startup files that auto-attach should skip the attach when
+`NO_TMUX` is set. Interactive `et` logins are unaffected.
 
 As a best-effort fallback, a command that still lands at a tmux pane's shell
 prompt (`TMUX` set) neither replaces nor exits that shell. A full-screen
@@ -139,9 +142,11 @@ program in that pane would still receive it as typed input. Either way the
 tunnel does not start, and ettun keeps waiting for the remote bootstrap until
 it is stopped.
 
-ettun passes ET only long options, which ET 7.0 and 7.1 clients parse the
-same way, plus `--no-persist`, which stops a 7.1 client from saving a session
-record that could not restore the forwards (7.0 ignores it).
+ettun passes ET only long options, which ET 7.0 and 7.1 clients parse the same
+way, plus `--no-persist`, which stops a 7.1 client from saving a session
+record that could not restore the forwards (7.0 ignores it). CI and the
+end-to-end checks cover ET 7.0; ET 7.1 support is checked against its source
+only.
 
 ## Configuration
 
@@ -191,21 +196,23 @@ status, and leave standard input attached when it needs interactive
 authentication. Like ettun's stock ET invocation, it should start the remote
 login shell with `NO_TMUX=1` in its environment (see
 [Remote login shells](#remote-login-shells)); with ET, pass
-`--terminal-path 'env NO_TMUX=1 etterminal'`. The command is written for
-ET's typed delivery: it ends with a line continuation that absorbs the
-`; exit` ET appends, so the adapter must deliver it the same way. It inherits
-`ETTUN_RETRY_MARKER`, the exact per-attempt marker
-that makes a remote bind collision retryable. Arbitrary adapter errors are not
-retried, even when their text happens to mention a collision. The one local
-exception is decided by the kernel rather than adapter output: when the adapter
-fails before control attachment and a fresh bind probe finds that ettun's
-generated local control port is now taken by a socket other than a listener,
-and ettun never reached the adapter's control listener, that attempt counts as
-a collision. A listener there is more likely a forward the adapter left behind,
-so ettun names it and keeps the adapter's status. Stock ET does not exit when a
-forward fails: it binds every address `localhost` resolves to (normally both
-families) and keeps whichever succeeds, so ettun connects to its control
-forward on `127.0.0.1` and then `::1`.
+`--terminal-path 'env NO_TMUX=1 etterminal'`. The command is written for ET's
+typed delivery: it ends with a backslash that escapes the `;` of the `; exit`
+ET types after it on the same line, so deliver it the same way. Followed by a
+bare newline, the backslash joins the next line instead, and fish rejects it
+when it is run as a plain remote command. It inherits `ETTUN_RETRY_MARKER`,
+the exact per-attempt marker that makes a remote bind collision retryable.
+Arbitrary adapter errors are not retried, even when their text happens to
+mention a collision. The one local exception is decided by the kernel rather
+than adapter output: when the adapter fails before control attachment and a
+fresh bind probe finds that ettun's generated local control port is now taken
+by a socket other than a listener, and ettun never reached the adapter's
+control listener, that attempt counts as a collision. A listener there is more
+likely a forward the adapter left behind, so ettun names it and keeps the
+adapter's status. Stock ET 7.0 does not exit when a forward fails (ET 7.1 does
+when ssh_config sets `ExitOnForwardFailure yes`): it binds every address
+`localhost` resolves to (normally both families) and keeps whichever succeeds,
+so ettun connects to its control forward on `127.0.0.1` and then `::1`.
 
 A `connect-v2` adapter which cannot safely be invoked again without repeating
 authentication or rebuilding private session state should also print
