@@ -19,7 +19,9 @@ load measurements.
   Ctrl-C/Ctrl-Z behavior, and the foreground handoff between launcher and
   adapter.
 - `ettun-default-test` characterizes the ET argv contract, generated bootstrap
-  and remote supervisor, private remote state, authenticated attachment and
+  (including how each installed shell family parses the typed command inside
+  and outside tmux) and remote supervisor, private remote state,
+  authenticated attachment and
   stop flows, stale-owner recovery, local/reverse relay cleanup, fixed reverse
   listener failures, coordinated local/remote port separation, local port
   probing, and recovery when a local port is lost before the transport binds

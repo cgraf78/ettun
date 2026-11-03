@@ -3,8 +3,9 @@
 `transport-et-wrapper` is a complete, intentionally thin implementation of
 the `ETTUN_TRANSPORT` contract. It supports the legacy three-argument
 local-only invocation and declares `connect-v2` for explicit reverse routes.
-Both forms are converted to ET's argv interface, stay in the foreground, and
-preserve standard input and the transport exit status through `exec`.
+Both forms are converted to the same ET argv that ettun uses for stock ET,
+including the `NO_TMUX=1` terminal path, stay in the foreground, and preserve
+standard input and the transport exit status through `exec`.
 
 Use it directly from a checkout:
 

@@ -210,7 +210,7 @@ ETTUN_TEST_COLLISIONS=2 \
   _run_ettun gateway.example 10443 service.internal 443
 unset ETTUN_TEST_COLLISIONS
 attempts=$(grep -c '^et$' "$log")
-mappings=$(sed -n '/^<-t>$/{n;p;}' "$log")
+mappings=$(sed -n '/^<--tunnel>$/{n;p;}' "$log")
 unique_mappings=$(printf '%s\n' "$mappings" | sort -u | wc -l | tr -d ' ')
 _assert_exit "relay collision: retries to success" 0 "$run_exit"
 _assert_eq "relay collision: makes exactly three attempts" "3" "$attempts"
@@ -221,7 +221,7 @@ _assert_contains "relay collision: preserves collision diagnostics" \
 ETTUN_REMOTE_PORT_SLOT_V1=7 ETTUN_TEST_COLLISIONS=2 \
   _run_ettun gateway.example 10458 service.internal 443
 unset ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TEST_COLLISIONS
-slot_mappings=$(sed -n '/^<-t>$/{n;p;}' "$log")
+slot_mappings=$(sed -n '/^<--tunnel>$/{n;p;}' "$log")
 _assert_exit "coordinated collision: retries to success" 0 "$run_exit"
 _assert_contains "coordinated collision: first attempt stays in its palette" \
   '<10458:49159,' "$slot_mappings"

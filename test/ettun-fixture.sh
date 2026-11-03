@@ -4,6 +4,9 @@
 # shellcheck disable=SC1091,SC2016,SC2034
 set -o pipefail
 export NO_COLOR=1
+# The generated bootstrap refuses to run inside tmux. Suites started from a
+# tmux pane must still exercise it, and the cases that need tmux set it.
+unset TMUX TMUX_PANE
 
 # A non-interactive shell starts an asynchronous simple command (`suite &`)
 # with SIGINT and SIGQUIT ignored, and a Bash started that way can neither
@@ -270,7 +273,7 @@ _write_stub "$bin/et" \
   'for arg in "$@"; do' \
   '  printf "<%s>\n" "$arg" >>"$ETTUN_TEST_LOG"' \
   '  if [[ "$previous" == --command ]]; then printf "%s\n" "$arg" >"$ETTUN_TEST_REMOTE_COMMAND"; fi' \
-  '  if [[ "$previous" == -t ]]; then tunnel_spec=$arg; fi' \
+  '  if [[ "$previous" == --tunnel ]]; then tunnel_spec=$arg; fi' \
   '  previous="$arg"' \
   'done' \
   'printf "%s\n" "--" >>"$ETTUN_TEST_LOG"' \

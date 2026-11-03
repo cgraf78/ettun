@@ -121,6 +121,22 @@ preferred because its relay preserves transparent half-close behavior. The
 and VNC, but request/response protocols that half-close before reading a reply
 should use `socat`.
 
+### Remote login shells
+
+ET runs `--command` by typing it into the remote login shell after that shell
+starts. A startup file that attaches to tmux, or execs another interactive
+program, would receive the command instead, and the tunnel would never start.
+ettun therefore starts the ET session with `NO_TMUX=1` in the login shell's
+environment, through ET's `--terminal-path` (`env NO_TMUX=1 etterminal`, so
+`etterminal` must be on the `PATH` of a non-interactive SSH command, as stock
+ET already requires). Startup files that auto-attach should skip the attach
+when `NO_TMUX` is set. If the command still lands in a tmux pane's shell
+(`TMUX` set), it neither replaces nor exits that shell, and the tunnel does
+not start. Interactive `et` logins are unaffected.
+
+ettun passes ET only long options, which ET 7.0 and 7.1 clients read the same
+way.
+
 ## Configuration
 
 | Variable | Purpose |
@@ -166,7 +182,11 @@ before connection unless `connect-v2` is declared.
 The adapter must provide ET-compatible forwarding and remote-command behavior,
 remain in the foreground for the connection's lifetime, preserve its exit
 status, and leave standard input attached when it needs interactive
-authentication. It inherits `ETTUN_RETRY_MARKER`, the exact per-attempt marker
+authentication. Like stock ET, it should start the remote login shell with
+`NO_TMUX=1` in its environment (see
+[Remote login shells](#remote-login-shells)); with ET, pass
+`--terminal-path 'env NO_TMUX=1 etterminal'`. It inherits
+`ETTUN_RETRY_MARKER`, the exact per-attempt marker
 that makes a remote bind collision retryable. Arbitrary adapter errors are not
 retried, even when their text happens to mention a collision. The one local
 exception is decided by the kernel rather than adapter output: when the adapter
