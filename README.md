@@ -126,13 +126,14 @@ should use `socat`.
 
 ET runs `--command` by typing it into the remote login shell after that shell
 starts. A startup file that attaches to tmux, or execs another interactive
-program, would receive the command instead, and the tunnel would never start.
+program, receives the command instead: a pane's shell would be replaced by the
+bootstrap, and any other program would just receive the typed text.
 ettun therefore starts the ET session with `NO_TMUX=1` in the login shell's
 environment, through ET's `--terminal-path` (`env NO_TMUX=1 etterminal`).
 ettun owns that option: its value replaces one an `ETTUN_ET` wrapper passes
-ahead of ettun's arguments, including `--macserver`'s. `etterminal` must
-therefore be on the `PATH` of a non-interactive SSH command on `VIA` (and on
-a `--jump-host`); a host that needs another etterminal path needs a custom
+ahead of ettun's arguments, including `--macserver`'s. `env` and `etterminal`
+must therefore be on the `PATH` of a non-interactive SSH command on `VIA` (and
+on a `--jump-host`); a host that needs another etterminal path needs a custom
 transport adapter. Startup files that auto-attach should skip the attach when
 `NO_TMUX` is set. Interactive `et` logins are unaffected.
 
@@ -140,13 +141,16 @@ As a best-effort fallback, a command that still lands at a tmux pane's shell
 prompt (`TMUX` set) neither replaces nor exits that shell. A full-screen
 program in that pane would still receive it as typed input. Either way the
 tunnel does not start, and ettun keeps waiting for the remote bootstrap until
-it is stopped.
+it is stopped. This includes a startup file that execs a new tmux session
+without checking `NO_TMUX`: earlier versions ran the bootstrap inside that
+pane, but it is indistinguishable from an attached session, so it must now
+honor `NO_TMUX`.
 
 ettun passes ET only long options, which ET 7.0 and 7.1 clients parse the same
 way, plus `--no-persist`, which stops a 7.1 client from saving a session
-record that could not restore the forwards (7.0 ignores it). CI and the
-end-to-end checks cover ET 7.0; ET 7.1 support is checked against its source
-only.
+record that could not restore the forwards (7.0 ignores it). The test suite
+checks this argv against a stub ET; ET 7.1 support is checked against its
+source only.
 
 ## Configuration
 
@@ -171,7 +175,8 @@ The original local-only form preserves the legacy three-argument invocation:
 
 1. the `VIA` value;
 2. the complete comma-separated ET tunnel specification; and
-3. the bounded remote bootstrap command.
+3. the bounded remote bootstrap command, written for ET's typed delivery (see
+   below).
 
 Before using a custom adapter for a reverse route, ettun invokes
 `ADAPTER --ettun-capabilities` with standard input redirected from `/dev/null`
