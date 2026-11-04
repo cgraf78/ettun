@@ -28,7 +28,8 @@ ETTUN_TEST_EXIT=23 \
 unset ETTUN_TEST_EXIT
 _assert_exit "jump host: reaches stock ET" 23 "$run_exit"
 _assert_contains "jump host: selects ET native jump mode" \
-  $'<--jumphost>\n<jump.example>' "$(cat "$log")"
+  $'<--jumphost>\n<jump.example>\n<--no-terminal>\n<--no-persist>\n<--keepalive>\n<5>\n<--terminal-path>\n<env NO_TMUX=1 etterminal>\n<--tunnel>' \
+  "$(cat "$log")"
 _assert_contains "jump host: preserves the relay destination" \
   '<gateway.example>' "$(cat "$log")"
 
@@ -576,7 +577,7 @@ PY
     free_port=$(_free_port)
     ETTUN_REMOTE_PORT_SLOT_V1=$probe_slot ETTUN_TEST_PATH="$probe_path" \
       _run_ettun gateway.example "$free_port" service.internal 443
-    probe_mapping=$(sed -n '/^<-t>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
+    probe_mapping=$(sed -n '/^<--tunnel>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
     probe_control=${probe_mapping##*,}
     probe_control=${probe_control%%:*}
     _assert_exit "$label: slotted launch succeeds" 0 "$run_exit"
@@ -815,7 +816,7 @@ _capture_default_launch() {
   decoded_remote_command=$(_decode_remote_payload "$transport_remote_payload")
   commands+=$'\n'"$decoded_remote_command"
   output=$(cat "$stdout")
-  mapping=$(sed -n '/^<-t>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
+  mapping=$(sed -n '/^<--tunnel>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
   ports=$(sed -n "s/^$local_port:\([0-9][0-9]*\),\([0-9][0-9]*\):\([0-9][0-9]*\)$/\1 \2 \3/p" <<<"$mapping")
   read -r relay_port control_local_port control_remote_port <<<"$ports"
 }
@@ -897,9 +898,17 @@ _select_local_remote_launch() {
 _capture_default_launch
 
 _assert_exit "default launch: succeeds" 0 "$run_exit"
-_assert_contains "default launch: runs ET without a terminal" $'et\n<-N>' "$commands"
+_assert_contains "default launch: runs ET without a terminal" $'et\n<--no-terminal>' "$commands"
 _assert_contains "default launch: enables ET keepalives" $'<--keepalive>\n<5>' "$commands"
-expected_mapping=$(printf '<-t>\n<10443:%s,%s:%s>' \
+_assert_contains "default launch: passes the complete stock ET option prefix" \
+  $'et\n<--no-terminal>\n<--no-persist>\n<--keepalive>\n<5>\n<--terminal-path>\n<env NO_TMUX=1 etterminal>\n<--tunnel>' \
+  "$commands"
+# ET 7.1 reads these short flags with OpenSSH meanings that break the tunnel.
+for short_flag in -N -t; do
+  _assert_not_contains "default launch: avoids the ambiguous ET flag $short_flag" \
+    "<$short_flag>" "$commands"
+done
+expected_mapping=$(printf '<--tunnel>\n<10443:%s,%s:%s>' \
   "$relay_port" "$control_local_port" "$control_remote_port")
 _assert_contains "default launch: maps the requested local port" \
   "$expected_mapping" "$commands"
@@ -919,6 +928,14 @@ _assert_contains "default launch: sends a remote relay command" "<--command>" "$
 _assert_contains "default launch: enters an explicit POSIX remote shell" \
   "exec /bin/sh -c '" \
   "$transport_remote_command"
+case "$transport_remote_command" in
+  ' printenv TMUX>/dev/null||exec /bin/sh -c '*) _pass "default launch: execs only outside tmux" ;;
+  *) _fail "default launch: execs only outside tmux" ;;
+esac
+case "$transport_remote_command" in
+  *" \\") _pass "default launch: escapes the ; exit that ET appends" ;;
+  *) _fail "default launch: escapes the ; exit that ET appends" ;;
+esac
 _assert_contains "default launch: bootstrap uses a portable decoder" \
   "base64 -d" "$transport_remote_command"
 _assert_contains "default launch: bootstrap decompresses the remote supervisor" \
@@ -1003,9 +1020,11 @@ mixed_commands=$(cat "$log")
 mixed_output=$(cat "$stdout")
 _assert_exit "mixed routes: launch succeeds" 0 "$run_exit"
 _assert_contains "mixed routes: keeps the local ET mapping" \
-  $'<-t>\n<10444:' "$mixed_commands"
+  $'<--tunnel>\n<10444:' "$mixed_commands"
 _assert_contains "mixed routes: adds a separate reverse ET mapping" \
-  $'<-r>\n<127.0.0.1:' "$mixed_commands"
+  $'<--reversetunnel>\n<127.0.0.1:' "$mixed_commands"
+_assert_not_contains "mixed routes: uses the long reverse-tunnel option" \
+  '<-r>' "$mixed_commands"
 _assert_contains "mixed routes: reverse target remains explicit" \
   ':127.0.0.1:22>' "$mixed_commands"
 if [[ -s $bootstrap_payload_file ]]; then
@@ -1042,16 +1061,18 @@ reverse_only_output=$(cat "$stdout")
 reverse_only_remote=$(_decode_remote_payload "$(<"$bootstrap_payload_file")")
 _assert_exit "reverse-only route: launch succeeds" 0 "$run_exit"
 _assert_contains "reverse-only route: keeps the private control mapping" \
-  $'<-t>\n<' "$reverse_only_commands"
+  $'<--tunnel>\n<' "$reverse_only_commands"
 _assert_contains "reverse-only route: adds the reverse ET mapping" \
-  $'<-r>\n<127.0.0.1:' "$reverse_only_commands"
+  $'<--reversetunnel>\n<127.0.0.1:' "$reverse_only_commands"
+_assert_contains "reverse-only route: starts the login shell with NO_TMUX=1" \
+  $'<--terminal-path>\n<env NO_TMUX=1 etterminal>' "$reverse_only_commands"
 _assert_contains "reverse-only route: reports the requested listener" \
   'localhost:22023 -> 127.0.0.1:22' "$reverse_only_output"
 
 ETTUN_TEST_LSOF_EXIT=1 _run_ettun localhost \
   --local 10454 127.0.0.1 443
 unset ETTUN_TEST_LSOF_EXIT
-standalone_mapping=$(sed -n '/^<-t>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
+standalone_mapping=$(sed -n '/^<--tunnel>$/{n;s/^<\(.*\)>$/\1/p;q;}' "$log")
 standalone_ports=$(sed -n \
   's/^10454:\([0-9][0-9]*\),\([0-9][0-9]*\):[0-9][0-9]*$/\1 \2/p' \
   <<<"$standalone_mapping")
@@ -1073,7 +1094,7 @@ unset ETTUN_REMOTE_PORT_SLOT_V1
 slot_zero_commands=$(<"$log")
 _assert_exit "remote port slot v1: first coordinated route succeeds" 0 "$run_exit"
 _assert_contains "remote port slot v1: first palette owns the relay port" \
-  $'<-t>\n<10455:49152,' "$slot_zero_commands"
+  $'<--tunnel>\n<10455:49152,' "$slot_zero_commands"
 _assert_contains "remote port slot v1: first palette owns the control port" \
   ':49971>' "$slot_zero_commands"
 # The local control port is the slot's first palette value of the preferred
@@ -1089,7 +1110,7 @@ fi
 _assert_contains "remote port slot v1: local control avoids the remote tuple" \
   "<10455:49152,$slot_zero_control:49971>" "$slot_zero_commands"
 _assert_contains "remote port slot v1: first palette owns the reverse port" \
-  $'<-r>\n<127.0.0.1:51609:127.0.0.1:22>' "$slot_zero_commands"
+  $'<--reversetunnel>\n<127.0.0.1:51609:127.0.0.1:22>' "$slot_zero_commands"
 
 ETTUN_REMOTE_PORT_SLOT_V1=0 _run_ettun gateway.example \
   --reverse 22025 127.0.0.1 52428
@@ -1099,9 +1120,9 @@ _assert_exit "remote port slot v1: delayed reverse target succeeds" 0 \
   "$run_exit"
 _assert_contains \
   "remote port slot v1: local control avoids the reverse target port" \
-  "$(printf '<-t>\n<%s:49971>' "$slot_target_control")" "$slot_target_commands"
+  "$(printf '<--tunnel>\n<%s:49971>' "$slot_target_control")" "$slot_target_commands"
 _assert_contains "remote port slot v1: delayed reverse target remains explicit" \
-  $'<-r>\n<127.0.0.1:51609:127.0.0.1:52428>' "$slot_target_commands"
+  $'<--reversetunnel>\n<127.0.0.1:51609:127.0.0.1:52428>' "$slot_target_commands"
 
 ETTUN_REMOTE_PORT_SLOT_V1=0 _run_ettun gateway.example \
   --local 49152 service.internal 443
@@ -1111,7 +1132,7 @@ _assert_exit "remote port slot v1: colliding local endpoint succeeds" 0 \
   "$run_exit"
 _assert_contains \
   "remote port slot v1: generated tuple avoids the local endpoint" \
-  "$(printf '<-t>\n<49152:52428,%s:53247>' "$slot_retry_control")" \
+  "$(printf '<--tunnel>\n<49152:52428,%s:53247>' "$slot_retry_control")" \
   "$slot_local_commands"
 
 ETTUN_REMOTE_PORT_SLOT_V1=0 _run_ettun gateway.example \
@@ -1122,7 +1143,7 @@ _assert_exit "remote port slot v1: colliding destination endpoint succeeds" 0 \
   "$run_exit"
 _assert_contains \
   "remote port slot v1: generated tuple avoids the destination endpoint" \
-  "$(printf '<-t>\n<10456:52428,%s:53247>' "$slot_retry_control")" \
+  "$(printf '<--tunnel>\n<10456:52428,%s:53247>' "$slot_retry_control")" \
   "$slot_destination_commands"
 
 ETTUN_REMOTE_PORT_SLOT_V1=1 _run_ettun gateway.example 10456 service.internal 443
@@ -1130,7 +1151,7 @@ unset ETTUN_REMOTE_PORT_SLOT_V1
 slot_one_commands=$(<"$log")
 _assert_exit "remote port slot v1: second coordinated route succeeds" 0 "$run_exit"
 _assert_contains "remote port slot v1: adjacent palettes do not overlap" \
-  $'<-t>\n<10456:49153,' "$slot_one_commands"
+  $'<--tunnel>\n<10456:49153,' "$slot_one_commands"
 _assert_contains "remote port slot v1: second palette owns its control port" \
   ':49972>' "$slot_one_commands"
 
@@ -1615,6 +1636,60 @@ fi
 rm -f "$bootstrap_dir"
 rm -rf "$bootstrap_guard_target"
 
+# ET types the command followed by `; exit`. Outside tmux the bootstrap must
+# replace the login shell. A startup file that attached to tmux first sends
+# the line to a pane's shell instead, which it must leave alone: no exec, and
+# ET's `; exit` must not end it. Check every installed shell family, also
+# under nounset, by running that exact line plus a later command. A hostile
+# staging path makes an exec fail fast with status 73 instead of waiting out
+# the bootstrap deadline.
+typed_remote_command="$remote_transport_command; exit"$'\n'"echo shell-survived"
+typed_shell_home="$tmp/typed-shell-home"
+mkdir -p "$typed_shell_home" "$bootstrap_guard_target"
+ln -s "$bootstrap_guard_target" "$bootstrap_dir"
+for typed_shell in sh bash bash-nounset zsh zsh-nounset fish; do
+  case $typed_shell in
+    bash-nounset) typed_shell_argv=(env -u BASH_ENV bash -u -c) ;;
+    zsh) typed_shell_argv=(zsh -f -c) ;;
+    zsh-nounset) typed_shell_argv=(zsh -f -o nounset -c) ;;
+    fish) typed_shell_argv=(fish --no-config -c) ;;
+    *) typed_shell_argv=("$typed_shell" -c) ;;
+  esac
+  # Probe the exact invocation: a missing shell, or a fish too old for
+  # --no-config, is a skip rather than a failure.
+  if ! HOME="$typed_shell_home" XDG_CONFIG_HOME="$typed_shell_home" \
+    XDG_DATA_HOME="$typed_shell_home" "${typed_shell_argv[@]}" : \
+    >/dev/null 2>&1; then
+    printf '  SKIP: typed bootstrap (%s): shell is not available\n' \
+      "$typed_shell"
+    continue
+  fi
+  for typed_tmux in "" /tmp/tmux-test/default,1,0; do
+    typed_exit=0
+    typed_output=$(
+      if [[ -n $typed_tmux ]]; then export TMUX=$typed_tmux; fi
+      HOME="$typed_shell_home" ZDOTDIR="$typed_shell_home" \
+        XDG_CONFIG_HOME="$typed_shell_home" XDG_DATA_HOME="$typed_shell_home" \
+        HISTFILE=/dev/null ETTUN_BOOTSTRAP_TIMEOUT="$ETTUN_TEST_TIME_SCALE" \
+        "${typed_shell_argv[@]}" "$typed_remote_command" 2>&1
+    ) || typed_exit=$?
+    if [[ -z $typed_tmux ]]; then
+      _assert_exit "typed bootstrap ($typed_shell): execs outside tmux" \
+        73 "$typed_exit"
+      _assert_not_contains \
+        "typed bootstrap ($typed_shell): replaces the shell outside tmux" \
+        shell-survived "$typed_output"
+    else
+      _assert_exit "typed bootstrap in tmux ($typed_shell): keeps the shell" \
+        0 "$typed_exit"
+      _assert_eq "typed bootstrap in tmux ($typed_shell): runs nothing else" \
+        shell-survived "$typed_output"
+    fi
+  done
+done
+rm -f "$bootstrap_dir"
+rm -rf "$bootstrap_guard_target"
+
 if _real_relay_available; then
   base64_invoked="$tmp/bootstrap-base64.invoked"
   _write_stub "$remote_bin/base64" \
@@ -1928,6 +2003,10 @@ fi
 wait "$remote_pid" || killed_control_exit=$?
 _assert_exit "remote control death: exits instead of hanging without a marker" \
   75 "$killed_control_exit"
+# No listener error precedes this marker, so it must start its own line even
+# when a forwarded pty put a terminal sequence before it.
+_assert_contains "remote control death: starts its marker on a fresh line" \
+  $'\nETTUN_COLLISION:' "$(<"$tmp/remote.stderr")"
 if [[ ! -e "$remote_state" ]]; then
   _pass "remote control death: removes owned state"
 else

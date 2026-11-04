@@ -27,7 +27,12 @@ else
   exit 2
 fi
 et_name=${ETTUN_ET:-et}
-et_argv=(-N --keepalive 5)
+# Mirror ettun's stock ET invocation. Long options mean the same in ET 7.0 and
+# 7.1, --no-persist stops ET 7.1 saving a session it cannot reattach with its
+# forwards, and the terminal path starts the remote login shell with NO_TMUX=1
+# so a startup file can skip a tmux attach before ET types the remote command.
+et_argv=(--no-terminal --no-persist --keepalive 5
+  --terminal-path 'env NO_TMUX=1 etterminal')
 
 # Resolve one executable instead of evaluating a command string. An adapter is
 # trusted code and receives the generated bootstrap command, but it should not
@@ -40,9 +45,9 @@ fi
 # Build each ET option as a distinct argv element. An empty mapping is omitted;
 # ettun's v2 invocation always supplies its private control mapping in the
 # ordinary tunnel specification, while the reverse specification is optional.
-[[ -z $tunnel_spec ]] || et_argv+=(-t "$tunnel_spec")
+[[ -z $tunnel_spec ]] || et_argv+=(--tunnel "$tunnel_spec")
 [[ -z $reverse_tunnel_spec ]] ||
-  et_argv+=(-r "$reverse_tunnel_spec")
+  et_argv+=(--reversetunnel "$reverse_tunnel_spec")
 et_argv+=(--command "$remote_command" "$via_host")
 
 # Stay in the foreground, retain the caller's standard input for interactive

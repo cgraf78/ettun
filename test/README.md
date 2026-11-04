@@ -19,15 +19,16 @@ load measurements.
   Ctrl-C/Ctrl-Z behavior, and the foreground handoff between launcher and
   adapter.
 - `ettun-default-test` characterizes the ET argv contract, generated bootstrap
-  and remote supervisor, private remote state, authenticated attachment and
-  stop flows, stale-owner recovery, local/reverse relay cleanup, fixed reverse
-  listener failures, coordinated local/remote port separation, local port
-  probing, and recovery when a local port is lost before the transport binds
-  it. Its bind-probe cases use real loopback listeners and TIME-WAIT sockets
-  and compare ettun's answer with an actual bind on the host. They run once
-  with perl when it is installed and once on a PATH that mirrors the system
-  directories without perl, so the python3 fallback is covered wherever
-  ettun uses it (everywhere but macOS).
+  (including how each installed shell family parses the typed command inside
+  and outside tmux) and remote supervisor, private remote state, authenticated
+  attachment and stop flows, stale-owner recovery, local/reverse relay
+  cleanup, fixed reverse listener failures, coordinated local/remote port
+  separation, local port probing, and recovery when a local port is lost
+  before the transport binds it. Its bind-probe cases use real loopback
+  listeners and TIME-WAIT sockets and compare ettun's answer with an actual
+  bind on the host. They run once with perl when it is installed and once on a
+  PATH that mirrors the system directories without perl, so the python3
+  fallback is covered wherever ettun uses it (everywhere but macOS).
   Cases that run real listeners on generated ports retry with a fresh launch
   when the supervisor's own collision marker shows host traffic took a port,
   and the losing-transport cases retry with fresh ports when the stub reports

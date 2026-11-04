@@ -19,12 +19,12 @@ token-protected control port are opened on the client's loopback interface.
 Only loopback listeners are opened on the ET server. `database.internal:443`
 does not need to run ET; it only needs to be reachable from `gateway.example`.
 
-Why not ET's own `-t`/`-r` forwards? In ET releases through 7.0.0, those
-always connect to localhost on the far end, even when given a destination
-host. `ettun` relays to any host the far end can reach (the ET server for a
-local route, the client for a reverse route). Ctrl-C cleans up the remote
-relay, and a relay left behind by a lost connection is reclaimed by the next
-run from the same client for the same port.
+Why not ET's own `--tunnel`/`--reversetunnel` forwards? In ET releases through
+7.0.0, those always connect to localhost on the far end, even when given a
+destination host. `ettun` relays to any host the far end can reach (the ET
+server for a local route, the client for a reverse route). Ctrl-C cleans up
+the remote relay, and a relay left behind by a lost connection is reclaimed by
+the next run from the same client for the same port.
 
 ## Installation
 
@@ -100,7 +100,8 @@ The client needs:
 
 - Bash 3.2 or newer (CI runs only newer Bash, so stock macOS `/bin/bash`
   3.2 is not CI-tested);
-- the `et` client, unless a custom transport adapter is configured;
+- the `et` client (ET 7.0 or newer), unless a custom transport adapter is
+  configured;
 - `base64`, `gzip`, and one of `sha256sum`, `shasum`, or `openssl`;
 - standard Unix tools including `awk`, `od`, `ps`, `sed`, and `tee`; and
 - `ss` (preferred) or `lsof` for early detection of an occupied local port,
@@ -114,12 +115,47 @@ The client needs:
   listener whose accept queue is full drops that connect too, so it also
   gets status 75: a known limitation.
 
-The `VIA` host needs `/bin/sh`, `etserver`, `flock`, `base64`, `gzip`, a
+The `VIA` host needs `/bin/sh`, `env`, `etserver`, `flock`, `base64`, `gzip`, a
 SHA-256 implementation, and either `socat` or Nmap's `ncat`. `socat` is
 preferred because its relay preserves transparent half-close behavior. The
 `ncat` fallback is suitable for long-lived full-duplex protocols such as RDP
 and VNC, but request/response protocols that half-close before reading a reply
 should use `socat`.
+
+### Remote login shells
+
+ET runs `--command` by typing it into the remote login shell after that shell
+starts. A startup file that attaches to tmux, or execs another interactive
+program, receives the command instead: without the measures below, a pane's
+shell would be replaced by the bootstrap, and any other program would just
+receive the typed text. ettun therefore starts the ET session with `NO_TMUX=1`
+in the login shell's environment, through ET's `--terminal-path`
+(`env NO_TMUX=1 etterminal`). ettun owns that option: its value replaces one an
+`ETTUN_ET` wrapper passes ahead of ettun's arguments, including
+`--macserver`'s. `env` and `etterminal` must therefore be on the `PATH` of a
+non-interactive SSH command on `VIA` (and on a `--jump-host`); a host that
+needs another etterminal path needs a custom transport adapter. Startup files
+that auto-attach should skip the attach when `NO_TMUX` is set. Interactive `et`
+logins are unaffected.
+
+As a best-effort fallback, a command that still lands at a tmux pane's shell
+prompt (`TMUX` set) neither replaces nor exits that shell. A full-screen
+program in that pane would still receive it as typed input. Either way the
+tunnel does not start, and ettun keeps waiting for the remote bootstrap until
+it is stopped. This includes a startup file that execs a new tmux session
+without checking `NO_TMUX`: earlier versions ran the bootstrap inside that
+pane, but it is indistinguishable from an attached session, so it must now
+honor `NO_TMUX`.
+
+ettun passes ET only long options, which ET 7.0 and 7.1 clients parse the same
+way, plus `--no-persist`, which stops a 7.1 client from saving a session record
+that could not restore the forwards (7.0 ignores it). The test suite checks
+this argv against a stub ET. ettun itself has also been run end to end, outside
+the suite, on loopback with ET 7.0.0 and 7.1.1 clients and servers. A 7.1
+client also forwards the remote shell's terminal output, with CRLF line
+endings, which ettun reads for the collision marker, so ettun's output then
+also shows the typed bootstrap line and the remote prompt; a 7.0 client
+forwards none of it.
 
 ## Configuration
 
@@ -144,7 +180,8 @@ The original local-only form preserves the legacy three-argument invocation:
 
 1. the `VIA` value;
 2. the complete comma-separated ET tunnel specification; and
-3. the bounded remote bootstrap command.
+3. the bounded remote bootstrap command, written for ET's typed delivery (see
+   below).
 
 Before using a custom adapter for a reverse route, ettun invokes
 `ADAPTER --ettun-capabilities` with standard input redirected from `/dev/null`
@@ -166,25 +203,34 @@ before connection unless `connect-v2` is declared.
 The adapter must provide ET-compatible forwarding and remote-command behavior,
 remain in the foreground for the connection's lifetime, preserve its exit
 status, and leave standard input attached when it needs interactive
-authentication. It inherits `ETTUN_RETRY_MARKER`, the exact per-attempt marker
-that makes a remote bind collision retryable. Arbitrary adapter errors are not
-retried, even when their text happens to mention a collision. The one local
-exception is decided by the kernel rather than adapter output: when the adapter
-fails before control attachment and a fresh bind probe finds that ettun's
-generated local control port is now taken by a socket other than a listener,
-and ettun never reached the adapter's control listener, that attempt counts as
-a collision. A listener there is more likely a forward the adapter left behind,
-so ettun names it and keeps the adapter's status. Stock ET does not exit when a
-forward fails: it binds every address `localhost` resolves to (normally both
-families) and keeps whichever succeeds, so ettun connects to its control
-forward on `127.0.0.1` and then `::1`.
+authentication. Like ettun's stock ET invocation, it should start the remote
+login shell with `NO_TMUX=1` in its environment (see
+[Remote login shells](#remote-login-shells)); with ET, pass
+`--terminal-path 'env NO_TMUX=1 etterminal'`. The command is written for ET's
+typed delivery: it ends with a backslash that escapes the `;` of the `; exit`
+ET types after it on the same line, so deliver it the same way. Followed by a
+bare newline, the backslash joins the next line instead, and fish rejects it
+when it is run as a plain remote command. It inherits `ETTUN_RETRY_MARKER`,
+the exact per-attempt marker that makes a remote bind collision retryable.
+Arbitrary adapter errors are not retried, even when their text happens to
+mention a collision. The one local exception is decided by the kernel rather
+than adapter output: when the adapter fails before control attachment and a
+fresh bind probe finds that ettun's generated local control port is now taken
+by a socket other than a listener, and ettun never reached the adapter's
+control listener, that attempt counts as a collision. A listener there is more
+likely a forward the adapter left behind, so ettun names it and keeps the
+adapter's status. Stock ET 7.0 does not exit when a forward fails (ET 7.1 does
+when ssh_config sets `ExitOnForwardFailure yes`): it binds every address
+`localhost` resolves to (normally both families) and keeps whichever succeeds,
+so ettun connects to its control forward on `127.0.0.1` and then `::1`.
 
 A `connect-v2` adapter which cannot safely be invoked again without repeating
 authentication or rebuilding private session state should also print
 `single-invocation-v1`. If that adapter reports an authenticated random relay
 collision, ettun exits with status 75 and asks the operator to restart instead
-of invoking it a second time. Stock ET and adapters which omit this capability
-retain the bounded five-attempt collision retry.
+of invoking it a second time. Adapters which omit this capability retain the
+bounded five-attempt collision retry when ettun sees the remote marker; an
+ET-backed adapter, like stock ET, shows it only with a 7.1 client.
 
 An orchestrator which has already authenticated that capability may pass
 `ETTUN_TRANSPORT_SINGLE_INVOCATION_V1=1`, including for a local-only route whose
@@ -222,11 +268,14 @@ The supervisor records private state beneath
 `${XDG_CACHE_HOME:-$HOME/.cache}/ettun`, serializes replacement with `flock`,
 and removes only state whose token and process ownership match. Random relay
 bind collisions retry with a fresh token and port set, up to five attempts,
-except for an adapter declaring `single-invocation-v1` as described above. A
-generated local control port taken between ettun's probe and the transport's
-bind follows the same policy, staying within any provider-assigned slot. A
-collision on the requested fixed reverse port fails immediately and actionably,
-as does losing the requested fixed local port, which is named in the error.
+except for an adapter declaring `single-invocation-v1` as described above, and
+except with an ET 7.0 client (stock or through an ET-backed adapter), which
+never shows ettun the remote marker: ettun then exits with ET's status (0) and
+no tunnel. A generated local control port taken between ettun's probe and the
+transport's bind follows the same policy, staying within any provider-assigned
+slot. A collision on the requested fixed reverse port fails immediately and
+actionably, as does losing the requested fixed local port, which is named in
+the error.
 
 The full supervisor is never placed directly in ET's command argument. A small
 bootstrap listener accepts a size-bounded payload over the private control

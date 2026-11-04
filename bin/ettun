@@ -33,6 +33,13 @@ REMOTE_PORT_SLOT_COUNT=$((RELAY_PORT_SPAN / (\
 MAX_HANDOFF_RESUMES=8
 FOREGROUND_GATE_TIMEOUT=10
 REMOTE_COMMAND_MAX_BYTES=3072
+# ET types --command into a login shell it has already started, so a startup
+# file that attaches to tmux first would receive the command instead. ET 7.0
+# and 7.1 both start the session's etterminal through the SSH bootstrap
+# `echo ID | TERMINAL_PATH --verbose=N`, and the login shell inherits that
+# process's environment. NO_TMUX=1 is therefore set before any startup file
+# runs, which lets one skip its attach without racing the typed command.
+ET_TERMINAL_PATH='env NO_TMUX=1 etterminal'
 
 # The launcher starts this internal mode as its own job. The worker is the
 # stable process-group leader seen by Bash job control; the adapter runs below
@@ -130,9 +137,15 @@ run_transport_worker() {
       if [[ -n "$worker_jump_host" ]]; then
         et_argv+=(--jumphost "$worker_jump_host")
       fi
-      et_argv+=(-N --keepalive 5 -t "$worker_tunnel_spec")
+      # Long options mean the same in ET 7.0 and 7.1. ET 7.1 reads -N and
+      # -t with their OpenSSH meanings (no remote command, force a pty).
+      # ET 7.1 also saves a reattachable session record by default, which
+      # cannot restore forwards and outlives a killed client; 7.0 ignores
+      # the unknown --no-persist.
+      et_argv+=(--no-terminal --no-persist --keepalive 5
+        --terminal-path "$ET_TERMINAL_PATH" --tunnel "$worker_tunnel_spec")
       if [[ -n "$worker_reverse_tunnel_spec" ]]; then
-        et_argv+=(-r "$worker_reverse_tunnel_spec")
+        et_argv+=(--reversetunnel "$worker_reverse_tunnel_spec")
       fi
       et_argv+=(--command "$worker_remote_command" "$worker_via_host")
       "$worker_et_path" "${et_argv[@]}" || adapter_status=$?
@@ -688,6 +701,11 @@ ettun_stop_file=\$ettun_state/stop
 ettun_stop_gate=\$ettun_state/stop-ready
 ettun_relay_gate=\$ettun_state/relay-ready
 umask 077
+# Start the collision marker on a fresh line: ET 7.1 forwards the remote pty,
+# where a shell's pre-command terminal sequence can precede the first output.
+print_retry_marker() {
+  printf '\\n%s\\n' "\$ettun_marker" >&2
+}
 # Fatal markers carry the attempt token so unrelated adapter output cannot
 # forge a retryable or actionable remote failure.
 fatal() {
@@ -1043,7 +1061,7 @@ fail_stopped_data_relay() {
     ! process_is_running "\$relay_pid"; then
     wait "\$relay_pid" 2>/dev/null || :
     relay_pid=
-    printf '%s\\n' "\$ettun_marker" >&2
+    print_retry_marker
     exit 75
   fi
   if [ "\$ettun_reverse_enabled" -eq 1 ] &&
@@ -1110,7 +1128,7 @@ check_stop_listener() {
     wait "\$stop_pid" || stop_status=\$?
     stop_pid=
     if [ "\$stop_status" -ne 0 ]; then
-      printf '%s\\n' "\$ettun_marker" >&2
+      print_retry_marker
       exit 75
     fi
     if read_control_line "\$ettun_stop_file" && \
@@ -1198,7 +1216,7 @@ while data_relays_running; do
   rm -f "\$ettun_control_gate"
   if [ "\$control_attached" -eq 1 ]; then
     if [ "\$control_status" -ne 0 ]; then
-      printf '%s\\n' "\$ettun_marker" >&2
+      print_retry_marker
       exit 75
     fi
     exit 0
@@ -1207,7 +1225,7 @@ while data_relays_running; do
     continue
   fi
   if [ "\$control_status" -ne 0 ]; then
-    printf '%s\\n' "\$ettun_marker" >&2
+    print_retry_marker
     exit 75
   fi
 done
@@ -1244,14 +1262,22 @@ build_remote_command() {
   # bytes with ulimit, enforces a deadline, verifies exact size and SHA-256, then
   # decodes and runs the supervisor. Invalid or partial clients are retried;
   # authenticated setup failures emit token-scoped fatal markers.
+  #
+  # ET types this line plus `; exit` into the remote login shell. If a startup
+  # file attached to tmux anyway, the line lands in a pane instead, so it must
+  # not replace or end that shell: the TMUX check skips exec, and the trailing
+  # backslash turns ET's `; exit` into ignored bootstrap arguments. printenv
+  # keeps the check valid under nounset and in fish, where `$TMUX` and
+  # `${TMUX-}` respectively fail. The leading space keeps the line out of
+  # histories that ignore space-prefixed commands.
   printf -v command '%s' \
-    "exec /bin/sh -c 'p=\$1; t=\$2; m=\$3; h=\$4; n=\$5; b=\${TMPDIR:-/tmp}/ettun-bootstrap.\$t; o=0; w=\$b/w; z=\$b/z; s=\$b/s; a=\$b/a; c=\$b/c; l=; d=; umask 077; " \
+    " printenv TMUX>/dev/null||exec /bin/sh -c 'p=\$1; t=\$2; m=\$3; h=\$4; n=\$5; b=\${TMPDIR:-/tmp}/ettun-bootstrap.\$t; o=0; w=\$b/w; z=\$b/z; s=\$b/s; a=\$b/a; c=\$b/c; l=; d=; umask 077; " \
     "stop_child() { k=; [ ! -r \"\$c\" ] || IFS= read -r k <\"\$c\" || :; case \"\$k\" in *[!0-9]*|\"\") ;; *) kill \"\$k\" 2>/dev/null || : ;; esac; }; cleanup() { [ \"\$o\" != 1 ] || stop_child; [ -z \"\$l\" ] || kill \"\$l\" 2>/dev/null || :; [ -z \"\$d\" ] || kill \"\$d\" 2>/dev/null || :; if [ \"\$o\" = 1 ]; then rm -f \"\$w\" \"\$z\" \"\$s\" \"\$a\" \"\$c\"; rmdir \"\$b\" 2>/dev/null || :; fi; }; fail() { status=\$1; reason=\$2; printf \"ETTUN_FATAL:%s:%s:%s\\n\" \"\$t\" \"\$status\" \"\$reason\" >&2; exit \"\$status\"; }; trap cleanup EXIT; trap \"exit 129\" HUP; trap \"exit 130\" INT; trap \"exit 143\" TERM; trap \"fail 124 bootstrap-timeout\" ALRM; mkdir \"\$b\" 2>/dev/null || fail 73 bootstrap-state; o=1; " \
     "command -v base64 >/dev/null 2>&1 || fail 127 missing-base64; command -v gzip >/dev/null 2>&1 || fail 127 missing-gzip; if command -v sha256sum >/dev/null 2>&1; then v=sha256sum; elif command -v shasum >/dev/null 2>&1; then v=shasum; elif command -v openssl >/dev/null 2>&1; then v=openssl; else fail 127 missing-sha256; fi; if command -v socat >/dev/null 2>&1; then r=socat; elif command -v ncat >/dev/null 2>&1; then r=ncat; else fail 127 missing-relay; fi; " \
     "printf \"#!/bin/sh\\necho \\\$\\\$ >\\\"\\\$ETB_C\\\"\\necho \\\"\\\$ETB_M\\\"\\nexec cat >\\\"\\\$ETB_W\\\"\\n\" >\"\$a\" || fail 74 bootstrap-handler; chmod 700 \"\$a\" || fail 74 bootstrap-handler; export ETB_W=\$w ETB_C=\$c ETB_M=ETTUN_BOOTSTRAP; " \
     "timeout=\${ETTUN_BOOTSTRAP_TIMEOUT:-60}; case \"\$timeout\" in \"\"|*[!0-9]*|0) timeout=60 ;; esac; (sleep \"\$timeout\"; kill -ALRM \"\$\$\") & d=\$!; limit=\$(((n + 511) / 512)); while :; do rm -f \"\$w\" \"\$z\" \"\$s\" \"\$c\"; if [ \"\$r\" = socat ]; then (ulimit -f \"\$limit\"; exec socat \"TCP-LISTEN:\$p,bind=127.0.0.1,reuseaddr\" \"EXEC:\$a\") & else (ulimit -f \"\$limit\"; exec ncat --listen --exec \"\$a\" 127.0.0.1 \"\$p\") & fi; l=\$!; wait \"\$l\"; receive_status=\$?; l=; rm -f \"\$c\"; size=\$(wc -c <\"\$w\" 2>/dev/null | awk \"{ print \\\$1 }\" || :); case \"\$size\" in \"\"|*[!0-9]*) size=0 ;; esac; if [ \"\$receive_status\" -ne 0 ]; then [ \"\$size\" -gt \"\$n\" ] && continue; printf \"%s\\n\" \"\$m\" >&2; exit 75; fi; [ \"\$size\" -eq \"\$n\" ] || continue; " \
     "case \"\$v\" in sha256sum) q=\$(sha256sum \"\$w\"); q=\${q%% *} ;; shasum) q=\$(shasum -a 256 \"\$w\"); q=\${q%% *} ;; openssl) q=\$(openssl dgst -sha256 \"\$w\"); q=\${q##* } ;; esac; [ \"\$q\" = \"\$h\" ] || continue; magic=; got=; payload=; IFS=: read -r magic got payload <\"\$w\" || :; [ \"\$magic\" = ETTUN_PAYLOAD ] && [ \"\$got\" = \"\$t\" ] || continue; case \"\$payload\" in \"\"|*[!A-Za-z0-9+/=]*) continue ;; esac; if ! { printf %s \"\$payload\" | base64 -d >\"\$z\" 2>/dev/null || printf %s \"\$payload\" | base64 -D >\"\$z\" 2>/dev/null; }; then fail 127 decode; fi; gzip -dc \"\$z\" >\"\$s\" 2>/dev/null || fail 127 decode; kill \"\$d\" 2>/dev/null || :; wait \"\$d\" 2>/dev/null || :; d=; /bin/sh \"\$s\"; status=\$?; exit \"\$status\"; done' et-bootstrap " \
-    "'$bootstrap_port' '$token' '$marker' '$payload_hash' '$payload_size'"
+    "'$bootstrap_port' '$token' '$marker' '$payload_hash' '$payload_size' \\"
 
   # Fail locally rather than rely on terminal/transport truncation, which could
   # leave an unauthenticated bootstrap listener alive on VIA.
@@ -1854,12 +1880,25 @@ run_transport() {
   stderr_pid=""
 
   collision_seen=0
-  if grep -Fxq -- "$marker" "$stdout_log" || grep -Fxq -- "$marker" "$stderr_log"; then
+  # Stock ET 7.1 forwards the remote pty's output, so the marker can arrive with
+  # a CRLF ending, or after a CR-terminated terminal sequence the shell printed
+  # before running the command. Treat CR as a line break and still require an
+  # exact line: the pty also echoes the typed command, which quotes the marker.
+  if log_has_line "$marker" "$stdout_log" ||
+    log_has_line "$marker" "$stderr_log"; then
     collision_seen=1
   fi
   fatal_status=$(sed -n \
     "s/.*ETTUN_FATAL:$stop_token:\([0-9][0-9]*\):.*/\1/p" \
     "$stdout_log" "$stderr_log" | head -n 1)
+}
+
+# Succeeds if a log holds LINE exactly, also treating CR as a line break.
+# LC_ALL=C keeps macOS tr from rejecting non-UTF-8 output. tr's status is
+# ignored so grep -q stopping early cannot fail the pipeline under pipefail.
+log_has_line() {
+  local line="$1" log="$2"
+  { LC_ALL=C tr '\r' '\n' <"$log" || :; } | grep -Fxq -- "$line"
 }
 
 # Public command entry point.
