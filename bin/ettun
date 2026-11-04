@@ -1875,7 +1875,12 @@ run_transport() {
   stderr_pid=""
 
   collision_seen=0
-  if grep -Fxq -- "$marker" "$stdout_log" || grep -Fxq -- "$marker" "$stderr_log"; then
+  # Stock ET 7.1 forwards the remote pty's output, so the marker can arrive with
+  # a CRLF ending, or after a CR-terminated terminal sequence the shell printed
+  # before running the command. Treat CR as a line break and still require an
+  # exact line: the pty also echoes the typed command, which quotes the marker.
+  if tr '\r' '\n' <"$stdout_log" | grep -Fx -- "$marker" >/dev/null ||
+    tr '\r' '\n' <"$stderr_log" | grep -Fx -- "$marker" >/dev/null; then
     collision_seen=1
   fi
   fatal_status=$(sed -n \

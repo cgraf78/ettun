@@ -269,10 +269,10 @@ mkdir -p "$nc_bin"
 _write_stub "$nc_bin/nc" 'exit "${ETTUN_TEST_NC_EXIT:-1}"'
 _write_stub "$bin/et" \
   'printf "et\n" >>"$ETTUN_TEST_LOG"' \
-  'previous= tunnel_spec=' \
+  'previous= tunnel_spec= typed=' \
   'for arg in "$@"; do' \
   '  printf "<%s>\n" "$arg" >>"$ETTUN_TEST_LOG"' \
-  '  if [[ "$previous" == --command ]]; then printf "%s\n" "$arg" >"$ETTUN_TEST_REMOTE_COMMAND"; fi' \
+  '  if [[ "$previous" == --command ]]; then printf "%s\n" "$arg" >"$ETTUN_TEST_REMOTE_COMMAND"; typed=$arg; fi' \
   '  if [[ "$previous" == --tunnel ]]; then tunnel_spec=$arg; fi' \
   '  previous="$arg"' \
   'done' \
@@ -281,7 +281,15 @@ _write_stub "$bin/et" \
   '[[ -r "$ETTUN_TEST_COUNT" ]] && read -r count <"$ETTUN_TEST_COUNT"' \
   'count=$((count + 1))' \
   'printf "%s\n" "$count" >"$ETTUN_TEST_COUNT"' \
-  'if ((count <= ${ETTUN_TEST_COLLISIONS:-0})); then' \
+  '# Like ET 7.1, forward the remote pty on stdout: the echoed typed command,' \
+  '# CRLF line endings, and the remote status.' \
+  'if [[ ${ETTUN_TEST_PTY_OUTPUT:-0} == 1 ]]; then' \
+  '  printf "%s; exit\r\n" "$typed"' \
+  '  if ((count <= ${ETTUN_TEST_COLLISIONS:-0})); then' \
+  '    printf "\033[?2004l\r%s\r\n" "$ETTUN_RETRY_MARKER"' \
+  '    exit 75' \
+  '  fi' \
+  'elif ((count <= ${ETTUN_TEST_COLLISIONS:-0})); then' \
   '  printf "%s\n" "$ETTUN_RETRY_MARKER" >&2' \
   'fi' \
   'if [[ -n "${ETTUN_TEST_FATAL_STATUS:-}" ]]; then' \
@@ -820,6 +828,7 @@ _run_ettun() {
     ETTUN_TEST_PORT_PROBE_ERROR="$port_probe_error" \
     ETTUN_TEST_COUNT="$count" \
     ETTUN_TEST_COLLISIONS="${ETTUN_TEST_COLLISIONS:-0}" \
+    ETTUN_TEST_PTY_OUTPUT="${ETTUN_TEST_PTY_OUTPUT:-0}" \
     ETTUN_TEST_EXIT="${ETTUN_TEST_EXIT:-0}" \
     ETTUN_TEST_FATAL_STATUS="${ETTUN_TEST_FATAL_STATUS:-}" \
     ETTUN_TEST_ECHO_ARGS="${ETTUN_TEST_ECHO_ARGS:-0}" \

@@ -218,6 +218,23 @@ _assert_eq "relay collision: selects a distinct mapping per attempt" "3" "$uniqu
 _assert_contains "relay collision: preserves collision diagnostics" \
   "ETTUN_COLLISION:" "$(cat "$stderr")"
 
+# ET 7.1 forwards the remote pty output: the marker arrives on stdout with a
+# CRLF ending after a shell terminal sequence, beside an echo of the command.
+ETTUN_TEST_PTY_OUTPUT=1 ETTUN_TEST_COLLISIONS=2 \
+  _run_ettun gateway.example 10459 service.internal 443
+unset ETTUN_TEST_PTY_OUTPUT ETTUN_TEST_COLLISIONS
+_assert_exit "pty-forwarded collision: retries to success" 0 "$run_exit"
+_assert_eq "pty-forwarded collision: makes exactly three attempts" "3" \
+  "$(grep -c '^et$' "$log")"
+
+# The echoed typed command quotes the marker; it alone is not a collision.
+ETTUN_TEST_PTY_OUTPUT=1 ETTUN_TEST_EXIT=75 \
+  _run_ettun gateway.example 10460 service.internal 443
+unset ETTUN_TEST_PTY_OUTPUT ETTUN_TEST_EXIT
+_assert_exit "pty-forwarded failure: keeps the transport status" 75 "$run_exit"
+_assert_eq "pty-forwarded failure: an echoed marker is not retried" "1" \
+  "$(grep -c '^et$' "$log")"
+
 ETTUN_REMOTE_PORT_SLOT_V1=7 ETTUN_TEST_COLLISIONS=2 \
   _run_ettun gateway.example 10458 service.internal 443
 unset ETTUN_REMOTE_PORT_SLOT_V1 ETTUN_TEST_COLLISIONS
