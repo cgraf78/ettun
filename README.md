@@ -149,10 +149,12 @@ honor `NO_TMUX`.
 ettun passes ET only long options, which ET 7.0 and 7.1 clients parse the same
 way, plus `--no-persist`, which stops a 7.1 client from saving a session record
 that could not restore the forwards (7.0 ignores it). The test suite checks
-this argv against a stub ET, and it has been run end to end with ET 7.0.0 and
-7.1.1 clients and servers. A 7.1 client also forwards the remote shell's
-terminal output, with CRLF line endings, which ettun reads for the collision
-marker; a 7.0 client forwards none of it.
+this argv against a stub ET. ettun itself has also been run end to end, outside
+the suite, on loopback with ET 7.0.0 and 7.1.1 clients and servers. A 7.1
+client also forwards the remote shell's terminal output, with CRLF line
+endings, which ettun reads for the collision marker, so ettun's output then
+also shows the typed bootstrap line and the remote prompt; a 7.0 client
+forwards none of it.
 
 ## Configuration
 
@@ -225,8 +227,8 @@ A `connect-v2` adapter which cannot safely be invoked again without repeating
 authentication or rebuilding private session state should also print
 `single-invocation-v1`. If that adapter reports an authenticated random relay
 collision, ettun exits with status 75 and asks the operator to restart instead
-of invoking it a second time. Stock ET and adapters which omit this capability
-retain the bounded five-attempt collision retry.
+of invoking it a second time. Adapters which omit this capability, and stock
+ET with a 7.1 client, retain the bounded five-attempt collision retry.
 
 An orchestrator which has already authenticated that capability may pass
 `ETTUN_TRANSPORT_SINGLE_INVOCATION_V1=1`, including for a local-only route whose
@@ -265,12 +267,12 @@ The supervisor records private state beneath
 and removes only state whose token and process ownership match. Random relay
 bind collisions retry with a fresh token and port set, up to five attempts,
 except for an adapter declaring `single-invocation-v1` as described above, and
-except with a stock ET 7.0 client, which never shows ettun the remote marker,
-so that attempt ends instead. A generated local control port taken between
-ettun's probe and the transport's bind follows the same policy, staying within
-any provider-assigned slot. A collision on the requested fixed reverse port
-fails immediately and actionably, as does losing the requested fixed local
-port, which is named in the error.
+except with a stock ET 7.0 client, which never shows ettun the remote marker:
+ettun then exits with ET's status (0) and no tunnel. A generated local control
+port taken between ettun's probe and the transport's bind follows the same
+policy, staying within any provider-assigned slot. A collision on the requested
+fixed reverse port fails immediately and actionably, as does losing the
+requested fixed local port, which is named in the error.
 
 The full supervisor is never placed directly in ET's command argument. A small
 bootstrap listener accepts a size-bounded payload over the private control

@@ -701,6 +701,11 @@ ettun_stop_file=\$ettun_state/stop
 ettun_stop_gate=\$ettun_state/stop-ready
 ettun_relay_gate=\$ettun_state/relay-ready
 umask 077
+# Start the collision marker on a fresh line: ET 7.1 forwards the remote pty,
+# where a shell's pre-command terminal sequence can precede the first output.
+print_retry_marker() {
+  printf '\\n%s\\n' "\$ettun_marker" >&2
+}
 # Fatal markers carry the attempt token so unrelated adapter output cannot
 # forge a retryable or actionable remote failure.
 fatal() {
@@ -1056,7 +1061,7 @@ fail_stopped_data_relay() {
     ! process_is_running "\$relay_pid"; then
     wait "\$relay_pid" 2>/dev/null || :
     relay_pid=
-    printf '%s\\n' "\$ettun_marker" >&2
+    print_retry_marker
     exit 75
   fi
   if [ "\$ettun_reverse_enabled" -eq 1 ] &&
@@ -1123,7 +1128,7 @@ check_stop_listener() {
     wait "\$stop_pid" || stop_status=\$?
     stop_pid=
     if [ "\$stop_status" -ne 0 ]; then
-      printf '%s\\n' "\$ettun_marker" >&2
+      print_retry_marker
       exit 75
     fi
     if read_control_line "\$ettun_stop_file" && \
@@ -1211,7 +1216,7 @@ while data_relays_running; do
   rm -f "\$ettun_control_gate"
   if [ "\$control_attached" -eq 1 ]; then
     if [ "\$control_status" -ne 0 ]; then
-      printf '%s\\n' "\$ettun_marker" >&2
+      print_retry_marker
       exit 75
     fi
     exit 0
@@ -1220,7 +1225,7 @@ while data_relays_running; do
     continue
   fi
   if [ "\$control_status" -ne 0 ]; then
-    printf '%s\\n' "\$ettun_marker" >&2
+    print_retry_marker
     exit 75
   fi
 done
@@ -1879,13 +1884,21 @@ run_transport() {
   # a CRLF ending, or after a CR-terminated terminal sequence the shell printed
   # before running the command. Treat CR as a line break and still require an
   # exact line: the pty also echoes the typed command, which quotes the marker.
-  if tr '\r' '\n' <"$stdout_log" | grep -Fx -- "$marker" >/dev/null ||
-    tr '\r' '\n' <"$stderr_log" | grep -Fx -- "$marker" >/dev/null; then
+  if log_has_line "$marker" "$stdout_log" ||
+    log_has_line "$marker" "$stderr_log"; then
     collision_seen=1
   fi
   fatal_status=$(sed -n \
     "s/.*ETTUN_FATAL:$stop_token:\([0-9][0-9]*\):.*/\1/p" \
     "$stdout_log" "$stderr_log" | head -n 1)
+}
+
+# Succeeds if a log holds LINE exactly, also treating CR as a line break.
+# LC_ALL=C keeps macOS tr from rejecting non-UTF-8 output. tr's status is
+# ignored so grep -q stopping early cannot fail the pipeline under pipefail.
+log_has_line() {
+  local line="$1" log="$2"
+  { LC_ALL=C tr '\r' '\n' <"$log" || :; } | grep -Fxq -- "$line"
 }
 
 # Public command entry point.

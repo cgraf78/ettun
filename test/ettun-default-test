@@ -2003,6 +2003,10 @@ fi
 wait "$remote_pid" || killed_control_exit=$?
 _assert_exit "remote control death: exits instead of hanging without a marker" \
   75 "$killed_control_exit"
+# No listener error precedes this marker, so it must start its own line even
+# when a forwarded pty put a terminal sequence before it.
+_assert_contains "remote control death: starts its marker on a fresh line" \
+  $'\nETTUN_COLLISION:' "$(<"$tmp/remote.stderr")"
 if [[ ! -e "$remote_state" ]]; then
   _pass "remote control death: removes owned state"
 else
