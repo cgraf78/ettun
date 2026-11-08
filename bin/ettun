@@ -389,7 +389,15 @@ port_has_owner() {
 # not depend on nc's -w: macOS nc applies it only to idle time, so a dropped
 # SYN (a full accept queue, or a socket bound without listening) stalled for
 # the system connect timeout, over a minute. Perl's IO::Socket::INET bounds
-# the connect itself; macOS nc needs -G for that.
+# the connect itself; macOS nc needs -G for that. A successful perl connect
+# is not proof by itself: when only a TIME-WAIT holds the port, the kernel
+# may assign the probe that same port as its ephemeral source, and the
+# connect then completes against the probe itself (TCP self-connection).
+# A listener-held port is never assigned as a source port for a connection
+# to that same address, so a connect whose local port equals the
+# destination proves the probe met itself and counts as refused. nc cannot
+# observe its own source port, so its success keeps the residual exposure
+# (a documented limitation).
 port_accepts() {
   local port="$1" probe_status=0 nc_help
 
@@ -397,7 +405,10 @@ port_accepts() {
     perl -MIO::Socket::INET -e '
       my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1",
         PeerPort => $ARGV[0], Proto => "tcp", Timeout => 1);
-      exit 0 if $s;
+      if ($s) {
+        exit 3 if $s->sockport() == $ARGV[0];
+        exit 0;
+      }
       exit 4 if $!{ETIMEDOUT};
       exit($!{ECONNREFUSED} ? 3 : 2);
     ' "$port" </dev/null >/dev/null 2>&1 || probe_status=$?
