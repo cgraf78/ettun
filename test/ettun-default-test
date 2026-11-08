@@ -255,6 +255,27 @@ print(held)
 PY
 }
 
+# Report whether a socket exists whose local and remote ports are both the
+# given port: the signature of a TCP self-connection, where a probe
+# connected to itself. Any state counts, since the closing handshake may
+# still be in flight when this runs. Linux-only; reads /proc/net/tcp.
+_self_connect_forced() {
+  "$test_python" - "$1" <<'PY'
+import sys
+
+port = f"{int(sys.argv[1]):04X}"
+for line in open("/proc/net/tcp"):
+    fields = line.split()
+    if len(fields) < 4:
+        continue
+    local, remote = fields[1], fields[2]
+    if (local.rsplit(":", 1)[-1] == port and
+            remote.rsplit(":", 1)[-1] == port):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
 # Holds a requested port for the losing-transport stub. By default it is bound
 # without SO_REUSEADDR and not listening, so ettun's control helper is refused
 # at once instead of stalling on an accepted connection that never answers.
@@ -372,7 +393,7 @@ _bind_probe_cases() {
   local hidden_expected full_queue_file full_queue_pid full_queue_port
   local full_queue_ready full_queue_start full_queue_elapsed
   local probe_mapping probe_control lost_control lost_mappings
-  local lost_retry_mapping
+  local lost_retry_mapping self_connect_range
 
   export ETTUN_TEST_LSOF_EXIT=1
 
@@ -518,6 +539,49 @@ PY
     fi
   else
     _fail "$label: fixture leaves an outgoing TIME-WAIT"
+  fi
+
+  # A connect to that TIME-WAIT normally draws another ephemeral source
+  # port, but the kernel may hand the probe the destination itself as its
+  # source; the connect then completes against the probe (TCP
+  # self-connection) although no listener exists. Narrowing the ephemeral
+  # range to the TIME-WAIT port forces that assignment, so the probe must
+  # still report the temporary failure. Linux-only, perl probe only (nc
+  # cannot observe its own source port), and only where the range is
+  # writable. An assertion failure cannot leak the narrowing (the range is
+  # restored immediately after the run, before any assertion); a kill in
+  # the window could, so an INT/TERM trap restores it too and re-raises
+  # the signal. The run only counts as coverage when a self-connection
+  # actually happened (checked afterwards): a kernel that refuses the
+  # assignment would otherwise pass vacuously, so that case skips loudly
+  # instead of asserting.
+  if [[ $1 == perl && -n ${time_wait_port:-} && $(uname -s) == Linux && \
+    -w /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    self_connect_range=$(< /proc/sys/net/ipv4/ip_local_port_range)
+    trap 'printf "%s" "$self_connect_range" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; trap - INT TERM; kill -TERM $$' TERM
+    trap 'printf "%s" "$self_connect_range" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; trap - INT TERM; kill -INT $$' INT
+    if printf '%s %s' "$time_wait_port" "$time_wait_port" \
+      > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; then
+      ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
+        _run_ettun gateway.example "$time_wait_port" service.internal 443
+      printf '%s' "$self_connect_range" \
+        > /proc/sys/net/ipv4/ip_local_port_range || \
+        _fail "$label: ephemeral range restore failed"
+      trap - INT TERM
+      if _self_connect_forced "$time_wait_port"; then
+        _assert_exit "$label: forced self-connect is not a listener" \
+          75 "$run_exit"
+        _assert_contains "$label: forced self-connect is reported as temporary" \
+          "retry within about a minute" "$(<"$stderr")"
+      else
+        printf '  SKIP: %s: kernel did not force the self-connect\n' "$label"
+      fi
+    else
+      trap - INT TERM
+      printf '  SKIP: %s: ephemeral range is not writable\n' "$label"
+    fi
+  else
+    printf '  SKIP: %s: forced self-connect needs the perl probe, Linux, and a writable ephemeral range\n' "$label"
   fi
 
   if time_wait_port=$(_make_time_wait server); then
