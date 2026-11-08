@@ -65,13 +65,15 @@ jobs:
 
       # The forced self-connect regression test narrows ip_local_port_range,
       # which needs CAP_NET_ADMIN: the container legs run without it, so the
-      # test skips there. Run the suite in a user and network namespace,
-      # where the range is writable, and require the coverage lines so a
-      # future skip fails loudly instead of going green.
-      - name: Run suite in a user and network namespace
+      # test skips there. Run the suite in a fresh network namespace (root
+      # via sudo: unprivileged user namespaces are blocked on the runner,
+      # so `unshare -rn` fails writing uid_map), where the range is
+      # writable, and require the coverage lines so a future skip fails
+      # loudly instead of going green.
+      - name: Run suite in a network namespace
         run: |
           set -euo pipefail
-          unshare -rn bash -c 'ip link set lo up; ETTUN_SKIP_SHELLCHECK=1 test/run' 2>&1 | tee /tmp/ettun-namespace-test.log
+          sudo unshare -n bash -c 'ip link set lo up; ETTUN_SKIP_SHELLCHECK=1 test/run' 2>&1 | tee /tmp/ettun-namespace-test.log
       - name: Require the forced self-connect coverage
         run: |
           grep -q 'PASS: bind probe \[perl\]: forced self-connect is not a listener' /tmp/ettun-namespace-test.log
