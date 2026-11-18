@@ -1118,9 +1118,9 @@ if [[ -s $bootstrap_payload_file ]]; then
   _assert_contains "mixed routes: ncat local relay child drops inherited descriptors" \
     '--sh-exec "$ettun_ncat_child_prefix exec ncat -- service.internal 443"' \
     "$mixed_remote"
-  # The ET transport port is generated, so match it as digits.
-  # shellcheck disable=SC2016 # The generated supervisor's literal text.
-  if [[ $mixed_remote == *'--sh-exec "$ettun_ncat_child_prefix exec ncat -- 127.0.0.1 '[0-9]*'" 127.0.0.1 "$ettun_reverse_port"'* ]]; then
+  # The ET transport port is generated, so match it as digits only.
+  ncat_reverse_relay_re='--sh-exec "\$ettun_ncat_child_prefix exec ncat -- 127\.0\.0\.1 [0-9]+" 127\.0\.0\.1 "\$ettun_reverse_port"'
+  if [[ $mixed_remote =~ $ncat_reverse_relay_re ]]; then
     _pass "mixed routes: ncat reverse relay child drops inherited descriptors"
   else
     _fail "mixed routes: ncat reverse relay child drops inherited descriptors"
@@ -1140,21 +1140,32 @@ print(" ".join(open_fds) or "none")'
   ncat_held_file="$tmp/ncat-held-descriptor"
   : >"$ncat_held_file"
   ncat_child_fds=$(
-    /bin/sh -c "$ncat_prefix_def"'
-      exec 3<"$1" 4<"$1" 5<"$1" 6<"$1" 8<"$1" 9<"$1"
-      exec /bin/sh -c "$ettun_ncat_child_prefix exec \"\$0\" -c \"\$1\"" "$2" "$3"' \
+    sh -c "$ncat_prefix_def"'
+      exec 3<"$1" 4<"$1" 5<"$1" 6<"$1" 7<"$1" 8<"$1" 9<"$1"
+      exec sh -c "$ettun_ncat_child_prefix exec \"\$0\" -c \"\$1\"" "$2" "$3"' \
       sh "$ncat_held_file" "$test_python" "$ncat_fd_probe"
   )
   ncat_control_fds=$(
-    /bin/sh -c '
-      exec 3<"$1" 4<"$1" 5<"$1" 6<"$1" 8<"$1" 9<"$1"
+    sh -c '
+      exec 3<"$1" 4<"$1" 5<"$1" 6<"$1" 7<"$1" 8<"$1" 9<"$1"
       exec "$2" -c "$3"' \
       sh "$ncat_held_file" "$test_python" "$ncat_fd_probe"
   )
   _assert_eq "ncat relay child: probe sees descriptors held without the prefix" \
-    "3 4 5 6 8 9" "$ncat_control_fds"
+    "3 4 5 6 7 8 9" "$ncat_control_fds"
   _assert_eq "ncat relay child: generated prefix closes every inherited descriptor" \
     "none" "$ncat_child_fds"
+  # A real ncat child usually holds only a few of 3-9. Closing an unopened
+  # descriptor must not abort the exec (a failed special-builtin redirection
+  # would kill the shell before the relay starts).
+  ncat_partial_fds=$(
+    sh -c "$ncat_prefix_def"'
+      exec 3<"$1" 4<"$1"
+      exec sh -c "$ettun_ncat_child_prefix exec \"\$0\" -c \"\$1\"" "$2" "$3"' \
+      sh "$ncat_held_file" "$test_python" "$ncat_fd_probe"
+  )
+  _assert_eq "ncat relay child: prefix tolerates descriptors that are not open" \
+    "none" "$ncat_partial_fds"
 else
   _fail "mixed routes: publishes an authenticated remote supervisor"
 fi

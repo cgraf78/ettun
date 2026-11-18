@@ -738,8 +738,10 @@ fi
 # client drop (e.g. a client reboot) the exec'd per-connection ncat can stay
 # half-open against ET, outlive its parent fork, and, reparented beyond
 # kill_tree's reach, keep the fixed reverse port bound indefinitely. Close the
-# inherited descriptors above stdio first; ncat's listener is an early, low fd,
-# within the 0-9 a portable redirection can name. socat closes it itself.
+# inherited descriptors above stdio first. The supervisor itself holds only
+# fd 7 (closed before each listener starts), so ncat's listener takes a low
+# fd (observed: 3), within the 0-9 a portable redirection can name. socat
+# closes its listener in forked children itself.
 ettun_ncat_child_prefix='exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-;'
 mkdir -p "\$ettun_root" || fatal 74 state-root
 chmod 700 "\$ettun_root" || fatal 74 state-root
