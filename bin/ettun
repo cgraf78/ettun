@@ -734,6 +734,13 @@ else
   printf 'ettun: remote relay requires ncat or socat\\n' >&2
   fatal 127 missing-relay
 fi
+# Ncat's --sh-exec children inherit the listening socket. After an unclean
+# client drop (e.g. a client reboot) the exec'd per-connection ncat can stay
+# half-open against ET, outlive its parent fork, and, reparented beyond
+# kill_tree's reach, keep the fixed reverse port bound indefinitely. Close the
+# inherited descriptors above stdio first; ncat's listener is an early, low fd,
+# within the 0-9 a portable redirection can name. socat closes it itself.
+ettun_ncat_child_prefix='exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-;'
 mkdir -p "\$ettun_root" || fatal 74 state-root
 chmod 700 "\$ettun_root" || fatal 74 state-root
 if ! command -v flock >/dev/null 2>&1; then
@@ -1031,7 +1038,7 @@ pending_remote_signal=0
 defer_remote_signals
 if [ "\$ettun_local_enabled" -eq 1 ]; then
   if [ "\$ettun_relay" = ncat ]; then
-    (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec ncat --listen --keep-open --sh-exec 'exec ncat -- $target_host $target_port' 127.0.0.1 "\$ettun_relay_port") &
+    (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec ncat --listen --keep-open --sh-exec "\$ettun_ncat_child_prefix exec ncat -- $target_host $target_port" 127.0.0.1 "\$ettun_relay_port") &
   else
     (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec socat "TCP-LISTEN:\$ettun_relay_port,bind=127.0.0.1,reuseaddr,fork" "TCP:$target_host:$target_port") &
   fi
@@ -1042,7 +1049,7 @@ if [ "\$ettun_reverse_enabled" -eq 1 ]; then
   # supervisor owns the stable requested listener, so replacement and cleanup
   # do not depend on reconnecting an abandoned ET terminal first.
   if [ "\$ettun_relay" = ncat ]; then
-    (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec ncat --listen --keep-open --sh-exec 'exec ncat -- 127.0.0.1 $reverse_transport_port' 127.0.0.1 "\$ettun_reverse_port") &
+    (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec ncat --listen --keep-open --sh-exec "\$ettun_ncat_child_prefix exec ncat -- 127.0.0.1 $reverse_transport_port" 127.0.0.1 "\$ettun_reverse_port") &
   else
     (exec 7>&-; while [ ! -e "\$ettun_relay_gate" ]; do kill -0 "\$supervisor_pid" 2>/dev/null || exit 1; sleep 1; done; trap '' HUP INT TERM; exec socat "TCP-LISTEN:\$ettun_reverse_port,bind=127.0.0.1,reuseaddr,fork" "TCP:127.0.0.1:\$ettun_reverse_transport_port") &
   fi
