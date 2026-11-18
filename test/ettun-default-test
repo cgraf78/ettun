@@ -555,17 +555,17 @@ PY
   # actually happened (checked afterwards): a kernel that refuses the
   # assignment would otherwise pass vacuously, so that case skips loudly
   # instead of asserting.
-  if [[ $1 == perl && -n ${time_wait_port:-} && $(uname -s) == Linux && \
-    -w /proc/sys/net/ipv4/ip_local_port_range ]]; then
-    self_connect_range=$(< /proc/sys/net/ipv4/ip_local_port_range)
+  if [[ $1 == perl && -n ${time_wait_port:-} && $(uname -s) == Linux &&
+  -w /proc/sys/net/ipv4/ip_local_port_range ]]; then
+    self_connect_range=$(</proc/sys/net/ipv4/ip_local_port_range)
     trap 'printf "%s" "$self_connect_range" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; trap - INT TERM; kill -TERM $$' TERM
     trap 'printf "%s" "$self_connect_range" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; trap - INT TERM; kill -INT $$' INT
     if printf '%s %s' "$time_wait_port" "$time_wait_port" \
-      > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; then
+      >/proc/sys/net/ipv4/ip_local_port_range 2>/dev/null; then
       ETTUN_TEST_PATH="$probe_path" ETTUN_TEST_EXIT=23 \
         _run_ettun gateway.example "$time_wait_port" service.internal 443
       printf '%s' "$self_connect_range" \
-        > /proc/sys/net/ipv4/ip_local_port_range || \
+        >/proc/sys/net/ipv4/ip_local_port_range ||
         _fail "$label: ephemeral range restore failed"
       trap - INT TERM
       if _self_connect_forced "$time_wait_port"; then
@@ -1111,6 +1111,61 @@ if [[ -s $bootstrap_payload_file ]]; then
   else
     _fail "mixed routes: fixed listener differs from every generated port"
   fi
+  # Ncat's --sh-exec children inherit the listening socket. A per-connection
+  # ncat orphaned by an unclean client drop then kept the fixed reverse port
+  # bound, so every later supervisor failed its bind. Both keep-open relays
+  # must run their child through the descriptor-closing prefix.
+  _assert_contains "mixed routes: ncat local relay child drops inherited descriptors" \
+    '--sh-exec "$ettun_ncat_child_prefix exec ncat -- service.internal 443"' \
+    "$mixed_remote"
+  # The ET transport port is generated, so match it as digits only.
+  ncat_reverse_relay_re='--sh-exec "\$ettun_ncat_child_prefix exec ncat -- 127\.0\.0\.1 [0-9]+" 127\.0\.0\.1 "\$ettun_reverse_port"'
+  if [[ $mixed_remote =~ $ncat_reverse_relay_re ]]; then
+    _pass "mixed routes: ncat reverse relay child drops inherited descriptors"
+  else
+    _fail "mixed routes: ncat reverse relay child drops inherited descriptors"
+  fi
+  # Run the generated prefix the way ncat does (sh -c with the listener and
+  # accepted sockets open above stdio) and prove the exec'd relay inherits none.
+  ncat_prefix_def=$(grep '^ettun_ncat_child_prefix=' <<<"$mixed_remote")
+  ncat_fd_probe='import os
+open_fds = []
+for fd in range(3, 10):
+    try:
+        os.fstat(fd)
+        open_fds.append(str(fd))
+    except OSError:
+        pass
+print(" ".join(open_fds) or "none")'
+  ncat_held_file="$tmp/ncat-held-descriptor"
+  : >"$ncat_held_file"
+  ncat_child_fds=$(
+    sh -c "$ncat_prefix_def"'
+      exec 3<"$1" 4<"$1" 5<"$1" 6<"$1" 7<"$1" 8<"$1" 9<"$1"
+      exec sh -c "$ettun_ncat_child_prefix exec \"\$0\" -c \"\$1\"" "$2" "$3"' \
+      sh "$ncat_held_file" "$test_python" "$ncat_fd_probe"
+  )
+  ncat_control_fds=$(
+    sh -c '
+      exec 3<"$1" 4<"$1" 5<"$1" 6<"$1" 7<"$1" 8<"$1" 9<"$1"
+      exec "$2" -c "$3"' \
+      sh "$ncat_held_file" "$test_python" "$ncat_fd_probe"
+  )
+  _assert_eq "ncat relay child: probe sees descriptors held without the prefix" \
+    "3 4 5 6 7 8 9" "$ncat_control_fds"
+  _assert_eq "ncat relay child: generated prefix closes every inherited descriptor" \
+    "none" "$ncat_child_fds"
+  # A real ncat child usually holds only a few of 3-9. Closing an unopened
+  # descriptor must not abort the exec (a failed special-builtin redirection
+  # would kill the shell before the relay starts).
+  ncat_partial_fds=$(
+    sh -c "$ncat_prefix_def"'
+      exec 3<"$1" 4<"$1"
+      exec sh -c "$ettun_ncat_child_prefix exec \"\$0\" -c \"\$1\"" "$2" "$3"' \
+      sh "$ncat_held_file" "$test_python" "$ncat_fd_probe"
+  )
+  _assert_eq "ncat relay child: prefix tolerates descriptors that are not open" \
+    "none" "$ncat_partial_fds"
 else
   _fail "mixed routes: publishes an authenticated remote supervisor"
 fi
