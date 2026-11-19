@@ -1702,6 +1702,180 @@ late_interrupt_exit=$?
 _assert_exit "interactive handoff: late transport Ctrl-C returns status 130" \
   0 "$late_interrupt_exit"
 
+# After attachment, the first Ctrl-C starts a graceful stop that waits for ET
+# to deliver the control EOF and exit. If ET lingers (it is waiting to
+# reconnect), a second Ctrl-C must force the stop. The graceful wait used to
+# run a synchronous `sleep` under monitor mode, which made that sleep the
+# terminal's foreground process group: the second Ctrl-C then only ended the
+# sleep and the launcher waited on. Prove the launcher keeps the terminal for
+# the whole graceful wait and that the second Ctrl-C forces exit 130.
+force_stop_transport_pid="$tmp/force-stop-transport.pid"
+force_stop_auth_result="$tmp/force-stop-auth.result"
+force_stop_control_token="$tmp/force-stop-control.token"
+force_stop_control_eof="$tmp/force-stop-control.eof"
+force_stop_control_held="$tmp/force-stop-control.held"
+force_stop_control_resumed="$tmp/force-stop-control.resumed"
+force_stop_control_ready="$tmp/force-stop-control.ready"
+force_stop_runtime_root="$tmp/force-stop-runtime"
+mkdir -p "$force_stop_runtime_root"
+force_stop_exit=0
+PATH="$bin:$test_extended_system_path" \
+  TMPDIR="$force_stop_runtime_root" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$test_home/state" \
+  ETTUN_CLIENT_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  ETTUN_TEST_TRANSPORT_PID="$force_stop_transport_pid" \
+  ETTUN_TEST_AUTH_RESULT="$force_stop_auth_result" \
+  ETTUN_TEST_CONTROL_TOKEN="$force_stop_control_token" \
+  ETTUN_TEST_CONTROL_EOF="$force_stop_control_eof" \
+  ETTUN_TEST_CONTROL_HELD="$force_stop_control_held" \
+  ETTUN_TEST_CONTROL_RESUMED="$force_stop_control_resumed" \
+  ETTUN_TEST_CONTROL_READY="$force_stop_control_ready" \
+  ETTUN_TEST_LINGER_AFTER_EOF=1 \
+  ETTUN_TRANSPORT="$bin/interactive-attached-transport" \
+  "$test_python" - "$BASH" "$SCRIPT" "$force_stop_transport_pid" \
+  "$force_stop_auth_result" "$force_stop_control_held" \
+  "$force_stop_control_eof" <<'PY' || force_stop_exit=$?
+import fcntl
+import os
+import pty
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+
+bash, script, transport_pid_file, auth_result, held_file, eof_file = sys.argv[1:]
+wait_seconds = float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))
+
+master, slave = pty.openpty()
+child = os.fork()
+if child == 0:
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    for fd in (0, 1, 2):
+        os.dup2(slave, fd)
+    os.close(master)
+    os.close(slave)
+    os.execv(bash, ["bash", script, "gateway.example", "10457", "service.internal", "443"])
+
+os.close(slave)
+output = b""
+
+def drain(timeout):
+    global output
+    readable, _, _ = select.select([master], [], [], timeout)
+    if readable:
+        try:
+            output += os.read(master, 4096)
+        except OSError:
+            pass
+
+def wait_for(predicate):
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        drain(0.05)
+    return False
+
+sent = first_sent = second_sent = False
+launcher_kept_terminal = None
+foreign_foreground = None
+status = None
+transport_pid = None
+adapter_gone = False
+try:
+    if wait_for(lambda: b"Passcode: " in output):
+        os.write(master, b"test-passcode\n")
+        sent = True
+    if sent and wait_for(lambda: os.path.exists(held_file)):
+        os.write(master, b"\x03")
+        first_sent = True
+    if first_sent and wait_for(lambda: os.path.exists(eof_file)):
+        # The graceful wait has begun and the transport is lingering. Sample
+        # the terminal's foreground group across several of its pauses.
+        launcher_kept_terminal = True
+        sample_deadline = time.monotonic() + wait_seconds / 8
+        while time.monotonic() < sample_deadline:
+            foreground = os.tcgetpgrp(master)
+            if foreground != child:
+                launcher_kept_terminal = False
+                foreign_foreground = foreground
+                break
+            drain(0.01)
+        os.write(master, b"\x03")
+        second_sent = True
+    if second_sent:
+        exit_deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < exit_deadline:
+            waited, candidate = os.waitpid(child, os.WNOHANG)
+            if waited:
+                status = candidate
+                break
+            drain(0.05)
+    try:
+        with open(transport_pid_file, "r", encoding="utf-8") as pid_input:
+            transport_pid = int(pid_input.read().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    if status is not None and transport_pid is not None:
+        gone_deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < gone_deadline:
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(transport_pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            if not state or state.startswith("Z"):
+                adapter_gone = True
+                break
+            time.sleep(0.05)
+finally:
+    if status is None:
+        try:
+            os.killpg(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            _, status = os.waitpid(child, 0)
+        except ChildProcessError:
+            pass
+    if not adapter_gone and transport_pid is not None:
+        try:
+            os.killpg(os.getpgid(transport_pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    os.close(master)
+
+exit_code = os.waitstatus_to_exitcode(status) if status is not None else None
+authenticated = False
+try:
+    with open(auth_result, "r", encoding="utf-8") as auth_input:
+        authenticated = auth_input.read().strip() == "test-passcode"
+except FileNotFoundError:
+    pass
+success = (
+    authenticated
+    and second_sent
+    and launcher_kept_terminal
+    and exit_code == 130
+    and adapter_gone
+)
+if not success:
+    sys.stderr.write(
+        f"sent={sent} auth={authenticated} first={first_sent} second={second_sent} "
+        f"kept_terminal={launcher_kept_terminal} foreign_fg={foreign_foreground} "
+        f"exit={exit_code} adapter_gone={adapter_gone}\n"
+    )
+    sys.stderr.buffer.write(output)
+sys.exit(0 if success else 1)
+PY
+_assert_exit "graceful stop: a second Ctrl-C forces exit while ET lingers" \
+  0 "$force_stop_exit"
+
 echo ""
 
 _assert_no_leaked_workers

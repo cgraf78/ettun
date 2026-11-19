@@ -1390,6 +1390,17 @@ stop_control_helper_now() {
   control_helper_job=""
 }
 
+# Pause the launcher while monitor mode is on. A synchronous command becomes
+# the terminal's foreground process group under `set -m`, so a plain `sleep`
+# would receive the user's (or fwdports') Ctrl-C instead of the launcher's
+# trap; that second Ctrl-C would only end the sleep and never force a stop.
+# Waiting on a background sleep keeps the launcher in the foreground, and a
+# trapped signal interrupts the wait immediately.
+launcher_sleep() {
+  sleep "$1" &
+  wait "$!" 2>/dev/null || true
+}
+
 # Invoked if another signal arrives while graceful shutdown is in progress.
 # shellcheck disable=SC2329
 force_stop() {
@@ -1439,7 +1450,7 @@ stop_transport() {
       if ((wait_count == 5)); then
         printf 'ettun: waiting for ET cleanup; press Ctrl-C again to force stop\n' >&2
       fi
-      sleep 1
+      launcher_sleep 1
     done
     return
   fi
@@ -1477,9 +1488,9 @@ stop_transport() {
       fi
       wait_count=$((wait_count + 1))
       if ((stop_connected == 1)); then
-        sleep 1
+        launcher_sleep 1
       else
-        sleep 0.25
+        launcher_sleep 0.25
       fi
     done
   fi
@@ -1704,11 +1715,9 @@ run_transport() {
         worker_ready_timed_out=1
         break
       fi
-      # A synchronous command becomes the terminal's foreground process group
-      # under monitor mode. Keep the launcher foreground so Ctrl-C reaches its
-      # pending-signal trap while the worker is still gated.
-      sleep 0.01 &
-      wait "$!" 2>/dev/null || true
+      # Keep the launcher foreground so Ctrl-C reaches its pending-signal trap
+      # while the worker is still gated.
+      launcher_sleep 0.01
     done
 
     if ((pending_signal != 0)); then
@@ -1825,7 +1834,7 @@ run_transport() {
         transport_reaped=1
         break
       fi
-      sleep 0.1
+      launcher_sleep 0.1
     done
   fi
 
@@ -1854,7 +1863,7 @@ run_transport() {
         transport_status=1
         break
       fi
-      sleep 0.1
+      launcher_sleep 0.1
       if ((signal_status != 0)) || ! transport_is_running; then
         continue
       fi

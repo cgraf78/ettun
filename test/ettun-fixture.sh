@@ -656,6 +656,12 @@ _write_stub "$bin/interactive-attached-transport" \
   '        pass' \
   'open(os.environ["ETTUN_TEST_CONTROL_EOF"], "wb").close()' \
   'server.close()' \
+  '# Optionally behave like ET waiting to reconnect: stay alive after the' \
+  '# graceful-stop EOF so only a forced stop can end the transport.' \
+  'if os.environ.get("ETTUN_TEST_LINGER_AFTER_EOF") == "1":' \
+  '    linger_deadline = time.monotonic() + 3 * float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20"))' \
+  '    while time.monotonic() < linger_deadline:' \
+  '        time.sleep(0.05)' \
   'PY'
 _write_stub "$bin/worker-pgrp-transport" \
   'worker_pgid=$(ps -o pgid= -p "$PPID" | tr -d " ")' \
