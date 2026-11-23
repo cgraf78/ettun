@@ -66,7 +66,7 @@ fi
 WAIT_DEADLINE_SECONDS=$((20 * ETTUN_TEST_TIME_SCALE))
 export ETTUN_TEST_TIME_SCALE ETTUN_TEST_WAIT_SECONDS=$WAIT_DEADLINE_SECONDS
 
-ETTUN_TEST_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ETTUN_TEST_ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=lib/test.sh
 . "$ETTUN_TEST_ROOT/test/lib/test.sh"
 

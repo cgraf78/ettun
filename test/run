@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+ROOT=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Shared CI owns one required inventory lint; local runs still lint by default.
 # Reading the same typed inventory keeps the two paths from acquiring different
