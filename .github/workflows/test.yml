@@ -74,7 +74,7 @@ jobs:
       - name: Run suite in a network namespace
         run: |
           set -euo pipefail
-          sudo unshare -n bash -c 'ip link set lo up; ETTUN_SKIP_SHELLCHECK=1 test/run' 2>&1 | tee /tmp/ettun-namespace-test.log
+          sudo unshare -n bash -ec 'ip link set lo up; ETTUN_SKIP_SHELLCHECK=1 test/run' 2>&1 | tee /tmp/ettun-namespace-test.log
       - name: Require the forced self-connect coverage
         run: |-
           grep -q 'PASS: bind probe \[perl\]: forced self-connect is not a listener' /tmp/ettun-namespace-test.log
