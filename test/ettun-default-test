@@ -3,7 +3,7 @@
 
 # shellcheck disable=SC2016,SC2154
 # shellcheck source=ettun-fixture.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ettun-fixture.sh"
+. "$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ettun-fixture.sh"
 
 echo "=== ettun default transport ==="
 
