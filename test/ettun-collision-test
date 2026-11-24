@@ -178,6 +178,26 @@ wait "$fake_worker_pid" 2>/dev/null || true
 _assert_not_contains "suite cleanup: forgets a reaped worker" \
   "$fake_worker_pid" "$(_leaked_workers)"
 
+# A process census can emit some ordinary rows before failing. Its partial
+# output cannot prove that this suite has no workers left.
+census_status=0
+census_output=$(
+  exec 2>&1
+  # shellcheck disable=SC2329
+  incomplete_ps() {
+    printf '1 init\n'
+    return 42
+  }
+  # The shared harness reads these in the cleanup and summary helpers.
+  # shellcheck disable=SC2034
+  real_ps=incomplete_ps PASS=0 FAIL=0
+  _assert_no_leaked_workers
+  _test_summary
+) || census_status=$?
+_assert_exit "suite cleanup: incomplete process census fails the suite" 1 "$census_status"
+_assert_contains "suite cleanup: census failure is actionable" \
+  "could not inspect transport workers" "$census_output"
+
 tmpdir_failure_exit=0
 tmpdir_failure_output=$(
   # _tmpdir resolves this subshell-local fault injector by command name;
