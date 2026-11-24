@@ -21,43 +21,50 @@ yes 2>/dev/null | head -n 1 >/dev/null
 pipe_status=${PIPESTATUS[0]}
 _assert_eq "signal dispositions: SIGPIPE terminates a writer" 141 "$pipe_status"
 
-# Exercise the namespace step's actual child shell without sudo, unshare, or
-# network changes. Outer pipefail cannot recover a status the child masked.
-namespace_spec=$(awk -F "'" '
-  /^[[:space:]]*sudo unshare -n bash / {
-    sub(/^[[:space:]]*sudo unshare -n bash /, "", $1)
-    sub(/[[:space:]]+$/, "", $1)
-    print $1
-    print $2
-    exit
-  }
-' "$ETTUN_TEST_ROOT/.github/workflows/test.yml")
-namespace_flags=${namespace_spec%%$'\n'*}
-namespace_body=${namespace_spec#*$'\n'}
-if [[ $namespace_flags =~ ^-[a-z]+$ &&
-  $namespace_body == 'ip link set lo up; ETTUN_SKIP_SHELLCHECK=1 test/run' ]]; then
-  namespace_fixture=$tmp/namespace-step
-  mkdir -p "$namespace_fixture/bin" "$namespace_fixture/test"
-  printf '%s\n' '#!/usr/bin/env bash' 'exit "$ETTUN_TEST_NAMESPACE_IP_STATUS"' >"$namespace_fixture/bin/ip"
-  printf '%s\n' '#!/usr/bin/env bash' '[[ $ETTUN_SKIP_SHELLCHECK == 1 ]] || exit 2' \
-    'printf "namespace suite started\n"' >"$namespace_fixture/test/run"
-  chmod +x "$namespace_fixture/bin/ip" "$namespace_fixture/test/run"
-  namespace_failure=0
-  namespace_output=$(CDPATH='' cd "$namespace_fixture" &&
-    PATH="$namespace_fixture/bin:$test_system_path" ETTUN_TEST_NAMESPACE_IP_STATUS=42 \
-      "$BASH" "$namespace_flags" "$namespace_body" 2>&1) || namespace_failure=$?
-  _assert_exit "namespace setup: ip failure reaches CI" 42 "$namespace_failure"
-  _assert_not_contains "namespace setup: failure starts no suite" \
-    'namespace suite started' "$namespace_output"
-  namespace_success=0
-  namespace_output=$(CDPATH='' cd "$namespace_fixture" &&
-    PATH="$namespace_fixture/bin:$test_system_path" ETTUN_TEST_NAMESPACE_IP_STATUS=0 \
-      "$BASH" "$namespace_flags" "$namespace_body" 2>&1) || namespace_success=$?
-  _assert_exit "namespace setup: successful setup allows the suite" 0 "$namespace_success"
-  _assert_contains "namespace setup: successful setup starts the suite" \
-    'namespace suite started' "$namespace_output"
-else
-  _fail "namespace setup: unexpected child shell in the CI workflow"
+# Exercise the installed test entry point without permissions or network
+# writes. Even a successful launcher that keeps the caller's namespace must
+# stop before invoking ip.
+if readlink /proc/self/ns/net >/dev/null 2>&1; then
+  namespace_bin="$tmp/namespace-bin"
+  mkdir -p "$namespace_bin"
+  _write_stub "$namespace_bin/unshare" \
+    '[[ $1 == --net && $2 == -- ]] || exit 2' \
+    '((ETTUN_TEST_NAMESPACE_STATUS == 0)) || exit "$ETTUN_TEST_NAMESPACE_STATUS"' \
+    'shift 2' \
+    'exec "$@"'
+  _write_stub "$namespace_bin/ip" ': >"$ETTUN_TEST_IP_MARKER"; exit 2'
+  namespace_test="$ETTUN_TEST_ROOT/test/namespace-self-connect-test"
+  namespace_status=0
+  PATH="$namespace_bin:$PATH" ETTUN_TEST_NAMESPACE_STATUS=42 \
+    ETTUN_TEST_IP_MARKER="$tmp/ip-called" "$namespace_test" || namespace_status=$?
+  _assert_exit "forced self-connect: namespace creation failure reaches CI" 42 "$namespace_status"
+  namespace_status=0
+  namespace_output=$(PATH="$namespace_bin:$PATH" ETTUN_TEST_NAMESPACE_STATUS=0 \
+    ETTUN_TEST_IP_MARKER="$tmp/ip-called" "$namespace_test" 2>&1) || namespace_status=$?
+  _assert_exit "forced self-connect: rejects the caller's network namespace" 1 "$namespace_status"
+  _assert_contains "forced self-connect: explains the missing isolation" \
+    "requires a fresh network namespace" "$namespace_output"
+  if [[ -e "$tmp/ip-called" ]]; then
+    _fail "forced self-connect: rejects before configuring loopback"
+  else
+    _pass "forced self-connect: rejects before configuring loopback"
+  fi
+
+  # Simulate a changed namespace for the ip failure path. Substitute an
+  # aborting fixture so an unexpected continuation cannot write a sysctl.
+  mkdir "$tmp/aborting-fixture"
+  printf 'exit 3\n' >"$tmp/aborting-fixture/ettun-fixture.sh"
+  _write_stub "$namespace_bin/readlink" 'printf "net:[%s]\n" "${ETTUN_TEST_NETNS_ID:-1}"'
+  _write_stub "$namespace_bin/unshare" \
+    '[[ $1 == --net && $2 == -- && $# == 8 ]] || exit 2' \
+    'shift 2' \
+    'ETTUN_TEST_NETNS_ID=2 exec "$1" "$2" "$3" "$4" "$5" "$ETTUN_TEST_ABORT_FIXTURE"'
+  _write_stub "$namespace_bin/ip" ': >"$ETTUN_TEST_IP_MARKER"; exit 42'
+  namespace_status=0
+  PATH="$namespace_bin:$PATH" ETTUN_TEST_IP_MARKER="$tmp/ip-called" \
+    ETTUN_TEST_ABORT_FIXTURE="$tmp/aborting-fixture" "$namespace_test" || namespace_status=$?
+  _assert_file_exists "forced self-connect: fixture reached loopback setup" "$tmp/ip-called"
+  _assert_exit "forced self-connect: loopback setup failure reaches CI" 42 "$namespace_status"
 fi
 
 # Every time bound in the test tree must come from ETTUN_TEST_WAIT_SECONDS or

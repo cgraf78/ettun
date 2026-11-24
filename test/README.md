@@ -40,6 +40,12 @@ load measurements.
   caller starts a suite with SIGINT and SIGQUIT ignored, as a script's
   `suite &` does, the fixture re-executes it with default dispositions so
   the terminal Ctrl-C cases stay meaningful.
+- `namespace-self-connect-test` is the dedicated Linux CI entrypoint for
+  forcing a real TCP self-connection. It creates a network namespace before
+  narrowing the ephemeral port range and fails if the kernel does not make
+  the self-connection. The ordinary suite never changes that range. On Linux
+  with Perl, iproute2, and access to network namespaces, run it explicitly
+  with `sudo test/namespace-self-connect-test`.
 - `lib/test.sh` owns the small assertion vocabulary and a guarded per-suite
   temporary root.
 
