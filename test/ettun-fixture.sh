@@ -931,36 +931,37 @@ PY
 # Give exiting workers the usual bound, then kill and report any survivor so
 # a cleanup gap fails the suite instead of leaving orphans on the host.
 _leaked_workers() {
-  local pid args
+  local processes pid args
 
+  # An unsuccessful census can omit a live worker, even if it printed rows.
+  processes=$("$real_ps" -axo pid=,args= 2>/dev/null) || return $?
   while read -r pid args; do
-    [[ $pid =~ ^[0-9]+$ && $args == *--ettun-transport-worker*"$tmp/"* ]] &&
+    if [[ $pid =~ ^[0-9]+$ && $args == *--ettun-transport-worker*"$tmp/"* ]]; then
       printf '%s\n' "$pid"
-  done < <("$real_ps" -axo pid=,args= 2>/dev/null)
+    fi
+  done <<<"$processes"
 }
 
 _assert_no_leaked_workers() {
-  local pid deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
-  local -a leaked
+  local workers pid deadline=$((SECONDS + WAIT_DEADLINE_SECONDS))
 
   while :; do
-    leaked=()
-    while read -r pid; do
-      leaked+=("$pid")
-    done < <(_leaked_workers)
-    ((${#leaked[@]} == 0)) && break
+    if ! workers=$(_leaked_workers); then
+      _fail "suite cleanup: could not inspect transport workers"
+      return
+    fi
+    if [[ -z "$workers" ]]; then
+      _pass "suite cleanup: no transport worker survives"
+      return
+    fi
     ((SECONDS < deadline)) || break
     sleep 0.1
   done
-  if ((${#leaked[@]} == 0)); then
-    _pass "suite cleanup: no transport worker survives"
-    return
-  fi
-  for pid in "${leaked[@]}"; do
+  while IFS= read -r pid; do
     # A worker started under job control leads its own process group.
     kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-  done
-  _fail "suite cleanup: no transport worker survives (killed ${leaked[*]})"
+  done <<<"$workers"
+  _fail "suite cleanup: no transport worker survives (killed ${workers//$'\n'/ })"
 }
 
 _process_has_stopped() {
