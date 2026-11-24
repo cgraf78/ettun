@@ -12,3 +12,4 @@ program	test/ettun-fixture.sh
 program	test/ettun-collision-test
 program	test/ettun-custom-test
 program	test/ettun-default-test
+program	test/namespace-self-connect-test

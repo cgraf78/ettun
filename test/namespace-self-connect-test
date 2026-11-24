@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Force a real TCP self-connection inside a disposable network namespace.
+# The shared fixture supplies the test globals in the namespace body.
+# shellcheck disable=SC2154
+
+# Report whether a socket exists whose local and remote ports are both the
+# given port: the signature of a TCP self-connection, where a probe
+# connected to itself. Any state counts, since the closing handshake may
+# still be in flight when this runs. Linux-only; reads /proc/net/tcp.
+_self_connect_forced() {
+  "$test_python" - "$1" <<'PY'
+import sys
+
+port = f"{int(sys.argv[1]):04X}"
+for line in open("/proc/net/tcp"):
+    fields = line.split()
+    if len(fields) < 4:
+        continue
+    local, remote = fields[1], fields[2]
+    if (local.rsplit(":", 1)[-1] == port and
+            remote.rsplit(":", 1)[-1] == port):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+_run_namespace_case() {
+  local caller_netns="$1" test_dir="$2" netns port
+  netns=$(readlink /proc/self/ns/net) || return 1
+  if [[ $netns == "$caller_netns" ]]; then
+    printf 'forced self-connect requires a fresh network namespace\n' >&2
+    return 1
+  fi
+  ip link set lo up || return $?
+  # shellcheck source=ettun-fixture.sh
+  . "$test_dir/ettun-fixture.sh"
+  if [[ -z $real_perl ]]; then
+    _fail "forced self-connect needs the Perl probe"
+    _test_summary
+  fi
+  if ! port=$(_make_time_wait client); then
+    _fail "forced self-connect needs a TIME-WAIT socket"
+    _test_summary
+  fi
+
+  # Make connect() choose the destination itself as its source. Even on
+  # SIGKILL, this namespace's port range cannot affect the caller.
+  if ! printf '%s %s' "$port" "$port" >/proc/sys/net/ipv4/ip_local_port_range; then
+    _fail "could not narrow the isolated ephemeral port range"
+    _test_summary
+  fi
+  ETTUN_TEST_LSOF_EXIT=1 ETTUN_TEST_PATH="$perl_bin:$bin:$test_system_path" \
+    ETTUN_TEST_EXIT=23 _run_ettun gateway.example "$port" service.internal 443
+
+  # Require proof that the kernel actually made the self-connection before
+  # checking ettun's classification. A non-listener alone proves too little.
+  if _self_connect_forced "$port"; then
+    _assert_exit "bind probe [perl]: forced self-connect is not a listener" 75 "$run_exit"
+    _assert_contains "bind probe [perl]: forced self-connect is reported as temporary" \
+      "retry within about a minute" "$(<"$stderr")"
+  else
+    _fail "kernel did not force the self-connect"
+  fi
+  _test_summary
+}
+
+test_dir=$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
+caller_netns=$(readlink /proc/self/ns/net) || exit 1
+# Hand fixed code to unshare so there is no separate entry point that can
+# accidentally execute the sysctl write outside the newly created namespace.
+exec unshare --net -- "$BASH" -c "$(declare -f _self_connect_forced _run_namespace_case)
+_run_namespace_case \"\$@\"" "$0" "$caller_netns" "$test_dir"

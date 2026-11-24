@@ -878,6 +878,54 @@ _wait_for_marker() {
   done
 }
 
+# Leave one loopback TCP endpoint in TIME-WAIT and print its port. "client"
+# models an outgoing connection, such as an `nc -z` health check, whose source
+# port is PORT (or an ephemeral one) and which closes first without
+# SO_REUSEADDR. "server" models a just-stopped SO_REUSEADDR listener that
+# closed its accepted connection first. Exit 3 means PORT was already taken.
+_make_time_wait() {
+  "$test_python" - "$1" "${2:-0}" <<'PY'
+import errno
+import os
+import socket
+import sys
+
+side, port = sys.argv[1], int(sys.argv[2])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+client = socket.socket()
+try:
+    if side == "server":
+        server.bind(("127.0.0.1", port))
+    else:
+        server.bind(("127.0.0.1", 0))
+        if port:
+            client.bind(("127.0.0.1", port))
+except OSError as error:
+    if error.errno == errno.EADDRINUSE:
+        sys.exit(3)
+    raise
+server.listen(1)
+if side == "server":
+    client.connect(server.getsockname())
+    accepted, _ = server.accept()
+    held = server.getsockname()[1]
+    first, second = accepted, client
+else:
+    client.connect(server.getsockname())
+    accepted, _ = server.accept()
+    held = client.getsockname()[1]
+    first, second = client, accepted
+first.close()
+# Wait for the first closer's FIN so that side, not its peer, ends in TIME-WAIT.
+second.settimeout(float(os.environ.get("ETTUN_TEST_WAIT_SECONDS", "20")))
+second.recv(1)
+second.close()
+server.close()
+print(held)
+PY
+}
+
 # Every transport worker a suite starts carries a runtime directory beneath
 # this suite's private temporary root in its argv, which proves ownership.
 # Give exiting workers the usual bound, then kill and report any survivor so
