@@ -518,7 +518,7 @@ sha256_text() {
 }
 
 client_id() {
-  local state_dir state_file lock_dir lock_cleanup tmp value attempt publish_status
+  local state_dir state_file lock_dir lock_cleanup lock_mkdir tmp value attempt publish_status
 
   if [[ -n "${ETTUN_CLIENT_ID:-}" ]]; then
     value="$ETTUN_CLIENT_ID"
@@ -559,13 +559,16 @@ client_id() {
     # temporary file while contenders wait for that canonical file to appear.
     if ! ln "$tmp" "$state_file" 2>/dev/null; then
       lock_dir="${state_file}.lock"
+      # Ubuntu's uutils mkdir can report success even when a different
+      # contender created the lock. Prefer the packaged GNU alternative.
+      lock_mkdir=$(type -P gnumkdir) || lock_mkdir='mkdir'
       publish_status=1
       for attempt in {1..100}; do
         if [[ -f "$state_file" ]]; then
           publish_status=0
           break
         fi
-        if mkdir "$lock_dir" 2>/dev/null; then
+        if command "$lock_mkdir" "$lock_dir" 2>/dev/null; then
           # client_id runs in a command-substitution shell. Keep its EXIT trap
           # scoped there so catchable termination cannot strand the empty lock;
           # the deadline below still prevents a SIGKILL-stale lock from hanging
