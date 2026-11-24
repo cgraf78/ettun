@@ -819,8 +819,11 @@ identity_race_home="$tmp/identity-race-home"
 identity_race_state="$identity_race_home/state/ettun"
 identity_ln_attempts="$tmp/identity-ln-attempts"
 identity_lock_attempts="$tmp/identity-lock-attempts"
+identity_false_success="$tmp/identity-false-success"
 identity_mv_ready="$tmp/identity-mv-ready"
 identity_mv_release="$tmp/identity-mv-release"
+identity_real_mkdir=$(type -P gnumkdir || type -P mkdir)
+printf -v identity_real_mkdir_q '%q' "$identity_real_mkdir"
 mkdir -p "$identity_race_home"
 : >"$identity_ln_attempts"
 : >"$identity_lock_attempts"
@@ -829,6 +832,17 @@ _write_stub "$bin/ln" \
   'exit 1'
 _write_stub "$bin/mkdir" \
   "real_mkdir=$real_mkdir_q" \
+  'if [[ $# -eq 1 && $1 == */client-id.lock && -d $1 ]]; then' \
+  '  : >"$ETTUN_TEST_IDENTITY_FALSE_SUCCESS"' \
+  '  printf "%s\n" "$PPID" >>"$ETTUN_TEST_IDENTITY_LOCK_ATTEMPTS"' \
+  '  exit 0' \
+  'fi' \
+  'if [[ $# -eq 1 && $1 == */client-id.lock ]]; then' \
+  '  printf "%s\n" "$PPID" >>"$ETTUN_TEST_IDENTITY_LOCK_ATTEMPTS"' \
+  'fi' \
+  'exec "$real_mkdir" "$@"'
+_write_stub "$bin/gnumkdir" \
+  "real_mkdir=$identity_real_mkdir_q" \
   'for arg in "$@"; do' \
   '  case "$arg" in' \
   '    */client-id.lock)' \
@@ -857,6 +871,7 @@ _run_identity_candidate() {
     ETTUN_TEST_PORT_PROBE_ERROR="$tmp/identity-$name-probe.error" \
     ETTUN_TEST_IDENTITY_LN_ATTEMPTS="$identity_ln_attempts" \
     ETTUN_TEST_IDENTITY_LOCK_ATTEMPTS="$identity_lock_attempts" \
+    ETTUN_TEST_IDENTITY_FALSE_SUCCESS="$identity_false_success" \
     ETTUN_TEST_IDENTITY_MV_READY="$identity_mv_ready" \
     ETTUN_TEST_IDENTITY_MV_RELEASE="$identity_mv_release" \
     bash "$SCRIPT" gateway.example "$local_port" service.internal 443 \
@@ -886,6 +901,11 @@ if ((identity_lock_observed == 1)); then
   _pass "client identity fallback: serializes competing first launches"
 else
   _fail "client identity fallback: serializes competing first launches"
+fi
+if [[ ! -e "$identity_false_success" ]]; then
+  _pass "client identity fallback: avoids false-success mkdir on an occupied lock"
+else
+  _fail "client identity fallback: avoids false-success mkdir on an occupied lock"
 fi
 : >"$identity_mv_release"
 identity_first_exit=0
@@ -923,7 +943,7 @@ for identity_temp in "$identity_race_state"/client-id.tmp.*; do
 done
 _assert_eq "client identity fallback: removes losing candidates" \
   0 "$identity_temp_count"
-rm -f "$bin/ln" "$bin/mkdir" "$bin/mv"
+rm -f "$bin/ln" "$bin/mkdir" "$bin/gnumkdir" "$bin/mv"
 
 echo ""
 echo "=== ettun validation and errors ==="
